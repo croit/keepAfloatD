@@ -1,0 +1,37 @@
+node_id: 3
+raft_listen: "10.50.0.12:17120"
+client_submit_listen: "10.50.0.12:17121"
+
+peers:
+  - id: 1
+    raft_address: "10.50.0.10:17100"
+    client_submit_address: "10.50.0.10:17101"
+  - id: 2
+    raft_address: "10.50.0.11:17110"
+    client_submit_address: "10.50.0.11:17111"
+  - id: 3
+    raft_address: "10.50.0.12:17120"
+    client_submit_address: "10.50.0.12:17121"
+
+vips:
+  - address: "10.50.0.100"
+    interface: eth0
+  - address: "10.50.0.101"
+    interface: eth0
+  - address: "10.50.0.102"
+    interface: eth0
+
+health:
+  command: ["/bin/sh", "/opt/keepafloatd-tests/health.sh", "/shared/node-c.unhealthy"]
+  interval_ms: 1000
+  timeout_ms: 1000
+  stale_secs: 6
+
+raft:
+  election_timeout_min_ms: 1500
+  election_timeout_max_ms: 2500
+  heartbeat_interval_ms: 500
+
+cluster_secret: "keepafloatd-e2e-secret"
+submit_timeout_ms: 5000
+dry_run: false

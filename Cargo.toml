@@ -1,0 +1,64 @@
+[package]
+name = "keepafloatd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "keepAfloatD - VIP failover daemon using OpenRaft"
+license = "AGPL-3.0-only" # Commercial licensing is also available; see LICENSE.
+repository = "https://github.com/croit/keepAfloatD"
+
+[[bin]]
+name = "keepafloatd"
+path = "src/main.rs"
+
+[package.metadata.deb]
+maintainer = "croit GmbH <support@croit.io>"
+copyright = "2026, croit GmbH. GNU AGPL v3 for community usage; commercial licensing available from croit.io."
+depends = "$auto, iproute2, iputils-arping, ca-certificates"
+section = "net"
+priority = "optional"
+maintainer-scripts = "deploy/debian/"
+assets = [
+  ["target/release/keepafloatd", "usr/bin/", "755"],
+  ["README.md", "usr/share/doc/keepafloatd/README.md", "644"],
+  ["LICENSE", "usr/share/doc/keepafloatd/LICENSE", "644"],
+  ["LICENSES/AGPL-3.0.txt", "usr/share/doc/keepafloatd/licenses/AGPL-3.0.txt", "644"],
+  ["LICENSES/COMMERCIAL.md", "usr/share/doc/keepafloatd/licenses/COMMERCIAL.md", "644"],
+  ["THIRD_PARTY_LICENSES.md", "usr/share/doc/keepafloatd/THIRD_PARTY_LICENSES.md", "644"],
+  ["config.example.yaml", "etc/keepafloatd/config.yaml", "644"],
+  ["deploy/default/keepafloatd", "etc/default/keepafloatd", "644"],
+]
+systemd-units = { unit-name = "keepafloatd", unit-scripts = "deploy/systemd/", enable = false, start = false, restart-after-upgrade = false }
+
+# RPM packaging via cargo-generate-rpm (el9+). Mirrors the deb asset layout above.
+[package.metadata.generate-rpm]
+summary = "keepAfloatD - VIP failover daemon using OpenRaft"
+assets = [
+  { source = "target/release/keepafloatd", dest = "/usr/bin/keepafloatd", mode = "755" },
+  { source = "README.md", dest = "/usr/share/doc/keepafloatd/README.md", mode = "644" },
+  { source = "LICENSE", dest = "/usr/share/doc/keepafloatd/LICENSE", mode = "644" },
+  { source = "LICENSES/AGPL-3.0.txt", dest = "/usr/share/doc/keepafloatd/licenses/AGPL-3.0.txt", mode = "644" },
+  { source = "LICENSES/COMMERCIAL.md", dest = "/usr/share/doc/keepafloatd/licenses/COMMERCIAL.md", mode = "644" },
+  { source = "THIRD_PARTY_LICENSES.md", dest = "/usr/share/doc/keepafloatd/THIRD_PARTY_LICENSES.md", mode = "644" },
+  { source = "config.example.yaml", dest = "/etc/keepafloatd/config.yaml", mode = "644", config = true },
+  { source = "deploy/default/keepafloatd", dest = "/etc/default/keepafloatd", mode = "644", config = true },
+  { source = "deploy/systemd/keepafloatd@.service", dest = "/usr/lib/systemd/system/keepafloatd@.service", mode = "644" },
+]
+[package.metadata.generate-rpm.requires]
+# el9/Fedora name the package "iproute" (iproute2 is the Debian name).
+iproute = "*"
+iputils = "*"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+# Pinned exactly: 0.10 is an alpha; the storage/network trait surface can churn between alphas.
+# The I/O-progress redesign in 0.10 is what fixes the diskless restart-past-snapshot crash (bug 6).
+openraft = { version = "=0.10.0-alpha.25", features = ["serde", "type-alias"] }
+futures = "0.3"

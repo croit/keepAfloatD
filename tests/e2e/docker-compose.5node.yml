@@ -1,0 +1,115 @@
+# 5-node / 4-VIP compose stack for the minimal-movement rebalance suite (tests/e2e/scripts/run5.sh).
+# It mirrors docker-compose.yml but runs five keepafloatd nodes (ids 1..5) with the *5.yaml configs
+# and a fourth VIP. The default 3-node stack in docker-compose.yml is left untouched.
+x-e2e-node: &e2e-node
+  image: ${KEEPAFLOATD_IMAGE:-ghcr.io/croit/keepafloatd:latest}
+  user: "0:0"
+  init: true
+  restart: "no"
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  environment:
+    RUST_LOG: ${KEEPAFLOATD_RUST_LOG:-info}
+  volumes:
+    - shared-state:/shared
+    - e2e-fixtures:/opt/keepafloatd-tests:ro
+  networks:
+    test-net: {}
+
+services:
+  e2e-fixtures:
+    build:
+      context: .
+      dockerfile: fixtures/Dockerfile
+    init: true
+    restart: "no"
+    command: ["sh", "-ec", "mkdir -p /fixtures-out && cp -a /opt/keepafloatd-tests/. /fixtures-out/"]
+    volumes:
+      - e2e-fixtures:/fixtures-out
+
+  node-a:
+    <<: *e2e-node
+    depends_on:
+      e2e-fixtures:
+        condition: service_completed_successfully
+      e2e-runner:
+        condition: service_started
+    command: ["-c", "/opt/keepafloatd-tests/configs/a5.yaml"]
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.10
+
+  node-b:
+    <<: *e2e-node
+    depends_on:
+      e2e-fixtures:
+        condition: service_completed_successfully
+      node-a:
+        condition: service_started
+    command: ["-c", "/opt/keepafloatd-tests/configs/b5.yaml"]
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.11
+
+  node-c:
+    <<: *e2e-node
+    depends_on:
+      e2e-fixtures:
+        condition: service_completed_successfully
+      node-b:
+        condition: service_started
+    command: ["-c", "/opt/keepafloatd-tests/configs/c5.yaml"]
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.12
+
+  node-d:
+    <<: *e2e-node
+    depends_on:
+      e2e-fixtures:
+        condition: service_completed_successfully
+      node-c:
+        condition: service_started
+    command: ["-c", "/opt/keepafloatd-tests/configs/d5.yaml"]
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.13
+
+  node-e:
+    <<: *e2e-node
+    depends_on:
+      e2e-fixtures:
+        condition: service_completed_successfully
+      node-d:
+        condition: service_started
+    command: ["-c", "/opt/keepafloatd-tests/configs/e5.yaml"]
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.14
+
+  e2e-runner:
+    build:
+      context: ./runner
+    init: true
+    restart: "no"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    command: ["sleep", "infinity"]
+    volumes:
+      - shared-state:/shared
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.20
+
+networks:
+  test-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.50.0.0/24
+
+volumes:
+  shared-state:
+  e2e-fixtures:

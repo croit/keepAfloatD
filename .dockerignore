@@ -1,0 +1,13 @@
+**
+!Cargo.toml
+!Cargo.lock
+!README.md
+!LICENSE
+!LICENSES/
+!LICENSES/**
+!THIRD_PARTY_LICENSES.md
+!src/
+!src/**
+# Pre-built release binaries the release `runtime-dist` image stage copies in (empty otherwise).
+!dist/
+!dist/**

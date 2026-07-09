@@ -1,0 +1,97 @@
+# keepAfloatD example configuration (copy to e.g. /etc/keepafloatd/config.yaml)
+#
+# One process = one Raft cluster = one health check = one shared VIP list.
+# Multiple independent failover groups require multiple processes and separate configs/ports/clusters.
+
+node_id: 1
+
+# Cluster formation is automatic and needs no special node: on startup nodes probe each other and,
+# once a majority is reachable and no cluster exists, each node initializes with the identical
+# `peers` roster (safe per OpenRaft) and Raft elects one leader. Any majority can form or recover
+# the cluster, even if the lowest-id node is down (suits diskless/PXE nodes with no saved state).
+
+# Bind Raft and the leader-side submit listener to the same peer-reachable addresses advertised
+# below in this node's `peers` entry. Avoid `0.0.0.0`: the bind/listen addresses are validated
+# against `peers[node_id]`, and a wider bind plus a missing `cluster_secret` would let any host on
+# the segment forge HealthUpdate envelopes.
+raft_listen: "127.0.0.1:7000"
+client_submit_listen: "127.0.0.1:7001"
+
+peers:
+  - id: 1
+    raft_address: "127.0.0.1:7000"
+    client_submit_address: "127.0.0.1:7001"
+  - id: 2
+    raft_address: "127.0.0.1:7010"
+    client_submit_address: "127.0.0.1:7011"
+  - id: 3
+    raft_address: "127.0.0.1:7020"
+    client_submit_address: "127.0.0.1:7021"
+
+# Virtual IPs to distribute across healthy voters. `address` takes an optional CIDR
+# suffix (`10.0.0.101/24`); without one the VIP is bound as a host route (`/32` for IPv4,
+# `/128` for IPv6), which is the usual choice. The prefix must match how the address is reachable on
+# `interface`. This list must be identical on every node.
+#
+# Optional: `vlan` (IEEE 802.1Q tag, 1–4094). When set, `ip addr` targets `{interface}.{vlan}`
+# (e.g. `eth0.100`). The sub-interface must already exist; keepafloatd does not create VLANs.
+vips:
+  - address: "10.0.0.101/24"
+    interface: eth0
+  - address: "10.0.0.102"      # no suffix -> bound as /32
+    interface: eth0
+  # - address: "10.0.0.103/24"
+  #   interface: eth0
+  #   vlan: 100               # binds to eth0.100 instead of eth0
+
+health:
+  command: ["/bin/true"]
+  interval_ms: 2000
+  timeout_ms: 5000
+  # A peer whose committed probe rounds stop advancing for longer than this window is excluded
+  # from VIP eligibility. This is what triggers failover when a node dies silently or gets
+  # partitioned before it can publish `healthy: false`. Must be >= ceil(interval_ms / 1000).
+  stale_secs: 10
+
+raft:
+  election_timeout_min_ms: 400
+  election_timeout_max_ms: 800
+  heartbeat_interval_ms: 250
+
+# Pre-shared cluster secret. MUST be identical on every member, MUST be unique per cluster, and
+# MUST be kept out of attacker reach (root-owned 0600 file). Omit the field entirely to disable
+# authentication on a fully trusted network.
+cluster_secret: "replace-me-with-a-random-32-byte-string"
+
+# Refuse RPC frames larger than this (defaults to 4 MiB; minimum 64 KiB). Protects against a
+# rogue or buggy peer trying to allocate a 4 GiB buffer via a u32 length prefix.
+max_frame_bytes: 4194304
+
+# Wall-clock budget on a single submit attempt, including local leader writes and
+# follower->leader forwards (defaults to 2000 ms).
+submit_timeout_ms: 2000
+
+dry_run: false
+
+# Optional notify script called when this node gains or releases a VIP (keepalived-compatible).
+# Invoked as: <script> INSTANCE <vip_address> MASTER|BACKUP|FAULT
+# MASTER — this node just acquired the VIP.
+# BACKUP — this node released the VIP to another healthy node.
+# FAULT  — this node released the VIP because its own health check failed.
+# The script runs fire-and-forget; a non-zero exit is logged but does not affect failover.
+# This is a per-node field and may differ between cluster members.
+# notify: /etc/keepafloatd/notify.sh
+
+# Whether a recovered node is allowed to reclaim VIPs it previously held (analogous to
+# keepalived's `preempt` / `nopreempt`).
+#   true  (default) — recovered nodes re-enter the eligible pool after `failback_delay_secs`.
+#   false           — once a node goes unhealthy it is permanently blocked from holding VIPs
+#                     until the entire cluster is fully reformed (all nodes restart from scratch
+#                     without an existing snapshot). Restarting a single daemon is not enough
+#                     because the block is replicated via Raft snapshot (nopreempt behaviour).
+# failback: true
+
+# Minimum time (seconds) a recovered node must remain healthy before it can take back VIPs.
+# Only meaningful when `failback: true`. Converted internally to probe-round counts so the
+# state machine stays deterministic (no wall-clock reads). Default: 10.
+# failback_delay_secs: 10

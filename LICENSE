@@ -1,0 +1,24 @@
+keepafloatd Licensing Overview
+==============================
+
+Copyright (C) 2026 croit GmbH
+
+Open-source and community usage of this repository is provided under the GNU Affero General Public
+License, version 3 (`AGPL-3.0-only`).
+
+A separate commercial license is also available from `croit.io`.
+
+If you have executed a written commercial agreement with croit GmbH covering `keepafloatd`, that
+agreement governs your use under the commercial option. Otherwise, you may use this repository
+under `AGPL-3.0-only`.
+
+External contributions are accepted only after croit GmbH has received either a signed
+Contributor License Agreement (`CLA`) or a copyright assignment for the contributed work.
+See `CONTRIBUTING.md` for the repository policy.
+
+The full public-license text is shipped in `LICENSES/AGPL-3.0.txt`.
+Commercial-license contact and notice information is provided in `LICENSES/COMMERCIAL.md`.
+
+Third-party dependencies remain under their own respective licenses. A current dependency inventory
+based on `Cargo.lock` is checked in as `THIRD_PARTY_LICENSES.md`, and CI enforces the allowed
+license families with `cargo deny check licenses`.

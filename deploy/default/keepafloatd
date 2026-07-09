@@ -1,0 +1,3 @@
+# Optional environment overrides for keepafloatd.
+# For example:
+# RUST_LOG=debug

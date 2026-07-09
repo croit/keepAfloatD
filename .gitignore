@@ -1,0 +1,12 @@
+/target/
+/e2e-artifacts/
+/dist/
+/coverage/
+/cobertura.xml
+/public/
+/version.env
+/config.yaml
+
+# Internal real-cluster test harness: hardcodes private cluster IPs, the croit jump host, SSH key
+# paths and a test cluster secret. Kept local-only (this repo is public); do not commit.
+/tests/realcluster/

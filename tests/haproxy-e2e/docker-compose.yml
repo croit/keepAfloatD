@@ -1,0 +1,95 @@
+x-haproxy-node: &haproxy-node
+  image: keepafloatd-haproxy-e2e-node:local
+  pull_policy: never
+  user: "0:0"
+  init: true
+  restart: "no"
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  environment:
+    RUST_LOG: ${KEEPAFLOATD_RUST_LOG:-info}
+  networks:
+    test-net: {}
+
+services:
+  backend-http:
+    image: python:3.12-alpine
+    pull_policy: never
+    init: true
+    restart: "no"
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /srv
+        printf 'keepafloatd haproxy article backend\n' > /srv/index.html
+        exec python -m http.server 8080 -d /srv
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.30
+
+  node-a:
+    <<: *haproxy-node
+    depends_on:
+      backend-http:
+        condition: service_started
+      e2e-runner:
+        condition: service_started
+    environment:
+      RUST_LOG: ${KEEPAFLOATD_RUST_LOG:-info}
+      NODE_NAME: node-a
+    command: ["-c", "/opt/haproxy-e2e/configs/a.yaml"]
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.10
+
+  node-b:
+    <<: *haproxy-node
+    depends_on:
+      backend-http:
+        condition: service_started
+      node-a:
+        condition: service_started
+    environment:
+      RUST_LOG: ${KEEPAFLOATD_RUST_LOG:-info}
+      NODE_NAME: node-b
+    command: ["-c", "/opt/haproxy-e2e/configs/b.yaml"]
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.11
+
+  node-c:
+    <<: *haproxy-node
+    depends_on:
+      backend-http:
+        condition: service_started
+      node-b:
+        condition: service_started
+    environment:
+      RUST_LOG: ${KEEPAFLOATD_RUST_LOG:-info}
+      NODE_NAME: node-c
+    command: ["-c", "/opt/haproxy-e2e/configs/c.yaml"]
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.12
+
+  e2e-runner:
+    image: python:3.12-alpine
+    pull_policy: never
+    init: true
+    restart: "no"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    command: ["sleep", "infinity"]
+    networks:
+      test-net:
+        ipv4_address: 10.50.0.20
+
+networks:
+  test-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.50.0.0/24

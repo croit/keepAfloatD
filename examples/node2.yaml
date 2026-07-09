@@ -1,0 +1,39 @@
+# Three-node lab example, node 2. See README "Manual multi-node".
+
+node_id: 2
+raft_listen: "127.0.0.1:7010"
+client_submit_listen: "127.0.0.1:7011"
+
+peers:
+  - id: 1
+    raft_address: "127.0.0.1:7000"
+    client_submit_address: "127.0.0.1:7001"
+  - id: 2
+    raft_address: "127.0.0.1:7010"
+    client_submit_address: "127.0.0.1:7011"
+  - id: 3
+    raft_address: "127.0.0.1:7020"
+    client_submit_address: "127.0.0.1:7021"
+
+vips:
+  - address: "10.0.0.101"
+    interface: lo
+  - address: "10.0.0.102"
+    interface: lo
+
+health:
+  command: ["/bin/true"]
+  interval_ms: 2000
+  timeout_ms: 5000
+  stale_secs: 10
+
+raft:
+  election_timeout_min_ms: 400
+  election_timeout_max_ms: 800
+  heartbeat_interval_ms: 250
+
+cluster_secret: "lab-shared-secret-please-change"
+max_frame_bytes: 4194304
+submit_timeout_ms: 2000
+
+dry_run: true
