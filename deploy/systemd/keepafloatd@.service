@@ -13,5 +13,28 @@ RestartSec=1
 TimeoutStopSec=15
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 
+# Sandbox: the daemon needs only NET_ADMIN (ip addr add/del) and NET_RAW
+# (arping). Health and notify commands run inside this sandbox too — if yours
+# needs more access, relax the unit with a systemctl drop-in, don't edit it.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# AF_NETLINK for `ip`, AF_PACKET for `arping`, the rest for Raft/DNS/sockets.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+
 [Install]
 WantedBy=multi-user.target
