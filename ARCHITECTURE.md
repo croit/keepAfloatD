@@ -333,19 +333,19 @@ Cluster formation (`auto_form_cluster` in `src/raft/mod.rs`, `src/raft/probe.rs`
     cluster-wide identical membership (built from `peers`). OpenRaft documents concurrent
     `initialize` with the same config as safe (only *different* configs cause split brain, and the
     shared `peers` roster already rules that out). Raft then elects a single leader among the
-    reachable majority. Because no node is special, **any majority can form — or recover — the
+    reachable majority. Because no node is special, **any majority can form - or recover - the
     cluster even if the lowest-id node is permanently gone.** This matters for diskless/PXE nodes
     that keep no state across reboots: after a full outage, whichever majority comes back reforms
     the cluster on its own.
   - **Quorum gate + existing-cluster check.** A node initializes only after a majority of peers
     (including itself) respond *uninitialized*, so a network partition yields at most one side with
     a leader, never two. If any peer reports an existing cluster (`initialized` or a known leader),
-    the node declines and joins as a follower via replication — so a blank-rebooted node **rejoins**
+    the node declines and joins as a follower via replication - so a blank-rebooted node **rejoins**
     rather than re-forming.
   - **Cluster incarnation fence.** The two facts above protect the common cases but leave one gap:
     if a minority is partitioned away and the majority then *loses its state and reforms* while the
     minority is still gone, the returning minority would hold stale, possibly higher-term state that
-    Raft's log-recency rule could let win — overwriting the legitimate majority (the in-memory store
+    Raft's log-recency rule could let win - overwriting the legitimate majority (the in-memory store
     violates Raft's durable-storage assumption). To close this, the first leader of a freshly formed
     cluster commits a random `ClusterFormed { cluster_id }` *incarnation*, which every member carries
     in the transport handshake. A node holding a *different* concrete incarnation has its Raft RPCs
@@ -390,7 +390,7 @@ Model:
   - `node_id`
   - `raft_listen`
   - `client_submit_listen`
-- Cluster formation is automatic — see "Cluster formation" above.
+- Cluster formation is automatic - see "Cluster formation" above.
 
 Defaults and normalization at load time:
 
@@ -490,4 +490,4 @@ Explicit non-goals:
   - cluster formation does not depend on durable state: any reachable majority reforms the cluster
     automatically (see "Cluster formation"), and a restart-safe reclaim path exists for VIPs
 
-When an AI agent proposes features outside this list, the default answer should be to push back unless the project's stated scope has explicitly changed.
+Features outside this list require an explicit project-scope decision before implementation.

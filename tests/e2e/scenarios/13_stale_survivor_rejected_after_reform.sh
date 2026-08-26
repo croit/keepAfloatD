@@ -60,7 +60,7 @@ wait_for_service_exit node-a 30
 start_service node-a
 wait_for_service_running node-a 10
 
-# 4c. Returning blank, node-a JOINS the new cluster via replication — it must NOT cold-form again.
+# 4c. Returning blank, node-a JOINS the new cluster via replication - it must NOT cold-form again.
 wait_for_log_any_after "${heal_checkpoint}" 45 'joining via replication instead of forming a new one'
 
 # 5. The cluster converges to the steady 3-node layout: unique holders, one agreed leader across all

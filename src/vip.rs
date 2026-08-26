@@ -124,8 +124,8 @@ impl LocalVip {
     /// so re-assertion does not spam the segment.
     pub async fn bind(&self, iface: &str, ip: IpAddr, prefix: u8) -> anyhow::Result<()> {
         let first_bind = !self.bound.read().await.contains(&ip);
-        // Record ownership *before* the syscall so a task abort mid-bind (SIGTERM →
-        // vip_task.abort()) still leaves the address recorded for unbind_all to reclaim; otherwise
+        // Record ownership *before* the syscall so SIGTERM followed by vip_task.abort() still leaves
+        // the address recorded for unbind_all to reclaim; otherwise
         // the child could finish attaching the address while the dropped future never inserted it,
         // leaking the VIP past graceful shutdown.
         self.bound.write().await.insert(ip);
@@ -279,7 +279,7 @@ impl VipState {
 
 /// Choose the notify state for a VIP release.
 ///
-/// `FAULT` when this node's own health check failed — the local node is the cause of the
+/// `FAULT` when this node's own health check failed - the local node is the cause of the
 /// release. `BACKUP` for any cluster-level reason (orderly reassignment, leader re-election,
 /// stale consensus): per keepalived convention `FAULT` signals a *local* failure only.
 pub(crate) fn release_notify_state(local_ok: bool) -> VipState {
@@ -322,7 +322,7 @@ fn fire_notify_script(
             .kill_on_drop(true)
             .status();
         // Bound the user script: a blocking notify hook (network call, held lock, downed service)
-        // must not stall unbind_all — which awaits every notify task — until systemd's
+        // must not stall unbind_all - which awaits every notify task - until systemd's
         // TimeoutStopSec SIGKILLs the whole daemon and skips orderly Raft/network shutdown.
         match tokio::time::timeout(NOTIFY_SCRIPT_TIMEOUT, run).await {
             Ok(Ok(s)) if s.success() => tracing::debug!(
@@ -434,7 +434,7 @@ pub async fn run_reconcile_loop(
             if let Err(e) = vip_local.unbind(iface, addr, prefix).await {
                 tracing::warn!("unbind {}: {}", addr, e);
             } else if was_bound {
-                // FAULT only when local health failed; cluster events → BACKUP.
+                // FAULT is only for local health failures; cluster events use BACKUP.
                 if let Some(script) = cfg.notify.as_deref() {
                     let _ = fire_notify_script(
                         script,
@@ -644,7 +644,7 @@ mod tests {
         assert!(vip.bound.read().await.is_empty());
     }
 
-    // VLAN sub-interface tests — verify that bind/unbind/startup_cleanup/unbind_all work
+    // VLAN sub-interface tests - verify that bind/unbind/startup_cleanup/unbind_all work
     // correctly when the effective interface is a VLAN sub-interface string (e.g. "eth0.100").
     // The interface name is computed by config::sorted_vips(); vip.rs treats it as an opaque
     // string, so dry-run tests here confirm the bookkeeping is correct regardless of the format.
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn release_notify_state_is_backup_when_healthy_and_fault_when_unhealthy() {
-        // FAULT only on local health failure; cluster events (no leader, stale raft) → BACKUP.
+        // FAULT is only for local health failures; cluster events use BACKUP.
         assert_eq!(release_notify_state(true), VipState::Backup);
         assert_eq!(release_notify_state(false), VipState::Fault);
     }

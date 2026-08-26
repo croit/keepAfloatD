@@ -37,7 +37,7 @@ l1_svc="$(service_for_id "${l1_id}")"
 }
 log "leadership moved to ${l1_svc} (id ${l1_id})"
 
-# Phase 2: survivor-rejoin against the NEW leader L1 — kill L1 plus one follower, keep one survivor.
+# Phase 2: survivor-rejoin against the NEW leader L1 - kill L1 plus one follower, keep one survivor.
 others=()
 for svc in "${NODES[@]}"; do
   [[ "${svc}" == "${l1_svc}" ]] || others+=("${svc}")

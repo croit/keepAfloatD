@@ -1,7 +1,7 @@
 # Development guide
 
 Building, testing and working on keepAfloatD. For the runtime design see
-[architecture.md](architecture.md); for running it in production see
+[ARCHITECTURE.md](../ARCHITECTURE.md); for running it in production see
 [operations.md](operations.md).
 
 ## Build and test
@@ -34,7 +34,7 @@ multi-node cluster tests that exercise ownership and handoff without touching re
 
 The placement and eligibility logic in `src/raft/store/vip_logic.rs` is deliberately pure and
 deterministic (no clocks, no RNG, iteration over sorted structures) so every node and every replay
-computes the same holder map — this is what keeps ownership consistent across the cluster.
+computes the same holder map - this is what keeps ownership consistent across the cluster.
 
 ## End-to-end scenario harness
 
@@ -54,25 +54,25 @@ past failures), and writes an aggregated `e2e-artifacts/report.md` plus per-scen
 
 ### Layout of `tests/e2e/`
 
-- `configs/` — the static node configs the harness feeds each container.
-- `scenarios/` — one `NN_name.sh` per failover scenario (steady state, holder death, leader death,
+- `configs/` - the static node configs the harness feeds each container.
+- `scenarios/` - one `NN_name.sh` per failover scenario (steady state, holder death, leader death,
   network partition, graceful SIGINT, restart/rejoin, full-outage recovery, cold start, stale-survivor
   fencing, …).
-- `scripts/lib.sh` — the shared helpers (`kill_service`, `wait_for_service_exit`,
+- `scripts/lib.sh` - the shared helpers (`kill_service`, `wait_for_service_exit`,
   `wait_for_even_over_nodes`, VIP-holder assertions) every scenario builds on.
 
 ### Adding a scenario
 
 Copy an existing `scenarios/NN_*.sh`, source `lib.sh`, drive the cluster (kill/partition/restart a
 container), then assert the observable outcome with the `wait_for_*` helpers. Scenarios are numbered
-so they run in order; each starts from a fresh stack. Keep them deterministic — assert on VIP
+so they run in order; each starts from a fresh stack. Keep them deterministic - assert on VIP
 placement and leadership, not on wall-clock timing.
 
 ## Conventions
 
 - `cargo fmt` (edition 2024 style) and `cargo clippy --all-targets` must be clean.
-- Keep `src/raft/store/vip_logic.rs` pure — no clocks, RNG or hash-map iteration order, so replays
+- Keep `src/raft/store/vip_logic.rs` pure - no clocks, RNG or hash-map iteration order, so replays
   stay deterministic.
 - Every behaviour change needs a test: a unit test for logic, or an e2e scenario for cluster-level
   behaviour.
-- Contributions require a signed CLA or copyright assignment — see [CONTRIBUTING.md](../CONTRIBUTING.md).
+- Contributions require a signed CLA or copyright assignment - see [CONTRIBUTING.md](../CONTRIBUTING.md).

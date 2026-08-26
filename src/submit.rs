@@ -237,10 +237,13 @@ async fn handle_one_submit(
     Ok(())
 }
 
-/// Validate envelope (secret + node_id membership + sender binding) and extract the inner
-/// request, or return a human-readable rejection message. `from_ip` is the connection's source
-/// address; a node may submit only for itself, so it must match the claimed node's advertised
-/// address — a secret-holding but compromised node cannot then forge state for a different node.
+/// Validate envelope (secret + node_id membership + sender binding) and extract the inner request,
+/// or return a human-readable rejection message.
+///
+/// `from_ip` is the connection's source address. A node may submit only for **itself**: the source
+/// IP must match the advertised address of the claimed `node_id`. The shared secret proves the
+/// sender is *in* the cluster; this binding proves it is the node it claims to be, so a
+/// secret-holding but compromised node cannot forge health for a different `node_id`.
 fn validate_and_extract(
     cfg: &Config,
     from_ip: std::net::IpAddr,

@@ -6,6 +6,7 @@
 //! holder can wait for a safe release point before binding.
 
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use std::net::IpAddr;
 
 /// Commands replicated through Raft and applied to the state machine.
@@ -77,13 +78,15 @@ pub enum KafResponse {
     Ok,
 }
 
+/// In-memory snapshot payload shared by the state machine and Raft transport.
+pub type KafSnapshotData = Cursor<Vec<u8>>;
+
 openraft::declare_raft_types!(
     /// Marker type wiring OpenRaft generics for this daemon.
     ///
-    /// Only the application-specific associated types are set here; the rest
-    /// (`NodeId = u64`, `Node = BasicNode`, `SnapshotData = Cursor<Vec<u8>>`,
-    /// `AsyncRuntime = TokioRuntime`, the leader-id/vote/entry/responder types) take the
-    /// `declare_raft_types!` defaults, which match the values keepafloatd used under openraft 0.9.
+    /// Only the application-specific associated types are set here; the rest (`NodeId = u64`,
+    /// `Node = BasicNode`, `AsyncRuntime = TokioRuntime`, and the leader-id/vote/entry/responder
+    /// types) take the `declare_raft_types!` defaults.
     pub TypeConfig:
         D = KafRequest,
         R = KafResponse,

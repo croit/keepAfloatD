@@ -20,7 +20,7 @@ wait_for_service_exit node-a 10
 wait_for_service_exit node-b 10
 wait_for_service_exit node-c 10
 
-# Bring all three back at once — a genuine concurrent cold start.
+# Bring all three back at once - a genuine concurrent cold start.
 start_service node-a
 start_service node-b
 start_service node-c

@@ -569,7 +569,7 @@ mod tests {
             activation_tick: 0,
         };
         let nh = HashMap::from([(1_u64, true), (2, true)]);
-        // node 1 exactly at the stale threshold → still eligible → replacement blocked.
+        // At the stale threshold, node 1 remains eligible and blocks replacement.
         let at_threshold = HashMap::from([(1_u64, 7_u64), (2, 10)]);
         assert!(!should_bind_vip(
             true,
@@ -585,7 +585,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
         ));
-        // node 1 one round past the threshold → ineligible → replacement allowed.
+        // One round past the threshold, node 1 is ineligible and replacement is allowed.
         let past_threshold = HashMap::from([(1_u64, 6_u64), (2, 10)]);
         assert!(should_bind_vip(
             true,
@@ -609,7 +609,7 @@ mod tests {
         let a2 = assignment(1);
         let nh = HashMap::from([(1_u64, true)]);
         let ticks = HashMap::from([(1_u64, 5_u64)]);
-        // Healthy, fresh, leader present, consensus fresh → binds both of its VIPs.
+        // A healthy, fresh holder with a fresh leader binds both of its VIPs.
         assert!(should_bind_vip(
             true,
             true,
@@ -638,7 +638,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
         ));
-        // Loses consensus freshness → binds neither.
+        // Losing consensus freshness prevents both binds.
         assert!(!should_bind_vip(
             true,
             true,

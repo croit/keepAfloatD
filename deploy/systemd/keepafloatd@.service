@@ -14,7 +14,7 @@ TimeoutStopSec=15
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 
 # Sandbox: the daemon needs only NET_ADMIN (ip addr add/del) and NET_RAW
-# (arping). Health and notify commands run inside this sandbox too — if yours
+# (arping). Health and notify commands run inside this sandbox too - if yours
 # needs more access, relax the unit with a systemctl drop-in, don't edit it.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes

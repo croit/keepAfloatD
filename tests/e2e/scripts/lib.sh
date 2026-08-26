@@ -2,14 +2,14 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
-COMPOSE_FILE="${COMPOSE_FILE:-${ROOT_DIR}/tests/e2e/docker-compose.yml}"
+COMPOSE_FILE="${COMPOSE_FILE:-${ROOT_DIR}/docker-compose.yml}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-keepafloatd-e2e}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${ROOT_DIR}/e2e-artifacts/compose}"
 export COMPOSE_PROJECT_NAME
 
 # Cluster topology. Overridable via space-separated env vars so a larger suite (e.g. the
 # 5-node/4-VIP minimal-movement scenario driven by run5.sh) can reuse this library unchanged.
-# Defaults are the 3-node/3-VIP layout used by scenarios 01–11; leaving the env vars unset keeps
+# Defaults are the 3-node/3-VIP layout used by scenarios 01-13; leaving the env vars unset keeps
 # that behavior identical.
 #
 # Note: there are deliberately no fixed expected-assignment arrays. The minimal-movement assignment

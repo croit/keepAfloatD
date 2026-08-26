@@ -63,7 +63,7 @@ pub struct Config {
     /// Defaults to [`DEFAULT_MAX_FRAME_BYTES`].
     #[serde(default = "default_max_frame_bytes")]
     pub max_frame_bytes: u32,
-    /// Wall-clock budget for one follower→leader submit forward. Defaults to
+    /// Wall-clock budget for one follower to leader submit forward. Defaults to
     /// [`DEFAULT_SUBMIT_TIMEOUT_MS`].
     #[serde(default = "default_submit_timeout_ms")]
     pub submit_timeout_ms: u64,
@@ -73,9 +73,9 @@ pub struct Config {
     /// Optional notify script called on VIP ownership transitions (keepalived-compatible).
     ///
     /// When set, the script is invoked as:
-    ///   `<script> INSTANCE <vip_address> MASTER`  — when this node gains the VIP,
-    ///   `<script> INSTANCE <vip_address> BACKUP`  — when a healthy node releases the VIP, and
-    ///   `<script> INSTANCE <vip_address> FAULT`   — when this node releases the VIP because its
+    ///   `<script> INSTANCE <vip_address> MASTER` - when this node gains the VIP,
+    ///   `<script> INSTANCE <vip_address> BACKUP` - when a healthy node releases the VIP, and
+    ///   `<script> INSTANCE <vip_address> FAULT` - when this node releases the VIP because its
     ///                                               own health check failed.
     ///
     /// The script runs fire-and-forget in a separate task; failures are logged but do not affect
@@ -163,7 +163,7 @@ impl VipAddr {
         }
     }
 
-    /// A host-route VIP (`/32` or `/128`) — used by tests and as the no-suffix default.
+    /// A host-route VIP (`/32` or `/128`) - used by tests and as the no-suffix default.
     #[must_use]
     pub fn host(addr: IpAddr) -> Self {
         Self {
@@ -230,7 +230,7 @@ pub struct VipConfig {
     pub address: VipAddr,
     /// Linux interface name (e.g. `eth0`) for `ip addr add|del`.
     pub interface: String,
-    /// Optional IEEE 802.1Q VLAN tag (1–4094). When set, all `ip addr` operations target
+    /// Optional IEEE 802.1Q VLAN tag (1-4094). When set, all `ip addr` operations target
     /// `{interface}.{vlan}` (e.g. `eth0.100`). The sub-interface must pre-exist; keepafloatd
     /// does not create or destroy VLAN sub-interfaces. `interface` must not itself contain a dot
     /// when `vlan` is set. Absent means no VLAN (current behaviour).
@@ -437,7 +437,7 @@ impl Config {
             if let Some(vlan) = vip.vlan {
                 anyhow::ensure!(
                     (1..=4094).contains(&vlan),
-                    "vips[{i}] ({}): vlan {vlan} is out of range: IEEE 802.1Q allows 1–4094",
+                    "vips[{i}] ({}): vlan {vlan} is out of range: IEEE 802.1Q allows 1-4094",
                     vip.address
                 );
                 anyhow::ensure!(
@@ -1355,7 +1355,7 @@ failback_delay_secs: 0
 
     #[test]
     fn effective_failback_delay_ticks_converts_seconds_to_probe_rounds() {
-        // interval_ms=1000 → interval_secs=1 → delay_ticks = ceil(10/1) = 10
+        // interval_ms=1000, interval_secs=1, delay_ticks = ceil(10/1) = 10
         let yaml = r#"
 node_id: 1
 raft_listen: "127.0.0.1:1"
@@ -1377,7 +1377,7 @@ failback_delay_secs: 10
         let c = parse_normalize(yaml).unwrap();
         assert_eq!(c.effective_failback_delay_ticks(), 10);
 
-        // interval_ms=3000 → interval_secs=3 → delay_ticks = ceil(10/3) = 4
+        // interval_ms=3000, interval_secs=3, delay_ticks = ceil(10/3) = 4
         let yaml2 = r#"
 node_id: 1
 raft_listen: "127.0.0.1:1"
@@ -1399,7 +1399,7 @@ failback_delay_secs: 10
         let c2 = parse_normalize(yaml2).unwrap();
         assert_eq!(c2.effective_failback_delay_ticks(), 4);
 
-        // interval_ms=500 (<1s) → interval_secs=1 → delay_ticks = ceil(5/1) = 5
+        // interval_ms=500 (<1s), interval_secs=1, delay_ticks = ceil(5/1) = 5
         let yaml3 = r#"
 node_id: 1
 raft_listen: "127.0.0.1:1"

@@ -1,4 +1,4 @@
-//! keepAfloatD — VIP failover daemon (OpenRaft + script-based health checks).
+//! keepAfloatD - VIP failover daemon (OpenRaft + script-based health checks).
 //!
 //! Process lifecycle
 //! -----------------
@@ -88,8 +88,8 @@ async fn main() -> anyhow::Result<()> {
     .await
 }
 
-/// Wire up the full daemon — orphan VIP cleanup, Raft transport + auto-formation, the submit
-/// server, health publishing and VIP reconciliation — then run until `shutdown` resolves and tear
+/// Wire up the full daemon - orphan VIP cleanup, Raft transport + auto-formation, the submit
+/// server, health publishing and VIP reconciliation - then run until `shutdown` resolves and tear
 /// everything down (stop reconciling, unbind every VIP this process holds, stop the remaining
 /// tasks, and shut down the Raft network and Raft itself).
 ///

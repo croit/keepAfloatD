@@ -19,7 +19,7 @@
 //! must release the VIP before the new holder may bind while the old node is still eligible. This
 //! is what eliminates the old "two healthy lagging nodes can both bind" window.
 
-use super::super::types::TypeConfig;
+use super::super::types::{KafSnapshotData, TypeConfig};
 use crate::config::VipAddr;
 use openraft::SnapshotMeta;
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf};
@@ -94,12 +94,12 @@ pub struct KafSnapshot {
 ///
 /// `vip_list`, `stale_missed_probes`, `failback`, `failback_delay_ticks` and activation holdoff
 /// are constants of the local config and never enter the Raft log; they must be **identical** on
-/// every member. Note: `failback` is especially critical — it controls what gets written into
+/// every member. Note: `failback` is especially critical - it controls what gets written into
 /// replicated state (`node_failback_blocked`), so a mismatch causes state-machine divergence.
 ///
 /// The log-storage half ([`super::log::KafLogStore`]) and the state-machine half
 /// ([`super::state_machine::KafStateMachine`]) both hold an `Arc<RwLock<KafStorageState>>` pointing
-/// at one shared instance, so the openraft trait split is along method lines only — the data is not
+/// at one shared instance, so the openraft trait split is along method lines only - the data is not
 /// duplicated.
 pub struct KafStorageState {
     pub last_purged_log_id: Option<LogIdOf<TypeConfig>>,
@@ -109,7 +109,7 @@ pub struct KafStorageState {
     /// `read_committed` can resume the engine's commit frontier after a restart instead of
     /// returning `None`. Without this, a restarted node boots with `committed = None`, and the
     /// first commit-driven apply reads `get_log_entries(0..)` against a backfilled log whose floor
-    /// is non-zero — tripping `Defensive(LogIndexNotFound { want: 0 })`.
+    /// is non-zero - tripping `Defensive(LogIndexNotFound { want: 0 })`.
     pub committed: Option<LogIdOf<TypeConfig>>,
     pub last_applied_log: Option<LogIdOf<TypeConfig>>,
     pub last_membership: StoredMembershipOf<TypeConfig>,
@@ -147,12 +147,12 @@ impl KafStorageState {
     /// Shared by `build_snapshot` and `get_current_snapshot` so the snapshot payload and metadata
     /// are produced identically in both paths. The `snapshot_id` is derived from the full
     /// `last_applied` log id (`<leader>-<index>` via its `Display`), not the index alone, so two
-    /// snapshots taken at the same index in different terms get distinct ids — openraft uses the id
+    /// snapshots taken at the same index in different terms get distinct ids - openraft uses the id
     /// for snapshot identity and de-dup.
     pub(super) fn snapshot_at(
         &self,
         last_applied: LogIdOf<TypeConfig>,
-    ) -> std::io::Result<SnapshotOf<TypeConfig>> {
+    ) -> std::io::Result<SnapshotOf<TypeConfig, KafSnapshotData>> {
         let snap = KafSnapshot {
             last_applied: Some(last_applied),
             last_membership: self.last_membership.clone(),

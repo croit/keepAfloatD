@@ -59,6 +59,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 # Pinned exactly: 0.10 is an alpha; the storage/network trait surface can churn between alphas.
-# The I/O-progress redesign in 0.10 is what fixes the diskless restart-past-snapshot crash (bug 6).
-openraft = { version = "=0.10.0-alpha.25", features = ["serde", "type-alias"] }
+# The I/O-progress redesign in 0.10 fixes the diskless restart-past-snapshot crash.
+openraft = { version = "=0.10.0-alpha.32", features = ["serde", "type-alias"] }
 futures = "0.3"

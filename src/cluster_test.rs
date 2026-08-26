@@ -1,14 +1,14 @@
 //! In-process, end-to-end cluster tests.
 //!
 //! Spins up real `keepafloatd` daemons (via [`crate::run`]) on loopback ports with dry-run VIP
-//! binding — both a single node and a three-node cluster — lets them auto-form, publish health and
+//! binding - both a single node and a three-node cluster - lets them auto-form, publish health and
 //! reconcile VIPs, then asserts every VIP ends up bound on exactly one holder and is released on
 //! shutdown.
 //!
-//! This exercises the networked stack the unit tests cannot reach — peer handshake + RPC transport
+//! This exercises the networked stack the unit tests cannot reach - peer handshake + RPC transport
 //! (`raft::network`), auto-formation (`raft::mod`), the full `RaftStorage` trait (`raft::store`),
-//! follower→leader submit forwarding (`submit`) and the reconciliation loop (`vip`) — through the
-//! public composition API only, so it stays valid as the transport internals evolve.
+//! follower-to-leader submit forwarding (`submit`) and the reconciliation loop (`vip`) through the
+//! public composition API, so it stays valid as the transport internals evolve.
 //!
 //! Assertions are invariant-based (every VIP bound exactly once across the cluster; all released on
 //! shutdown), never "which node holds which VIP", so the upcoming sticky/min-move placement change
@@ -203,10 +203,10 @@ async fn three_node_cluster_forms_distributes_and_releases_vips() {
 /// End-to-end notify hook test: a single-node cluster with a real notify script.
 ///
 /// Verifies that acquiring a VIP causes the script to be invoked with `INSTANCE <addr> MASTER`,
-/// and that releasing it (health loss → FAULT) triggers `INSTANCE <addr> FAULT`.
+/// and that a health-loss release triggers `INSTANCE <addr> FAULT`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notify_script_fires_master_on_vip_acquisition_and_fault_on_health_failure() {
-    // Fix #8: unique per-invocation suffix so parallel test runs don't share the same tmpdir.
+    // Use a unique suffix so parallel test runs do not share the same temporary directory.
     static NOTIFY_TEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let uid = NOTIFY_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let tmp = std::env::temp_dir().join(format!("kaf_notify_{}_{}", std::process::id(), uid));
@@ -214,7 +214,7 @@ async fn notify_script_fires_master_on_vip_acquisition_and_fault_on_health_failu
     let script = tmp.join("notify.sh");
     let log = tmp.join("notify.log");
 
-    // Health flag file: exists → healthy, absent → unhealthy.
+    // The node is healthy while the flag exists and unhealthy after it is removed.
     let health_flag = tmp.join("healthy");
     tokio::fs::write(&health_flag, "").await.unwrap();
 
@@ -244,7 +244,7 @@ async fn notify_script_fires_master_on_vip_acquisition_and_fault_on_health_failu
     }];
 
     let mut cfg = (*make_cfg(0, &peers, &vips)).clone();
-    // Fix #6: quote the path so it is safe if TMPDIR contains spaces.
+    // Quote the path because the temporary directory may contain spaces.
     cfg.health.command = vec![
         "/bin/sh".into(),
         "-c".into(),
@@ -294,7 +294,7 @@ async fn notify_script_fires_master_on_vip_acquisition_and_fault_on_health_failu
     // Trigger FAULT: remove the health flag so the health check starts failing.
     tokio::fs::remove_file(&health_flag).await.unwrap();
 
-    // Wait for the VIP to be released (reconcile loop sees !local_ok → unbind → FAULT).
+    // Wait for the reconcile loop to observe !local_ok, unbind the VIP and report FAULT.
     let mut released = false;
     for _ in 0..150 {
         tokio::time::sleep(Duration::from_millis(200)).await;

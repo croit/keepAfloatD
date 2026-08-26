@@ -1,0 +1,39 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /tests/e2e/fixtures
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /tests/e2e/runner
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /tests/haproxy-e2e
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"

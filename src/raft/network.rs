@@ -2,7 +2,7 @@
 //!
 //! Wire format
 //! -----------
-//! 1. Handshake (sender → receiver): 8-byte BE [`Config::node_id`]; then 4-byte BE secret length
+//! 1. Handshake (sender to receiver): 8-byte BE [`Config::node_id`]; then 4-byte BE secret length
 //!    `s` followed by `s` bytes of [`Config::cluster_secret`] (zero-length means "no secret");
 //!    then a 1-byte cluster-incarnation flag (`0`/`1`) and, when `1`, 16 bytes BE of the sender's
 //!    committed cluster incarnation. The incarnation lets a receiver fence Raft RPCs from a peer in
@@ -27,7 +27,7 @@
 //! half-open connection into a prompt `Timeout` error instead of an unbounded `read_exact`.
 
 use super::probe::{ClusterStatusRequest, ClusterStatusResponse};
-use super::types::TypeConfig;
+use super::types::{KafSnapshotData, TypeConfig};
 use super::{KafRaft, KafStorageState};
 use crate::config::Config;
 use anyhow::Context;
@@ -659,6 +659,8 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkImpl {
 }
 
 impl RaftNetworkV2<TypeConfig> for RaftConnection {
+    type SnapshotData = KafSnapshotData;
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
@@ -677,7 +679,7 @@ impl RaftNetworkV2<TypeConfig> for RaftConnection {
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<TypeConfig>,
-        snapshot: SnapshotOf<TypeConfig>,
+        snapshot: SnapshotOf<TypeConfig, Self::SnapshotData>,
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {

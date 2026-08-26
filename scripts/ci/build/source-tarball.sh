@@ -21,9 +21,9 @@ mkdir -p dist
 STAGING="$(mktemp -d)"
 trap 'rm -rf "${STAGING}"' EXIT
 
-# Snapshot exactly the tracked files at HEAD (the release commit in CI). This
-# respects .gitignore, so target/, dist/, config.yaml, ... never leak in.
-git archive --format=tar --prefix="${NAME}/" HEAD | tar -x -C "${STAGING}"
+# Export the reviewed public manifest from the release commit. Internal CI files,
+# local configuration and maintainer-only documentation never enter the archive.
+"${WORKDIR}/scripts/public/export.sh" "${STAGING}/${NAME}" HEAD
 
 # git archive ships the placeholder version, so stamp the release version into
 # the staged tree (working-tree stamps never reach the archive).

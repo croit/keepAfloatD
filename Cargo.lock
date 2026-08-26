@@ -727,9 +727,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.25"
+version = "0.10.0-alpha.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a66d99dfb16ed37410298bcd5e5de85b2578471fa2fe6b630123a9fe1435960"
+checksum = "094676c5b08a2fdd82dfcff60a128efbe5bb4792dfb96dac05ad231a123fa942"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -756,22 +756,22 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.25"
+version = "0.10.0-alpha.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c842098c7cc8fb053b94daa2eb4417de160fce2bc1bc53c1164357f00b73cb6"
+checksum = "f5c57259539e016f70d05ea7e264573cc5ddabd651a127a13374e47b165b7664"
 dependencies = [
  "chrono",
  "proc-macro2",
  "quote",
  "semver",
- "syn 2.0.117",
+ "syn 3.0.4",
 ]
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.25"
+version = "0.10.0-alpha.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb2e39f9dbbbe5eb38d4db51e6e10efdf585ffb85bbe3e6cd466214d7562f80f"
+checksum = "02379ddf29c426905a6e91c5df522003ee2a9a9811b3b8be01e90ab1106ecef6"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -782,9 +782,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.25"
+version = "0.10.0-alpha.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "465a3a25c12eef62dfa8ff2f732993fe73efa163dc5a523ed3aec20bbb89a723"
+checksum = "cfeb8c656d8b0e01319aafc70f77b3b312cac56d07adf157d80b49677cc2fcec"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -1290,6 +1290,17 @@ name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -5,7 +5,7 @@
 //! recompute/reconcile feedback loop are unchanged from openraft 0.9; only the trait shape moved
 //! (apply now consumes a stream of `EntryResponder` and answers per entry via the responder).
 
-use super::super::types::{KafRequest, KafResponse, TypeConfig};
+use super::super::types::{KafRequest, KafResponse, KafSnapshotData, TypeConfig};
 use super::state::{KafSnapshot, KafStorageState};
 use super::vip_logic::{next_probe_tick, recompute_vip_holder, reconcile_vip_assignments};
 use futures::{Stream, TryStreamExt};
@@ -13,7 +13,7 @@ use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMember
 use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend, StoredMembership};
 use std::collections::HashMap;
-use std::io::{self, Cursor};
+use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -44,8 +44,7 @@ impl KafStateMachine {
             EntryPayload::Blank => KafResponse::Ok,
             EntryPayload::Normal(req) => match req {
                 KafRequest::HealthUpdate { node_id, healthy } => {
-                    let was_unhealthy = state.node_health.get(node_id) == Some(&false);
-                    state.node_health.insert(*node_id, *healthy);
+                    let previous_health = state.node_health.insert(*node_id, *healthy);
                     let next_tick = next_probe_tick(
                         state.node_probe_ticks.get(node_id).copied(),
                         state.latest_probe_tick,
@@ -55,16 +54,16 @@ impl KafStateMachine {
                         state.latest_probe_tick = next_tick;
                     }
                     if *healthy {
-                        // Transitioning from unhealthy → healthy: start the failback timer.
-                        if was_unhealthy {
+                        // A recovery delay only applies when recovered nodes may fail back.
+                        if state.failback && previous_health == Some(false) {
                             state.node_recovery_tick.insert(*node_id, next_tick);
                         }
-                        // First-time healthy (was_unhealthy=false, no prior entry): no timer.
+                        // A first healthy report, or recovery without failback, has no timer.
                     } else {
                         // Becoming unhealthy: reset any recovery timer.
                         state.node_recovery_tick.remove(node_id);
-                        // If failback is disabled, permanently block this node.
-                        if !state.failback {
+                        // A startup failure has no prior ownership to protect from failback.
+                        if !state.failback && previous_health == Some(true) {
                             state.node_failback_blocked.insert(*node_id);
                         }
                     }
@@ -150,7 +149,11 @@ impl KafStateMachine {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for KafStateMachine {
-    async fn build_snapshot(&mut self) -> Result<SnapshotOf<TypeConfig>, io::Error> {
+    type SnapshotData = KafSnapshotData;
+
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<SnapshotOf<TypeConfig, Self::SnapshotData>, io::Error> {
         let state = self.state.read().await;
         let last_applied = state
             .last_applied_log
@@ -160,6 +163,7 @@ impl RaftSnapshotBuilder<TypeConfig> for KafStateMachine {
 }
 
 impl RaftStateMachine<TypeConfig> for KafStateMachine {
+    type SnapshotData = KafSnapshotData;
     type SnapshotBuilder = Self;
 
     async fn applied_state(
@@ -187,14 +191,10 @@ impl RaftStateMachine<TypeConfig> for KafStateMachine {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Cursor<Vec<u8>>, io::Error> {
-        Ok(Cursor::new(Vec::new()))
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMetaOf<TypeConfig>,
-        snapshot: Cursor<Vec<u8>>,
+        snapshot: Self::SnapshotData,
     ) -> Result<(), io::Error> {
         let data = snapshot.into_inner();
         let snap: KafSnapshot = serde_json::from_slice(&data).map_err(|e| {
@@ -253,7 +253,9 @@ impl RaftStateMachine<TypeConfig> for KafStateMachine {
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<SnapshotOf<TypeConfig>>, io::Error> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<SnapshotOf<TypeConfig, Self::SnapshotData>>, io::Error> {
         let state = self.state.read().await;
         let Some(last_applied) = state.last_applied_log else {
             return Ok(None);

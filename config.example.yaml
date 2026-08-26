@@ -28,12 +28,12 @@ peers:
     raft_address: "127.0.0.1:7020"
     client_submit_address: "127.0.0.1:7021"
 
-# Virtual IPs to distribute across healthy voters. `address` takes an optional CIDR
-# suffix (`10.0.0.101/24`); without one the VIP is bound as a host route (`/32` for IPv4,
+# Virtual IPs to distribute across healthy voters. `address` takes an optional keepalived-style
+# CIDR suffix (`10.0.0.101/24`); without one the VIP is bound as a host route (`/32` for IPv4,
 # `/128` for IPv6), which is the usual choice. The prefix must match how the address is reachable on
 # `interface`. This list must be identical on every node.
 #
-# Optional: `vlan` (IEEE 802.1Q tag, 1–4094). When set, `ip addr` targets `{interface}.{vlan}`
+# Optional: `vlan` (IEEE 802.1Q tag, 1-4094). When set, `ip addr` targets `{interface}.{vlan}`
 # (e.g. `eth0.100`). The sub-interface must already exist; keepafloatd does not create VLANs.
 vips:
   - address: "10.0.0.101/24"
@@ -75,20 +75,22 @@ dry_run: false
 
 # Optional notify script called when this node gains or releases a VIP (keepalived-compatible).
 # Invoked as: <script> INSTANCE <vip_address> MASTER|BACKUP|FAULT
-# MASTER — this node just acquired the VIP.
-# BACKUP — this node released the VIP to another healthy node.
-# FAULT  — this node released the VIP because its own health check failed.
+# MASTER - this node just acquired the VIP.
+# BACKUP - this node released the VIP to another healthy node.
+# FAULT - this node released the VIP because its own health check failed.
 # The script runs fire-and-forget; a non-zero exit is logged but does not affect failover.
 # This is a per-node field and may differ between cluster members.
 # notify: /etc/keepafloatd/notify.sh
 
 # Whether a recovered node is allowed to reclaim VIPs it previously held (analogous to
 # keepalived's `preempt` / `nopreempt`).
-#   true  (default) — recovered nodes re-enter the eligible pool after `failback_delay_secs`.
-#   false           — once a node goes unhealthy it is permanently blocked from holding VIPs
-#                     until the entire cluster is fully reformed (all nodes restart from scratch
-#                     without an existing snapshot). Restarting a single daemon is not enough
-#                     because the block is replicated via Raft snapshot (nopreempt behaviour).
+#   true  (default) - recovered nodes re-enter the eligible pool after `failback_delay_secs`.
+#   false: once a previously healthy node goes unhealthy it is permanently blocked
+#                     from holding VIPs until the entire cluster is fully reformed (all nodes
+#                     restart from scratch without an existing snapshot). A node whose first
+#                     startup probe fails may still join after it becomes healthy. Restarting a
+#                     single daemon is not enough because the block is replicated via Raft
+#                     snapshot (nopreempt behaviour).
 # failback: true
 
 # Minimum time (seconds) a recovered node must remain healthy before it can take back VIPs.

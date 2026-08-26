@@ -7,7 +7,7 @@ It does not attempt to enumerate Debian or other OS packages pulled in by contai
 installation paths; its scope is the Rust/Cargo dependency graph for this repository.
 
 - Scope: `cargo metadata --format-version 1 --locked`
-- Non-root crates observed: `182`
+- Non-root crates observed: `183`
 - Distinct third-party license expressions observed: `13`
 
 Every third-party crate in the current lockfile is usable under a permissive license. The only
@@ -180,10 +180,10 @@ with a commercial licensing path available from `croit.io`.
 - `num-traits` `0.2.19`
 - `once_cell` `1.21.4`
 - `once_cell_polyfill` `1.70.2`
-- `openraft` `0.10.0-alpha.25`
-- `openraft-macros` `0.10.0-alpha.25`
-- `openraft-rt` `0.10.0-alpha.25`
-- `openraft-rt-tokio` `0.10.0-alpha.25`
+- `openraft` `0.10.0-alpha.32`
+- `openraft-macros` `0.10.0-alpha.34`
+- `openraft-rt` `0.10.0-alpha.34`
+- `openraft-rt-tokio` `0.10.0-alpha.34`
 - `parking_lot` `0.12.5`
 - `parking_lot_core` `0.9.12`
 - `ppv-lite86` `0.2.21`
@@ -216,6 +216,7 @@ with a commercial licensing path available from `croit.io`.
 - `socket2` `0.6.3`
 - `syn` `1.0.109`
 - `syn` `2.0.117`
+- `syn` `3.0.4`
 - `thiserror` `2.0.18`
 - `thiserror-impl` `2.0.18`
 - `thread_local` `1.1.9`

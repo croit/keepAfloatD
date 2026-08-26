@@ -13,14 +13,12 @@ following for the submitted work:
 - a signed Contributor License Agreement (`CLA`), or
 - a copyright assignment accepted by croit GmbH
 
-Submitting a merge request does not by itself replace these contributor terms. If your contribution
+Submitting a pull request does not by itself replace these contributor terms. If your contribution
 is accepted for review, the maintainers will tell you which path applies and how to complete it.
 
 ## Practical Workflow
 
-- open or reference the relevant GitLab issue
+- open or reference the relevant GitHub issue
 - work on a dedicated branch
 - keep changes scoped to the issue
 - run the relevant validation commands before requesting review
-
-For repository-specific branch, push, and MR expectations, see `AGENTS.md`.

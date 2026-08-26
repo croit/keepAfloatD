@@ -66,6 +66,9 @@ pub async fn start_raft(
         election_timeout_min: cfg.raft.election_timeout_min_ms,
         election_timeout_max: cfg.raft.election_timeout_max_ms,
         heartbeat_interval: cfg.raft.heartbeat_interval_ms,
+        // Nodes are intentionally diskless and restart with empty logs. Let the leader reset its
+        // remembered follower progress so it can replay the committed state after a restart.
+        allow_log_reversion: Some(true),
         ..Default::default()
     }
     .validate()
@@ -181,14 +184,14 @@ async fn run_epoch_minter(
     }
 }
 
-/// Detect that this node is a **stale survivor** — it still holds an old incarnation while a
-/// majority of the roster has reformed under a new one — and reset by exiting for a supervisor
+/// Detect that this node is a **stale survivor** - it still holds an old incarnation while a
+/// majority of the roster has reformed under a new one - and reset by exiting for a supervisor
 /// restart (returning blank, it rejoins via replication like any diskless reboot).
 ///
 /// Safety of the reset rests on the trigger: the node must (1) hold a committed incarnation,
 /// (2) currently have no leader, and (3) see a **majority of the whole roster** report a *different*
 /// concrete incarnation. Condition (3) is what proves this node is the minority that reformed
-/// around — it can hold nothing committed by that majority, so discarding its state loses nothing.
+/// around - it can hold nothing committed by that majority, so discarding its state loses nothing.
 /// A healthy follower in a normal election shares its peers' incarnation, so it never triggers.
 async fn run_cluster_guard(
     cfg: Arc<Config>,
@@ -262,16 +265,16 @@ async fn run_cluster_guard(
 ///
 /// Every node runs this; there is no special "bootstrap" node. Safety rests on two facts
 /// (see `ARCHITECTURE.md`):
-/// 1. **Identical-config initialize** — every node calls `Raft::initialize` with the *same*,
+/// 1. **Identical-config initialize** - every node calls `Raft::initialize` with the *same*,
 ///    cluster-wide identical membership (from `peers`). OpenRaft documents concurrent `initialize`
 ///    with the same config as safe; the only unsafe case is *different* configs, which the shared
 ///    `peers` roster already rules out. Raft then elects a single leader among the reachable
-///    majority, so any majority can form — or recover — the cluster even if the lowest-id node is
+///    majority, so any majority can form - or recover - the cluster even if the lowest-id node is
 ///    permanently gone (important for diskless/PXE nodes with no state across reboots).
-/// 2. **Quorum gate + existing-cluster check** — a node initializes only after a majority of peers
+/// 2. **Quorum gate + existing-cluster check** - a node initializes only after a majority of peers
 ///    (including itself) respond uninitialized. A network partition therefore yields at most one
 ///    side with a leader (quorum), never two. If any peer reports an existing cluster, the node
-///    joins via replication instead — so a blank-rebooted node rejoins rather than re-forming.
+///    joins via replication instead - so a blank-rebooted node rejoins rather than re-forming.
 async fn auto_form_cluster(cfg: Arc<Config>, raft: KafRaft, network: Arc<RaftNetworkImpl>) {
     match raft.is_initialized().await {
         Ok(true) => return, // already part of a cluster

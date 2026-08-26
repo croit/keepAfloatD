@@ -4,7 +4,7 @@
 //! of the roster is reachable, the node calls `Raft::initialize` with the full, cluster-wide
 //! identical membership. OpenRaft documents concurrent `initialize` with the *same* config as
 //! safe, so **every** node may do this and Raft elects a single leader among the reachable
-//! majority — no node is special, so any majority can form (or recover) the cluster even if the
+//! majority - no node is special, so any majority can form (or recover) the cluster even if the
 //! lowest-id node is permanently down. If a cluster already exists, the node joins via replication
 //! instead. See [`crate::raft::auto_form_cluster`] for the orchestration and the safety model.
 //!

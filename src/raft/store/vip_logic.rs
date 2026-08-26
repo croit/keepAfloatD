@@ -1,8 +1,8 @@
 //! Pure, deterministic VIP eligibility and assignment logic.
 //!
 //! These functions take only plain data (health maps, probe ticks, membership, the VIP list) and
-//! produce the holder map. No clocks, no RNG, no hash-map iteration-order dependence — every
-//! iteration is over sorted structures — so all nodes and all replays agree. The state machine in
+//! produce the holder map. No clocks, no RNG, no hash-map iteration-order dependence - every
+//! iteration is over sorted structures - so all nodes and all replays agree. The state machine in
 //! [`super::state_machine`] feeds committed state through here on every applied entry.
 
 use super::super::types::TypeConfig;
@@ -36,7 +36,7 @@ pub(crate) fn assign_vips_round_robin_eligible(
 /// Extreme-load node, ties broken by the lowest id.
 ///
 /// `load` is a `BTreeMap`, so it is iterated in ascending id order and the first node seen at the
-/// extreme — the lowest id — wins. `keep_current` decides the extreme: `l >= bl` keeps the smaller
+/// extreme - the lowest id - wins. `keep_current` decides the extreme: `l >= bl` keeps the smaller
 /// load (least-loaded), `l <= bl` keeps the larger (most-loaded). Returns `None` only for an empty
 /// map.
 fn extreme_loaded_node(
@@ -81,7 +81,7 @@ fn most_loaded_node(load: &BTreeMap<u64, usize>) -> Option<(u64, usize)> {
 /// nodes and replays agree. Idempotent on an already balanced assignment (it then makes no moves).
 ///
 /// With an empty `current_holders` (cold start) every VIP is an orphan placed in sorted order onto
-/// loads seeded to zero, which is exactly round-robin over the sorted eligible list — so cold-start
+/// loads seeded to zero, which is exactly round-robin over the sorted eligible list - so cold-start
 /// steady state matches `assign_vips_round_robin_eligible` for an already-sorted VIP list.
 pub(crate) fn assign_vips_minimal_movement(
     eligible: &[u64],
@@ -104,7 +104,7 @@ pub(crate) fn assign_vips_minimal_movement(
     let mut vips_sorted = vip_addrs_in_order.to_vec();
     vips_sorted.sort_unstable();
 
-    // Pass 1 — stability: keep VIPs whose current holder is still eligible.
+    // Pass 1 - stability: keep VIPs whose current holder is still eligible.
     let mut orphans: Vec<IpAddr> = Vec::new();
     for vip in &vips_sorted {
         match current_holders.get(vip) {
@@ -117,7 +117,7 @@ pub(crate) fn assign_vips_minimal_movement(
         }
     }
 
-    // Pass 2 — orphan placement: least-loaded eligible node, ties broken by the lowest id.
+    // Pass 2 - orphan placement: least-loaded eligible node, ties broken by the lowest id.
     for vip in orphans {
         let Some((target, _)) = least_loaded_node(&load) else {
             break;
@@ -127,7 +127,7 @@ pub(crate) fn assign_vips_minimal_movement(
         held.entry(target).or_default().insert(vip);
     }
 
-    // Pass 3 — rebalance until the load spread is at most one VIP. Each iteration strictly reduces
+    // Pass 3 - rebalance until the load spread is at most one VIP. Each iteration strictly reduces
     // the spread (a non-negative integer), so it terminates. `load` is non-empty here, so the
     // most/least lookups always yield `Some`; the loop ends via the spread check below.
     while let (Some((donor, donor_load)), Some((recv, recv_load))) =
@@ -204,7 +204,7 @@ pub fn is_node_eligible(
 /// A publishing node advances by one but never trails the cluster frontier
 /// (`latest_probe_tick`): a node returning after downtime (or a freshly joined node) catches up to
 /// the frontier in a single update and so regains freshness immediately, while a node that has
-/// *stopped* publishing keeps falling behind as the frontier advances — which is what drives
+/// *stopped* publishing keeps falling behind as the frontier advances - which is what drives
 /// failover. Pure and deterministic (no clocks), so every node and every replay agree.
 #[must_use]
 pub fn next_probe_tick(prev: Option<u64>, latest_probe_tick: u64) -> u64 {
@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn is_node_eligible_exact_staleness_boundary() {
         let nh = HashMap::from([(1_u64, true)]);
-        // latest - last == stale → still eligible.
+        // At latest - last == stale, the node remains eligible.
         let at = HashMap::from([(1_u64, 7_u64)]);
         assert!(is_node_eligible(
             1,
@@ -975,7 +975,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new()
         ));
-        // latest - last == stale + 1 → fenced off.
+        // At latest - last == stale + 1, the node is fenced off.
         let past = HashMap::from([(1_u64, 6_u64)]);
         assert!(!is_node_eligible(
             1,
@@ -1055,7 +1055,7 @@ mod tests {
         let ticks = HashMap::from([(1_u64, 10_u64)]);
         // Recovery tick = 8, delay = 3: need latest - recovery >= 3, i.e. latest >= 11.
         let recovery = HashMap::from([(1_u64, 8_u64)]);
-        // At tick 10: 10 - 8 = 2 < 3 → not eligible yet.
+        // At tick 10, 10 - 8 = 2 < 3, so the node is not eligible yet.
         assert!(!is_node_eligible(
             1,
             &nh,
@@ -1066,7 +1066,7 @@ mod tests {
             &recovery,
             &HashSet::new()
         ));
-        // At tick 11: 11 - 8 = 3 >= 3 → eligible.
+        // At tick 11, 11 - 8 = 3 >= 3, so the node is eligible.
         let ticks11 = HashMap::from([(1_u64, 11_u64)]);
         assert!(is_node_eligible(
             1,
@@ -1099,10 +1099,10 @@ mod tests {
             &recovery_at_5,
             &HashSet::new()
         ));
-        // After unhealthy→healthy again, recovery_tick resets to 7.
+        // After another unhealthy-to-healthy transition, recovery_tick resets to 7.
         let recovery_at_7 = HashMap::from([(1_u64, 7_u64)]);
         let ticks10 = HashMap::from([(1_u64, 10_u64)]);
-        // 10 - 7 = 3 >= 3 → eligible.
+        // 10 - 7 = 3 >= 3, so the node is eligible.
         assert!(is_node_eligible(
             1,
             &nh,

@@ -2,7 +2,7 @@ use super::state::{KafSnapshot, KafStorageState, VipAssignment};
 use super::{KafLogStore, KafStateMachine};
 use crate::config::VipAddr;
 use crate::raft::store::vip_logic::is_node_eligible;
-use crate::raft::types::{KafRequest, TypeConfig};
+use crate::raft::types::{KafRequest, KafSnapshotData, TypeConfig};
 use futures::stream;
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf};
 use openraft::entry::RaftEntry;
@@ -74,7 +74,7 @@ impl TestStore {
         self.log.read_vote().await
     }
 
-    /// 0.9 `purge_logs_upto(log_id)` removes `..=log_id.index` — maps directly to 0.10 `purge`.
+    /// 0.9 `purge_logs_upto(log_id)` removes `..=log_id.index` - maps directly to 0.10 `purge`.
     async fn purge_logs_upto(&mut self, log_id: LogIdOf<TypeConfig>) -> io::Result<()> {
         self.log.purge(log_id).await
     }
@@ -98,10 +98,6 @@ impl TestStore {
         self.sm.applied_state().await
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> io::Result<Cursor<Vec<u8>>> {
-        self.sm.begin_receiving_snapshot().await
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMetaOf<TypeConfig>,
@@ -114,7 +110,9 @@ impl TestStore {
         self.sm.get_snapshot_builder().await
     }
 
-    async fn get_current_snapshot(&mut self) -> io::Result<Option<SnapshotOf<TypeConfig>>> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> io::Result<Option<SnapshotOf<TypeConfig, KafSnapshotData>>> {
         self.sm.get_current_snapshot().await
     }
 }
@@ -144,7 +142,7 @@ fn membership_entry(index: u64, voters: &[u64]) -> EntryOf<TypeConfig> {
     let set: BTreeSet<u64> = voters.iter().copied().collect();
     // `Membership::new` rejects an empty voter config in 0.10 (`ensure_valid`); these tests
     // deliberately exercise the no-voters case (membership_without_voters_clears_assignments), so
-    // use `new_with_defaults`, which builds the membership without that validation — matching the
+    // use `new_with_defaults`, which builds the membership without that validation - matching the
     // 0.9 behaviour the regression suite relies on.
     EntryOf::<TypeConfig>::new_membership(
         lid(1, index),
@@ -172,12 +170,26 @@ fn storage(vips: &[IpAddr], stale_missed_probes: u64) -> TestStore {
 }
 
 fn storage_failback(vips: &[IpAddr], stale_missed_probes: u64, failback: bool) -> TestStore {
+    storage_failback_delay(vips, stale_missed_probes, failback, 0)
+}
+
+fn storage_failback_delay(
+    vips: &[IpAddr],
+    stale_missed_probes: u64,
+    failback: bool,
+    failback_delay_ticks: u64,
+) -> TestStore {
     let vip_list: Arc<Vec<(VipAddr, String)>> = Arc::new(
         vips.iter()
             .map(|&a| (VipAddr::host(a), "lo".to_string()))
             .collect(),
     );
-    let (log, sm, state) = super::new_store(vip_list, stale_missed_probes, failback, 0);
+    let (log, sm, state) = super::new_store(
+        vip_list,
+        stale_missed_probes,
+        failback,
+        failback_delay_ticks,
+    );
     TestStore { log, sm, state }
 }
 
@@ -232,6 +244,44 @@ async fn health_updates_advance_frontier_and_assign_only_eligible_holders() {
             a.holder
         );
     }
+}
+
+#[tokio::test]
+async fn initial_unhealthy_nodes_join_balanced_placement_without_failback() {
+    let v1 = ip4(10, 0, 0, 1);
+    let v2 = ip4(10, 0, 0, 2);
+    let mut s = storage_failback_delay(&[v1, v2], 3, false, 10);
+
+    s.apply_to_state_machine(&[membership_entry(1, &[1, 2, 3])])
+        .await
+        .unwrap();
+    s.apply_to_state_machine(&[health_entry(2, 1, true)])
+        .await
+        .unwrap();
+    s.apply_to_state_machine(&[health_entry(3, 2, false)])
+        .await
+        .unwrap();
+    s.apply_to_state_machine(&[health_entry(4, 3, false)])
+        .await
+        .unwrap();
+    s.apply_to_state_machine(&[health_entry(5, 2, true)])
+        .await
+        .unwrap();
+    s.apply_to_state_machine(&[health_entry(6, 3, true)])
+        .await
+        .unwrap();
+
+    let st = s.state.read().await;
+    assert!(
+        st.node_failback_blocked.is_empty(),
+        "an initial unhealthy report must not permanently block a starting node"
+    );
+    let holders: BTreeSet<u64> = st.vip_assignments.values().map(|a| a.holder).collect();
+    assert_eq!(
+        holders.len(),
+        2,
+        "two VIPs must have distinct holders after the starting nodes recover"
+    );
 }
 
 #[tokio::test]
@@ -361,7 +411,6 @@ async fn storage_trait_log_vote_and_snapshot_roundtrip() {
 
     // Install that snapshot into a fresh store and verify the committed state transfers.
     let mut restored = storage(&[v1], 3);
-    let _ = restored.begin_receiving_snapshot().await.unwrap();
     let bytes = snap.snapshot.into_inner();
     restored
         .install_snapshot(&snap.meta, Cursor::new(bytes))
@@ -427,7 +476,6 @@ async fn install_snapshot_purges_covered_log_and_sets_purged_id() {
         .unwrap();
 
     let (meta, bytes) = snapshot_covering(&[v1], 5).await;
-    let _ = restored.begin_receiving_snapshot().await.unwrap();
     restored
         .install_snapshot(&meta, Cursor::new(bytes))
         .await
@@ -467,7 +515,6 @@ async fn install_snapshot_keeps_log_suffix_above_index() {
         .unwrap();
 
     let (meta, bytes) = snapshot_covering(&[v1], 5).await;
-    let _ = restored.begin_receiving_snapshot().await.unwrap();
     restored
         .install_snapshot(&meta, Cursor::new(bytes))
         .await
@@ -489,7 +536,6 @@ async fn install_snapshot_does_not_move_purge_backwards() {
     restored.purge_logs_upto(lid(1, 9)).await.unwrap();
 
     let (meta, bytes) = snapshot_covering(&[v1], 5).await;
-    let _ = restored.begin_receiving_snapshot().await.unwrap();
     restored
         .install_snapshot(&meta, Cursor::new(bytes))
         .await
@@ -521,7 +567,6 @@ async fn install_snapshot_empty_last_applied_is_noop_on_log() {
         last_membership: StoredMembershipOf::<TypeConfig>::default(),
         snapshot_id: "empty".to_string(),
     };
-    let _ = restored.begin_receiving_snapshot().await.unwrap();
     restored
         .install_snapshot(&meta, Cursor::new(bytes))
         .await
@@ -533,7 +578,7 @@ async fn install_snapshot_empty_last_applied_is_noop_on_log() {
 }
 
 /// Two snapshots whose last-applied entry shares an index but was proposed in different terms
-/// must get distinct `snapshot_id`s — openraft uses the id for snapshot identity/de-dup, so an
+/// must get distinct `snapshot_id`s - openraft uses the id for snapshot identity/de-dup, so an
 /// index-only id would let a stale snapshot masquerade as an already-installed newer one.
 #[tokio::test]
 async fn snapshot_id_distinguishes_same_index_different_term() {
@@ -857,7 +902,7 @@ async fn truncate_after_is_exclusive_and_none_clears_log_and_floor() {
         .await
         .unwrap();
 
-    // truncate_after(Some(2)) keeps ..=2 (1 and 2 survive), removes 3,4,5 — the EXCLUSIVE
+    // truncate_after(Some(2)) keeps ..=2 (1 and 2 survive), removes 3,4,5 - the EXCLUSIVE
     // boundary: index 2 is KEPT, not removed (the 0.9 inclusive call removed index 2).
     log.truncate_after(Some(lid(1, 2))).await.unwrap();
     {
@@ -867,7 +912,7 @@ async fn truncate_after_is_exclusive_and_none_clears_log_and_floor() {
     }
 
     // truncate_after(None) removes the WHOLE log and, given a stale high floor, clears it to
-    // None — the reform-to-zero path (0.9 `delete_conflict_logs_since(index 0)`).
+    // None - the reform-to-zero path (0.9 `delete_conflict_logs_since(index 0)`).
     {
         let mut st = state.write().await;
         st.last_purged_log_id = Some(lid(1, 9000));
@@ -934,7 +979,6 @@ async fn install_snapshot_clears_failback_blocked_when_local_failback_true() {
     let mut restored = storage_failback(&[v1], 3, true);
 
     let (meta, bytes) = snapshot_with_blocked_node(&[v1]).await;
-    let _ = restored.begin_receiving_snapshot().await.unwrap();
     restored
         .install_snapshot(&meta, Cursor::new(bytes))
         .await
@@ -956,7 +1000,6 @@ async fn install_snapshot_keeps_failback_blocked_when_local_failback_false() {
     let mut restored = storage_failback(&[v1], 3, false);
 
     let (meta, bytes) = snapshot_with_blocked_node(&[v1]).await;
-    let _ = restored.begin_receiving_snapshot().await.unwrap();
     restored
         .install_snapshot(&meta, Cursor::new(bytes))
         .await

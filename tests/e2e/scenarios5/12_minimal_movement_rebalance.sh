@@ -13,7 +13,7 @@ export ROOT_DIR
 # hardcoded one: the assignment is a stable, minimal-movement, load-balancing rebalance, so the
 # absolute cold-start holder of each VIP depends on join/election timing and is not deterministic
 # across runs. Reading the real placement and asserting the relative behavior is strictly stronger
-# than hardcoding holders — it also proves that uninvolved VIPs do NOT move (the property that
+# than hardcoding holders - it also proves that uninvolved VIPs do NOT move (the property that
 # distinguishes minimal-movement from a global round-robin reshuffle).
 #
 # Narrative (A..E are physical nodes; victim1/victim2 are the two we kill; E0 is the idle node):
@@ -29,7 +29,7 @@ IPB="${VIPS[1]}"
 IPC="${VIPS[2]}"
 IPD="${VIPS[3]}"
 
-# expect_holders vip1 holder1 vip2 holder2 ... — true iff every VIP currently maps to its holder.
+# expect_holders vip1 holder1 vip2 holder2 ... - true iff every VIP currently maps to its holder.
 expect_holders() {
   while (($#)); do
     local vip="$1" want="$2"

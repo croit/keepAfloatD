@@ -7,11 +7,10 @@ export ROOT_DIR
 # shellcheck source=tests/e2e/scripts/lib.sh
 . "${ROOT_DIR}/tests/e2e/scripts/lib.sh"
 
-# Work item #14: VIP ownership is STICKY -- a healthy node never has a VIP yanked off it just because
-# the cluster membership changed. We prove the load-bearing half of that here: when a node dies, ONLY
-# the VIP it was holding moves; the VIPs on the still-healthy survivors stay exactly where they were.
-# The pre-#14 round-robin would reshuffle the survivors' VIPs whenever the eligible set changed, so
-# this scenario fails on the old code and passes on the sticky code.
+# VIP ownership is sticky: a healthy node never loses a VIP solely because cluster membership
+# changed. When a node dies, only the VIP it held moves; VIPs on healthy survivors stay where they
+# were. A full round-robin reassignment would reshuffle the survivors whenever eligibility changed,
+# so this scenario protects the minimal-movement rule.
 #
 # (The complementary "a recovered node does not flap a VIP back" property is shown unconditionally by
 # the 2-VIP/3-node dry-run harness and the Rust unit tests; with 3 VIPs over 3 nodes here the

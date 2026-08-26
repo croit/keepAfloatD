@@ -56,7 +56,7 @@ where
 }
 
 /// Grace period for draining a probe's stdout/stderr after it has exited (or been killed). A probe
-/// that forks a background child inheriting the pipe (`curl … &`, `nc -l &`) keeps the write-end
+/// that forks a background child inheriting the pipe (`curl ... &`, `nc -l &`) keeps the write-end
 /// open, so the reader never sees EOF; without this bound `run_health_check` would never return and
 /// the health-publication loop would stop ticking, fencing the node as stale forever.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);

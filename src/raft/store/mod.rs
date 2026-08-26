@@ -4,7 +4,7 @@
 //! ([`log::KafLogStore`]: `RaftLogReader` + `RaftLogStorage`) and the state-machine half
 //! ([`state_machine::KafStateMachine`]: `RaftStateMachine` + `RaftSnapshotBuilder`) both hold an
 //! `Arc<RwLock<`[`state::KafStorageState`]`>>` pointing at one shared instance, so the split is along
-//! method lines only — the in-memory data is not duplicated. [`new_store`] builds the pair plus a
+//! method lines only - the in-memory data is not duplicated. [`new_store`] builds the pair plus a
 //! third handle on the shared state for the transport/reconciliation layers.
 
 mod log;
