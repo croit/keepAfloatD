@@ -1,4 +1,4 @@
-FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 
 RUN mkdir -p /opt/keepafloatd-tests/configs /opt/keepafloatd-tests/configs22 /opt/keepafloatd-tests/configs26 /opt/keepafloatd-tests/configs26-equivalent
 
