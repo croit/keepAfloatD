@@ -6,15 +6,34 @@
 //! - the node can still submit to consensus (`consensus_fresh`),
 //! - committed assignment state names this node as the holder,
 //! - the assignment's activation tick has passed,
-//! - and either the previous holder has committed a matching release ack or that previous holder
-//!   is no longer eligible.
+//! - and, for a first local activation, either the previous holder has released the generation or
+//!   is currently ineligible. Once this process safely activates the assigned VIP, later recovery
+//!   of that previous holder does not revoke the activation.
 //!
 //! That last pair of fences is what removes the old "two healthy nodes with different applied
 //! views both bind" failure mode.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::raft::store::{VipAssignment, is_node_eligible};
+use crate::raft::store::{VipAssignment, is_node_probe_fresh};
+
+/// Process-local preconditions that must all hold before any committed assignment is honored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BindGates {
+    /// Raft currently reports a leader.
+    pub(crate) has_leader: bool,
+    /// The local health probe is green.
+    pub(crate) local_healthy: bool,
+    /// This node can still submit to consensus.
+    pub(crate) consensus_fresh: bool,
+}
+
+impl BindGates {
+    #[must_use]
+    pub(crate) const fn all_open(self) -> bool {
+        self.has_leader && self.local_healthy && self.consensus_fresh
+    }
+}
 
 #[cfg(test)]
 use std::net::IpAddr;
@@ -22,21 +41,46 @@ use std::net::IpAddr;
 /// Whether **this** node should attempt to attach the VIP described by `assignment`.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn should_bind_vip(
     has_leader: bool,
     local_healthy: bool,
     consensus_fresh: bool,
     node_id: u64,
     assignment: Option<&VipAssignment>,
-    node_health: &HashMap<u64, bool>,
     node_probe_ticks: &HashMap<u64, u64>,
     latest_probe_tick: u64,
     stale_missed_probes: u64,
-    failback_delay_ticks: u64,
-    node_recovery_tick: &HashMap<u64, u64>,
-    node_failback_blocked: &HashSet<u64>,
 ) -> bool {
-    if !(has_leader && local_healthy && consensus_fresh) {
+    should_bind_or_keep_vip(
+        BindGates {
+            has_leader,
+            local_healthy,
+            consensus_fresh,
+        },
+        node_id,
+        assignment,
+        node_probe_ticks,
+        latest_probe_tick,
+        stale_missed_probes,
+        None,
+    )
+}
+
+/// Apply the bind policy while preserving an already-safe local activation of the same assignment
+/// generation. The activation proof never bypasses leader, health, freshness, holder, or tick
+/// gates.
+#[must_use]
+pub(crate) fn should_bind_or_keep_vip(
+    gates: BindGates,
+    node_id: u64,
+    assignment: Option<&VipAssignment>,
+    node_probe_ticks: &HashMap<u64, u64>,
+    latest_probe_tick: u64,
+    stale_missed_probes: u64,
+    activated_generation: Option<u64>,
+) -> bool {
+    if !gates.all_open() {
         return false;
     }
 
@@ -48,18 +92,18 @@ pub(crate) fn should_bind_vip(
         return false;
     }
 
+    if activated_generation == Some(assignment.generation) {
+        return true;
+    }
+
     match assignment.previous_holder {
         None => true,
         Some(_) if assignment.previous_holder_released => true,
-        Some(previous_holder) => !is_node_eligible(
+        Some(previous_holder) => !is_node_probe_fresh(
             previous_holder,
-            node_health,
             node_probe_ticks,
             latest_probe_tick,
             stale_missed_probes,
-            failback_delay_ticks,
-            node_recovery_tick,
-            node_failback_blocked,
         ),
     }
 }
@@ -75,13 +119,9 @@ pub(crate) fn binder_count_for_vip(
     peer_ids_sorted: &[u64],
     local_healthy_per_node: &HashMap<u64, bool>,
     consensus_fresh_per_node: &HashMap<u64, bool>,
-    node_health: &HashMap<u64, bool>,
     node_probe_ticks: &HashMap<u64, u64>,
     latest_probe_tick: u64,
     stale_missed_probes: u64,
-    failback_delay_ticks: u64,
-    node_recovery_tick: &HashMap<u64, u64>,
-    node_failback_blocked: &HashSet<u64>,
 ) -> usize {
     let assignment = assignments.get(&vip);
     peer_ids_sorted
@@ -95,13 +135,9 @@ pub(crate) fn binder_count_for_vip(
                 consensus_ok,
                 nid,
                 assignment,
-                node_health,
                 node_probe_ticks,
                 latest_probe_tick,
                 stale_missed_probes,
-                failback_delay_ticks,
-                node_recovery_tick,
-                node_failback_blocked,
             )
         })
         .count()
@@ -118,13 +154,9 @@ pub(crate) fn binder_count_for_vip_per_node_view(
     peer_ids_sorted: &[u64],
     local_healthy_per_node: &HashMap<u64, bool>,
     consensus_fresh_per_node: &HashMap<u64, bool>,
-    node_health: &HashMap<u64, bool>,
     node_probe_ticks: &HashMap<u64, u64>,
     latest_probe_tick: u64,
     stale_missed_probes: u64,
-    failback_delay_ticks: u64,
-    node_recovery_tick: &HashMap<u64, u64>,
-    node_failback_blocked: &HashSet<u64>,
 ) -> usize {
     peer_ids_sorted
         .iter()
@@ -138,13 +170,9 @@ pub(crate) fn binder_count_for_vip_per_node_view(
                 consensus_ok,
                 nid,
                 assignment,
-                node_health,
                 node_probe_ticks,
                 latest_probe_tick,
                 stale_missed_probes,
-                failback_delay_ticks,
-                node_recovery_tick,
-                node_failback_blocked,
             )
         })
         .count()
@@ -152,7 +180,10 @@ pub(crate) fn binder_count_for_vip_per_node_view(
 
 #[cfg(test)]
 mod tests {
-    use super::{binder_count_for_vip, binder_count_for_vip_per_node_view, should_bind_vip};
+    use super::{
+        BindGates, binder_count_for_vip, binder_count_for_vip_per_node_view,
+        should_bind_or_keep_vip, should_bind_vip,
+    };
     use crate::config::VipAddr;
     use crate::raft::store::{VipAssignment, recompute_vip_holder, reconcile_vip_assignments};
     use crate::raft::types::TypeConfig;
@@ -178,7 +209,6 @@ mod tests {
     #[test]
     fn failure_no_leader_prevents_any_bind_even_if_health_and_holder_match() {
         let assignments = HashMap::from([(ip(10, 0, 0, 5), assignment(1))]);
-        let node_health = HashMap::from([(1_u64, true)]);
         let node_ticks = HashMap::from([(1_u64, 5_u64)]);
         let local = HashMap::from([(1_u64, true)]);
         let consensus = HashMap::from([(1_u64, true)]);
@@ -190,13 +220,9 @@ mod tests {
                 &[1],
                 &local,
                 &consensus,
-                &node_health,
                 &node_ticks,
                 5,
-                3,
-                0,
-                &HashMap::new(),
-                &HashSet::new(),
+                3
             ),
             0
         );
@@ -204,7 +230,6 @@ mod tests {
 
     #[test]
     fn failure_local_unhealthy_prevents_bind_when_this_node_is_holder() {
-        let node_health = HashMap::from([(1_u64, true)]);
         let node_ticks = HashMap::from([(1_u64, 5_u64)]);
         assert!(!should_bind_vip(
             true,
@@ -212,19 +237,14 @@ mod tests {
             true,
             1,
             Some(&assignment(1)),
-            &node_health,
             &node_ticks,
             5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
     }
 
     #[test]
     fn failure_consensus_not_fresh_prevents_bind() {
-        let node_health = HashMap::from([(1_u64, true)]);
         let node_ticks = HashMap::from([(1_u64, 5_u64)]);
         assert!(!should_bind_vip(
             true,
@@ -232,19 +252,14 @@ mod tests {
             false,
             1,
             Some(&assignment(1)),
-            &node_health,
             &node_ticks,
             5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
     }
 
     #[test]
     fn failure_holder_mismatch_even_if_healthy() {
-        let node_health = HashMap::from([(1_u64, true), (2, true)]);
         let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
         assert!(!should_bind_vip(
             true,
@@ -252,13 +267,9 @@ mod tests {
             true,
             2,
             Some(&assignment(1)),
-            &node_health,
             &node_ticks,
             5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
     }
 
@@ -271,7 +282,6 @@ mod tests {
             previous_holder_released: false,
             activation_tick: 5,
         };
-        let node_health = HashMap::from([(1_u64, true), (2, true)]);
         let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
         assert!(!should_bind_vip(
             true,
@@ -279,14 +289,117 @@ mod tests {
             true,
             2,
             Some(&assignment),
-            &node_health,
+            &node_ticks,
+            5,
+            3
+        ));
+    }
+
+    #[test]
+    fn failed_unbind_from_fresh_unhealthy_holder_blocks_replacement() {
+        let assignment = VipAssignment {
+            holder: 2,
+            generation: 2,
+            previous_holder: Some(1),
+            previous_holder_released: false,
+            activation_tick: 5,
+        };
+        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+
+        assert!(!should_bind_vip(
+            true,
+            true,
+            true,
+            2,
+            Some(&assignment),
+            &node_ticks,
+            5,
+            3
+        ));
+    }
+
+    #[test]
+    fn active_handoff_stays_bound_when_previous_holder_recovers() {
+        let assignment = VipAssignment {
+            holder: 2,
+            generation: 2,
+            previous_holder: Some(1),
+            previous_holder_released: false,
+            activation_tick: 5,
+        };
+        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        assert!(should_bind_or_keep_vip(
+            BindGates {
+                has_leader: true,
+                local_healthy: true,
+                consensus_fresh: true
+            },
+            2,
+            Some(&assignment),
             &node_ticks,
             5,
             3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            Some(2)
         ));
+    }
+
+    #[test]
+    fn old_activation_generation_cannot_bypass_a_new_handoff_fence() {
+        let assignment = VipAssignment {
+            holder: 2,
+            generation: 2,
+            previous_holder: Some(1),
+            previous_holder_released: false,
+            activation_tick: 5,
+        };
+        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+
+        assert!(!should_bind_or_keep_vip(
+            BindGates {
+                has_leader: true,
+                local_healthy: true,
+                consensus_fresh: true
+            },
+            2,
+            Some(&assignment),
+            &node_ticks,
+            5,
+            3,
+            Some(1)
+        ));
+    }
+
+    #[test]
+    fn active_handoff_cannot_bypass_mandatory_local_fences() {
+        let assignment = VipAssignment {
+            holder: 2,
+            generation: 2,
+            previous_holder: Some(1),
+            previous_holder_released: false,
+            activation_tick: 5,
+        };
+        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        for (has_leader, local_healthy, consensus_fresh, node_id, latest_tick) in [
+            (false, true, true, 2, 5),
+            (true, false, true, 2, 5),
+            (true, true, false, 2, 5),
+            (true, true, true, 3, 5),
+            (true, true, true, 2, 4),
+        ] {
+            assert!(!should_bind_or_keep_vip(
+                BindGates {
+                    has_leader,
+                    local_healthy,
+                    consensus_fresh
+                },
+                node_id,
+                Some(&assignment),
+                &node_ticks,
+                latest_tick,
+                3,
+                Some(2)
+            ));
+        }
     }
 
     #[test]
@@ -298,7 +411,6 @@ mod tests {
             previous_holder_released: true,
             activation_tick: 5,
         };
-        let node_health = HashMap::from([(1_u64, true), (2, true)]);
         let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
         assert!(should_bind_vip(
             true,
@@ -306,13 +418,9 @@ mod tests {
             true,
             2,
             Some(&assignment),
-            &node_health,
             &node_ticks,
             5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
     }
 
@@ -325,7 +433,6 @@ mod tests {
             previous_holder_released: false,
             activation_tick: 6,
         };
-        let node_health = HashMap::from([(1_u64, true), (2, true)]);
         let node_ticks = HashMap::from([(1_u64, 1_u64), (2, 6)]);
         assert!(!should_bind_vip(
             true,
@@ -333,13 +440,9 @@ mod tests {
             true,
             2,
             Some(&assignment),
-            &node_health,
             &node_ticks,
             5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
         assert!(should_bind_vip(
             true,
@@ -347,13 +450,9 @@ mod tests {
             true,
             2,
             Some(&assignment),
-            &node_health,
             &node_ticks,
             6,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
     }
 
@@ -364,7 +463,6 @@ mod tests {
         let vips = vec![ip(10, 0, 0, 11), ip(10, 0, 0, 12)];
         let assignments = HashMap::from([(vips[0], assignment(2)), (vips[1], assignment(1))]);
         let peers = [1_u64, 2, 3];
-        let node_health = HashMap::from([(1_u64, true), (2, true), (3, true)]);
         let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5), (3, 5)]);
 
         for has_leader in [false, true] {
@@ -384,13 +482,9 @@ mod tests {
                             &peers,
                             &local,
                             &consensus,
-                            &node_health,
                             &node_ticks,
                             5,
                             3,
-                            0,
-                            &HashMap::new(),
-                            &HashSet::new(),
                         );
                         assert!(n <= 1);
                     }
@@ -451,6 +545,7 @@ mod tests {
                 &vip_list,
                 &mut assignments,
                 &mut generations,
+                &mut HashMap::new(),
             );
             for (vip, _) in &vip_list {
                 let cnt = binder_count_for_vip(
@@ -460,13 +555,9 @@ mod tests {
                     &peers_vec,
                     &local,
                     &consensus,
-                    &node_health,
                     &node_ticks,
                     4,
                     3,
-                    0,
-                    &HashMap::new(),
-                    &HashSet::new(),
                 );
                 assert!(
                     cnt <= 1,
@@ -499,7 +590,6 @@ mod tests {
         let per_node = HashMap::from([(1_u64, node1_view), (2, node2_view)]);
         let local = HashMap::from([(1_u64, true), (2, true)]);
         let consensus = HashMap::from([(1_u64, true), (2, true)]);
-        let node_health = HashMap::from([(1_u64, true), (2, true)]);
         let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
 
         let cnt = binder_count_for_vip_per_node_view(
@@ -509,13 +599,9 @@ mod tests {
             &peers,
             &local,
             &consensus,
-            &node_health,
             &node_ticks,
             5,
             3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
         );
         assert_eq!(cnt, 1);
     }
@@ -524,7 +610,6 @@ mod tests {
     fn activation_tick_boundary_gates_first_bind() {
         // No previous holder, so the activation tick is the only remaining fence.
         let a = assignment(1); // previous_holder: None, activation_tick: 5
-        let nh = HashMap::from([(1_u64, true)]);
         let ticks = HashMap::from([(1_u64, 5_u64)]);
         // One round before activation: blocked.
         assert!(!should_bind_vip(
@@ -533,29 +618,12 @@ mod tests {
             true,
             1,
             Some(&a),
-            &nh,
             &ticks,
             4,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
         // Exactly at activation: allowed.
-        assert!(should_bind_vip(
-            true,
-            true,
-            true,
-            1,
-            Some(&a),
-            &nh,
-            &ticks,
-            5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
-        ));
+        assert!(should_bind_vip(true, true, true, 1, Some(&a), &ticks, 5, 3));
     }
 
     #[test]
@@ -568,8 +636,7 @@ mod tests {
             previous_holder_released: false,
             activation_tick: 0,
         };
-        let nh = HashMap::from([(1_u64, true), (2, true)]);
-        // node 1 exactly at the stale threshold → still eligible → replacement blocked.
+        // At the stale threshold, node 1 remains eligible and blocks replacement.
         let at_threshold = HashMap::from([(1_u64, 7_u64), (2, 10)]);
         assert!(!should_bind_vip(
             true,
@@ -577,15 +644,11 @@ mod tests {
             true,
             2,
             Some(&a),
-            &nh,
             &at_threshold,
             10,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
-        // node 1 one round past the threshold → ineligible → replacement allowed.
+        // One round past the threshold, node 1 is ineligible and replacement is allowed.
         let past_threshold = HashMap::from([(1_u64, 6_u64), (2, 10)]);
         assert!(should_bind_vip(
             true,
@@ -593,13 +656,9 @@ mod tests {
             true,
             2,
             Some(&a),
-            &nh,
             &past_threshold,
             10,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
     }
 
@@ -607,22 +666,17 @@ mod tests {
     fn node_holding_two_vips_binds_both_when_fresh_and_neither_when_consensus_stale() {
         let a1 = assignment(1);
         let a2 = assignment(1);
-        let nh = HashMap::from([(1_u64, true)]);
         let ticks = HashMap::from([(1_u64, 5_u64)]);
-        // Healthy, fresh, leader present, consensus fresh → binds both of its VIPs.
+        // A healthy, fresh holder with a fresh leader binds both of its VIPs.
         assert!(should_bind_vip(
             true,
             true,
             true,
             1,
             Some(&a1),
-            &nh,
             &ticks,
             5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
         assert!(should_bind_vip(
             true,
@@ -630,28 +684,20 @@ mod tests {
             true,
             1,
             Some(&a2),
-            &nh,
             &ticks,
             5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
-        // Loses consensus freshness → binds neither.
+        // Losing consensus freshness prevents both binds.
         assert!(!should_bind_vip(
             true,
             true,
             false,
             1,
             Some(&a1),
-            &nh,
             &ticks,
             5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
         assert!(!should_bind_vip(
             true,
@@ -659,13 +705,9 @@ mod tests {
             false,
             1,
             Some(&a2),
-            &nh,
             &ticks,
             5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            3
         ));
     }
 }

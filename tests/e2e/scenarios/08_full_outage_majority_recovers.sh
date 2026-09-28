@@ -8,7 +8,7 @@ export ROOT_DIR
 . "${ROOT_DIR}/tests/e2e/scripts/lib.sh"
 
 # Diskless full-outage recovery: every node goes down, and only a majority (node-b + node-c) comes
-# back. The survivors must reform the cluster on their own, elect a leader, and bind VIPs — no node
+# back. The survivors must reform the cluster on their own, elect a leader, and bind VIPs - no node
 # is special and there is no saved state.
 #
 # The node held down is node-a, the LOWEST id, on purpose: it is the strongest check that no node
@@ -25,7 +25,7 @@ wait_for_service_exit node-a 10
 wait_for_service_exit node-b 10
 wait_for_service_exit node-c 10
 
-# Only the two higher-id nodes return (blank). node-a stays down — use --no-deps so compose does
+# Only the two higher-id nodes return (blank). node-a stays down - use --no-deps so compose does
 # not pull node-a back up via node-b's depends_on.
 start_services_no_deps node-b node-c
 wait_for_service_running node-b 10

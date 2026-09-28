@@ -7,18 +7,22 @@
 //!   activation delays and authentication are derived deterministically and pass between peers).
 //!
 //! Per-host fields that legitimately differ:
-//! - `node_id`, `raft_listen`, `client_submit_listen`.
+//! - `node_id`, `raft_listen`, `client_submit_listen`, `address_protocol`.
 //!
-//! Cluster formation is automatic (see [`crate::raft::auto_form_cluster`]).
+//! Cluster formation is automatic (see [`crate::raft::start_raft`]).
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+
+mod fingerprint;
+
+pub use fingerprint::ClusterConfigFingerprint;
 
 /// Default upper bound on accepted TCP frame size for both Raft RPC and submit channel.
 ///
@@ -26,15 +30,27 @@ use std::sync::Arc;
 /// a few MB are allowed; anything larger is treated as protocol abuse and refused.
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024;
 
+/// Hard upper bound for configurable Raft and snapshot frames.
+pub const MAX_RAFT_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+
 /// Default cap on time spent forwarding a single submit request to the leader.
 pub const DEFAULT_SUBMIT_TIMEOUT_MS: u64 = 2_000;
+
+/// Default Linux route protocol used in the dedicated `10000 + protocol` ownership-marker table.
+pub const DEFAULT_VIP_ADDRESS_PROTOCOL: u8 = 246;
+
+/// Public marker in the shipped sample. It is intentionally invalid so copying the sample without
+/// replacing the secret cannot start a cluster with a credential known to every installation.
+const INSECURE_CLUSTER_SECRET_PLACEHOLDER: &str = "replace-me-with-a-random-32-byte-string";
 
 /// Top-level daemon configuration (one file per process).
 ///
 /// All members of a cluster must share the same `peers`, `vips`, `health.interval_ms`,
-/// `health.stale_secs`, `cluster_secret`, `max_frame_bytes` and timing-relevant tuning. Only
-/// [`Config::node_id`] and the listen addresses differ per host.
+/// `health.stale_secs`, `cluster_secret`, `max_frame_bytes` and timing-relevant tuning. Node-local
+/// process/effect fields such as [`Config::node_id`], listen addresses, health command,
+/// `address_protocol`, `dry_run`, and notify may differ per host.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// This process identity; must appear in [`Config::peers`].
     pub node_id: u64,
@@ -63,33 +79,43 @@ pub struct Config {
     /// Defaults to [`DEFAULT_MAX_FRAME_BYTES`].
     #[serde(default = "default_max_frame_bytes")]
     pub max_frame_bytes: u32,
-    /// Wall-clock budget for one follower→leader submit forward. Defaults to
+    /// Wall-clock budget for one follower to leader submit forward. Defaults to
     /// [`DEFAULT_SUBMIT_TIMEOUT_MS`].
     #[serde(default = "default_submit_timeout_ms")]
     pub submit_timeout_ms: u64,
+    /// Linux route protocol and derived table used as this process's crash-safe VIP namespace.
+    /// Co-located keepafloatd instances must use distinct non-zero values. Keep this stable across
+    /// restarts; rotate it only after a graceful stop or explicit cleanup with the old value.
+    #[serde(default = "default_vip_address_protocol")]
+    pub address_protocol: u8,
     /// When true, log intended `ip` operations but do not run `ip` (tests / lab).
     #[serde(default)]
     pub dry_run: bool,
     /// Optional notify script called on VIP ownership transitions (keepalived-compatible).
     ///
     /// When set, the script is invoked as:
-    ///   `<script> INSTANCE <vip_address> MASTER`  — when this node gains the VIP,
-    ///   `<script> INSTANCE <vip_address> BACKUP`  — when a healthy node releases the VIP, and
-    ///   `<script> INSTANCE <vip_address> FAULT`   — when this node releases the VIP because its
+    ///   `<script> INSTANCE <vip_address> MASTER` - when this node gains the VIP,
+    ///   `<script> INSTANCE <vip_address> BACKUP` - when a healthy node releases the VIP, and
+    ///   `<script> INSTANCE <vip_address> FAULT` - when this node releases the VIP because its
     ///                                               own health check failed.
     ///
     /// The script runs fire-and-forget in a separate task; failures are logged but do not affect
     /// the reconciliation loop. This is a per-node field and may differ between cluster members.
     #[serde(default)]
     pub notify: Option<String>,
+    /// Minimum continuous unhealthy duration before an established healthy node is reported
+    /// unhealthy and releases its VIPs. Default: zero, preserving immediate failover.
+    ///
+    /// The duration is converted to local probe rounds. A node that has never passed its health
+    /// check remains unhealthy immediately; the delay never makes startup health optimistic.
+    #[serde(default)]
+    pub failover_delay_secs: u32,
     /// Whether a recovered node may reclaim its VIPs (keepalived `preempt` / `nopreempt`).
     ///
     /// `true` (default, keepalived `preempt`): after being unhealthy, a node regains eligibility
     /// once it has been continuously healthy for at least `failback_delay_secs`.
-    /// `false` (keepalived `nopreempt`): a node that lost its VIPs due to a health failure never
-    /// has VIPs reassigned to it until the entire cluster is fully reformed (all nodes restart
-    /// from scratch without an existing snapshot). The block is replicated via snapshot, so
-    /// restarting a single daemon is not sufficient to clear it.
+    /// `false` (keepalived `nopreempt`): a recovered node does not receive proactive rebalance
+    /// moves from healthy holders, but remains eligible for orphaned VIPs when a holder fails.
     ///
     /// Cluster-wide: must be the same on every node.
     #[serde(default = "default_failback")]
@@ -101,7 +127,8 @@ pub struct Config {
     /// Converted at startup to a committed probe-round count so the state machine stays
     /// deterministic (no wall-clock reads inside the SM).
     ///
-    /// Cluster-wide: must be the same on every node.
+    /// Cluster-wide when `failback` is true. It is ignored and normalized out of the cluster
+    /// configuration identity when `failback` is false.
     #[serde(default = "default_failback_delay_secs")]
     pub failback_delay_secs: u32,
 }
@@ -122,13 +149,33 @@ fn default_submit_timeout_ms() -> u64 {
     DEFAULT_SUBMIT_TIMEOUT_MS
 }
 
+fn default_vip_address_protocol() -> u8 {
+    DEFAULT_VIP_ADDRESS_PROTOCOL
+}
+
 fn parse_socket_addr(field: &str, value: &str) -> anyhow::Result<SocketAddr> {
     value
         .parse()
+        .map(canonical_socket_addr)
         .with_context(|| format!("{field} must be a valid IP:port socket address (got {value})"))
 }
 
+/// Canonicalize Linux listener aliases before equality checks and configuration fingerprinting.
+/// An IPv4-mapped IPv6 socket and its IPv4 form compete for the same kernel endpoint (#26).
+pub(crate) fn canonical_socket_addr(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V6(address) => address
+            .ip()
+            .to_ipv4_mapped()
+            .map_or(SocketAddr::V6(address), |ip| {
+                SocketAddr::new(IpAddr::V4(ip), address.port())
+            }),
+        SocketAddr::V4(_) => address,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerConfig {
     /// Raft node identifier; must match [`Config::node_id`] on that host.
     pub id: u64,
@@ -163,7 +210,7 @@ impl VipAddr {
         }
     }
 
-    /// A host-route VIP (`/32` or `/128`) — used by tests and as the no-suffix default.
+    /// A host-route VIP (`/32` or `/128`) - used by tests and as the no-suffix default.
     #[must_use]
     pub fn host(addr: IpAddr) -> Self {
         Self {
@@ -223,6 +270,7 @@ impl From<VipAddr> for String {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VipConfig {
     /// Secondary address managed by keepAfloatD (must be identical on every cluster member).
     /// Accepts an optional CIDR suffix (`10.0.0.101/24`); without one the VIP is
@@ -230,7 +278,7 @@ pub struct VipConfig {
     pub address: VipAddr,
     /// Linux interface name (e.g. `eth0`) for `ip addr add|del`.
     pub interface: String,
-    /// Optional IEEE 802.1Q VLAN tag (1–4094). When set, all `ip addr` operations target
+    /// Optional IEEE 802.1Q VLAN tag (1-4094). When set, all `ip addr` operations target
     /// `{interface}.{vlan}` (e.g. `eth0.100`). The sub-interface must pre-exist; keepafloatd
     /// does not create or destroy VLAN sub-interfaces. `interface` must not itself contain a dot
     /// when `vlan` is set. Absent means no VLAN (current behaviour).
@@ -244,6 +292,7 @@ pub struct VipConfig {
 
 /// Local script/command health probe and the cluster-wide staleness window.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthConfig {
     /// Executable and arguments (like execv): e.g. `["/bin/bash","-c","curl -sf http://127.0.0.1/"]`.
     pub command: Vec<String>,
@@ -278,12 +327,14 @@ impl HealthConfig {
     /// miss before the cluster fences it off".
     #[must_use]
     pub fn effective_stale_missed_probes(&self) -> u64 {
-        let interval_secs = self.interval_ms.div_ceil(1_000).max(1);
-        self.effective_stale_secs().div_ceil(interval_secs).max(1)
+        let stale_ms = u128::from(self.effective_stale_secs()).saturating_mul(1_000);
+        let rounds = stale_ms / u128::from(self.interval_ms.max(1));
+        (rounds.min(u128::from(u64::MAX)) as u64).max(1)
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RaftTuneConfig {
     /// Lower bound of leader election random timeout (OpenRaft).
     pub election_timeout_min_ms: u64,
@@ -342,6 +393,34 @@ impl Config {
             "health.timeout_ms suspiciously large vs interval_ms"
         );
 
+        // Validate Raft timing at load. OpenRaft validates the same relations, but only inside
+        // start_raft, after startup cleanup has already touched host addresses; failing here
+        // keeps a bad raft block from mutating the host at all.
+        anyhow::ensure!(
+            self.raft.election_timeout_min_ms > 0,
+            "raft.election_timeout_min_ms must be > 0"
+        );
+        anyhow::ensure!(
+            self.raft.election_timeout_max_ms > 0,
+            "raft.election_timeout_max_ms must be > 0"
+        );
+        anyhow::ensure!(
+            self.raft.heartbeat_interval_ms > 0,
+            "raft.heartbeat_interval_ms must be > 0"
+        );
+        anyhow::ensure!(
+            self.raft.heartbeat_interval_ms < self.raft.election_timeout_min_ms,
+            "raft.heartbeat_interval_ms ({}) must be < raft.election_timeout_min_ms ({})",
+            self.raft.heartbeat_interval_ms,
+            self.raft.election_timeout_min_ms
+        );
+        anyhow::ensure!(
+            self.raft.election_timeout_min_ms < self.raft.election_timeout_max_ms,
+            "raft.election_timeout_min_ms ({}) must be < raft.election_timeout_max_ms ({})",
+            self.raft.election_timeout_min_ms,
+            self.raft.election_timeout_max_ms
+        );
+
         let stale = self.health.effective_stale_secs();
         let interval_secs = self.health.interval_ms.div_ceil(1_000).max(1);
         anyhow::ensure!(
@@ -358,7 +437,12 @@ impl Config {
         let raft_listen = parse_socket_addr("raft_listen", &self.raft_listen)?;
         let client_submit_listen =
             parse_socket_addr("client_submit_listen", &self.client_submit_listen)?;
-        for peer in &self.peers {
+        self.raft_listen = raft_listen.to_string();
+        self.client_submit_listen = client_submit_listen.to_string();
+        let mut endpoint_owners: BTreeMap<SocketAddr, (u64, &'static str)> = BTreeMap::new();
+        let mut raft_roster_is_ipv4 = None;
+        let mut submit_roster_is_ipv4 = None;
+        for peer in &mut self.peers {
             let raft_address = parse_socket_addr(
                 &format!("peers[{}].raft_address", peer.id),
                 &peer.raft_address,
@@ -367,6 +451,24 @@ impl Config {
                 &format!("peers[{}].client_submit_address", peer.id),
                 &peer.client_submit_address,
             )?;
+            peer.raft_address = raft_address.to_string();
+            peer.client_submit_address = client_submit_address.to_string();
+            if let Some(expected) = raft_roster_is_ipv4 {
+                anyhow::ensure!(
+                    expected == raft_address.is_ipv4(),
+                    "raft_address roster must use one IP family"
+                );
+            } else {
+                raft_roster_is_ipv4 = Some(raft_address.is_ipv4());
+            }
+            if let Some(expected) = submit_roster_is_ipv4 {
+                anyhow::ensure!(
+                    expected == client_submit_address.is_ipv4(),
+                    "client_submit_address roster must use one IP family"
+                );
+            } else {
+                submit_roster_is_ipv4 = Some(client_submit_address.is_ipv4());
+            }
             anyhow::ensure!(
                 !raft_address.ip().is_unspecified(),
                 "peers[{}].raft_address must not use an unspecified IP ({})",
@@ -384,6 +486,18 @@ impl Config {
                 "peer {} raft_address and client_submit_address must differ",
                 peer.id
             );
+            for (kind, address) in [
+                ("raft_address", raft_address),
+                ("client_submit_address", client_submit_address),
+            ] {
+                if let Some((other_id, other_kind)) = endpoint_owners.get(&address) {
+                    anyhow::bail!(
+                        "peer endpoint {address} is used by peer {other_id} {other_kind} and peer {} {kind}",
+                        peer.id
+                    );
+                }
+                endpoint_owners.insert(address, (peer.id, kind));
+            }
         }
 
         let local_peer = self
@@ -415,11 +529,15 @@ impl Config {
         if let Some(secret) = &self.cluster_secret {
             anyhow::ensure!(
                 !secret.is_empty(),
-                "cluster_secret must be non-empty if set (omit the field to disable)"
+                "cluster_secret is required and must be non-empty"
             );
             anyhow::ensure!(
                 secret.len() <= 256,
                 "cluster_secret must be at most 256 bytes"
+            );
+            anyhow::ensure!(
+                secret != INSECURE_CLUSTER_SECRET_PLACEHOLDER,
+                "replace cluster_secret placeholder with a unique random secret"
             );
         }
 
@@ -427,7 +545,15 @@ impl Config {
             self.max_frame_bytes >= 64 * 1024,
             "max_frame_bytes must be >= 64 KiB to fit Raft heartbeats"
         );
+        anyhow::ensure!(
+            self.max_frame_bytes <= MAX_RAFT_FRAME_BYTES,
+            "max_frame_bytes must be <= 16 MiB"
+        );
         anyhow::ensure!(self.submit_timeout_ms > 0, "submit_timeout_ms must be > 0");
+        anyhow::ensure!(
+            self.address_protocol > 0,
+            "address_protocol must be between 1 and 255"
+        );
 
         self.vips.sort_by_key(|v| v.address.addr);
         self.vips.dedup_by_key(|v| v.address.addr);
@@ -437,7 +563,7 @@ impl Config {
             if let Some(vlan) = vip.vlan {
                 anyhow::ensure!(
                     (1..=4094).contains(&vlan),
-                    "vips[{i}] ({}): vlan {vlan} is out of range: IEEE 802.1Q allows 1–4094",
+                    "vips[{i}] ({}): vlan {vlan} is out of range: IEEE 802.1Q allows 1-4094",
                     vip.address
                 );
                 anyhow::ensure!(
@@ -456,14 +582,16 @@ impl Config {
     ///
     /// Converts `failback_delay_secs` to the number of consecutive probe rounds a recovered node
     /// must accumulate before it is eligible again. Zero means immediate re-eligibility.
-    /// When `failback` is `false` this value is irrelevant (the node is permanently blocked).
+    /// Ignored when `failback` is `false`; nopreempt placement is tracked separately.
     #[must_use]
     pub fn effective_failback_delay_ticks(&self) -> u64 {
-        if self.failback_delay_secs == 0 {
-            return 0;
-        }
-        let interval_secs = self.health.interval_ms.div_ceil(1_000).max(1);
-        (self.failback_delay_secs as u64).div_ceil(interval_secs)
+        duration_to_probe_rounds_ceil(u64::from(self.failback_delay_secs), self.health.interval_ms)
+    }
+
+    /// Explicit health-failure delay expressed as local probe rounds.
+    #[must_use]
+    pub fn effective_failover_delay_ticks(&self) -> u64 {
+        duration_to_probe_rounds_ceil(u64::from(self.failover_delay_secs), self.health.interval_ms)
     }
 
     pub fn get_peer(&self, id: u64) -> Option<&PeerConfig> {
@@ -492,9 +620,18 @@ impl Config {
     }
 }
 
+fn duration_to_probe_rounds_ceil(duration_secs: u64, interval_ms: u64) -> u64 {
+    if duration_secs == 0 {
+        return 0;
+    }
+    let duration_ms = u128::from(duration_secs).saturating_mul(1_000);
+    let rounds = duration_ms.div_ceil(u128::from(interval_ms.max(1)));
+    rounds.min(u128::from(u64::MAX)) as u64
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, duration_to_probe_rounds_ceil};
     use std::net::IpAddr;
     use std::str::FromStr;
 
@@ -528,9 +665,124 @@ health:
         assert_eq!(c.node_id, 1);
         assert_eq!(c.max_frame_bytes, super::DEFAULT_MAX_FRAME_BYTES);
         assert_eq!(c.submit_timeout_ms, super::DEFAULT_SUBMIT_TIMEOUT_MS);
+        assert_eq!(c.address_protocol, super::DEFAULT_VIP_ADDRESS_PROTOCOL);
         assert_eq!(c.cluster_secret.as_deref(), Some("test-secret"));
         assert_eq!(c.health.effective_stale_secs(), 3);
         assert_eq!(c.health.effective_stale_missed_probes(), 3);
+    }
+
+    fn with_raft(min: u64, max: u64, heartbeat: u64) -> String {
+        format!(
+            "{MINIMAL_YAML}\nraft:\n  election_timeout_min_ms: {min}\n  election_timeout_max_ms: {max}\n  heartbeat_interval_ms: {heartbeat}\n"
+        )
+    }
+
+    #[test]
+    fn raft_timing_rejects_zero_values() {
+        for yaml in [
+            with_raft(0, 800, 250),
+            with_raft(400, 0, 250),
+            with_raft(400, 800, 0),
+        ] {
+            let err = parse_normalize(&yaml).unwrap_err().to_string();
+            assert!(
+                err.contains("raft.") && err.contains("must be > 0"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn raft_timing_requires_heartbeat_below_election_min() {
+        let err = parse_normalize(&with_raft(400, 800, 400))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "raft.heartbeat_interval_ms (400) must be < raft.election_timeout_min_ms (400)"
+            ),
+            "{err}"
+        );
+        assert!(parse_normalize(&with_raft(400, 800, 399)).is_ok());
+    }
+
+    #[test]
+    fn raft_timing_requires_election_min_below_max() {
+        let err = parse_normalize(&with_raft(800, 800, 250))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "raft.election_timeout_min_ms (800) must be < raft.election_timeout_max_ms (800)"
+            ),
+            "{err}"
+        );
+        assert!(parse_normalize(&with_raft(799, 800, 250)).is_ok());
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_at_every_level() {
+        let cases = [
+            format!("{MINIMAL_YAML}\nfailbck: true\n"),
+            MINIMAL_YAML.replace("    raft_address:", "    raft_addres:"),
+            MINIMAL_YAML.replace("    interface: lo", "    iface: lo"),
+            MINIMAL_YAML.replace("  interval_ms: 1000", "  intervall_ms: 1000"),
+            with_raft(400, 800, 250).replace("heartbeat_interval_ms", "heartbeat_ms"),
+        ];
+        for yaml in cases {
+            let err = parse_normalize(&yaml).unwrap_err().to_string();
+            assert!(err.contains("unknown field"), "{yaml}\n{err}");
+        }
+    }
+
+    #[test]
+    fn fixture_configs_deserialize_without_unknown_fields() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut dirs = vec![
+            root.join("examples"),
+            root.join("tests/haproxy-e2e/configs"),
+        ];
+        for entry in std::fs::read_dir(root.join("tests/e2e")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with("configs") {
+                dirs.push(entry.path());
+            }
+        }
+        let mut checked = 0;
+        for dir in dirs {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|e| e == "yaml") {
+                    let yaml = std::fs::read_to_string(&path).unwrap();
+                    serde_yaml::from_str::<Config>(&yaml)
+                        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked >= 20,
+            "expected the fixture configs, found {checked}"
+        );
+    }
+
+    #[test]
+    fn raft_frame_cap_preserves_main_resource_bound() {
+        assert!(parse_normalize(&format!("{MINIMAL_YAML}\nmax_frame_bytes: 16777216\n")).is_ok());
+        assert!(parse_normalize(&format!("{MINIMAL_YAML}\nmax_frame_bytes: 16777217\n")).is_err());
+    }
+
+    #[test]
+    fn address_protocol_accepts_a_custom_instance_marker_and_rejects_zero() {
+        let custom = MINIMAL_YAML.replace(
+            "cluster_secret: \"test-secret\"",
+            "cluster_secret: \"test-secret\"\naddress_protocol: 245",
+        );
+        assert_eq!(parse_normalize(&custom).unwrap().address_protocol, 245);
+
+        let zero = custom.replace("address_protocol: 245", "address_protocol: 0");
+        let error = parse_normalize(&zero).unwrap_err().to_string();
+        assert!(error.contains("address_protocol must be between 1 and 255"));
     }
 
     #[test]
@@ -539,6 +791,22 @@ health:
         let yaml = MINIMAL_YAML.replace("cluster_secret: \"test-secret\"\n", "");
         let err = parse_normalize(&yaml).unwrap_err().to_string();
         assert!(err.contains("cluster_secret is required"), "{err}");
+    }
+
+    #[test]
+    fn public_example_cluster_secret_placeholder_is_rejected() {
+        let yaml = include_str!("../config.example.yaml");
+        let err = parse_normalize(yaml).unwrap_err().to_string();
+        assert!(err.contains("replace cluster_secret placeholder"), "{err}");
+    }
+
+    #[test]
+    fn public_example_accepts_generated_hex_cluster_secret() {
+        let yaml = include_str!("../config.example.yaml").replace(
+            "cluster_secret: \"replace-me-with-a-random-32-byte-string\"",
+            "cluster_secret: \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"",
+        );
+        parse_normalize(&yaml).unwrap();
     }
 
     #[test]
@@ -831,6 +1099,13 @@ max_frame_bytes: 1024
     }
 
     #[test]
+    fn oversized_max_frame_rejected() {
+        let yaml = format!("{MINIMAL_YAML}\nmax_frame_bytes: 67108865\n");
+        let err = parse_normalize(&yaml).unwrap_err().to_string();
+        assert!(err.contains("max_frame_bytes must be <= 16 MiB"), "{err}");
+    }
+
+    #[test]
     fn stale_secs_smaller_than_interval_rejected() {
         let yaml = r#"
 node_id: 1
@@ -946,6 +1221,64 @@ health:
     }
 
     #[test]
+    fn mixed_ip_families_in_raft_roster_are_rejected() {
+        let yaml = r#"
+node_id: 1
+raft_listen: "127.0.0.1:17101"
+client_submit_listen: "127.0.0.1:17102"
+cluster_secret: "test-secret"
+peers:
+  - id: 1
+    raft_address: "127.0.0.1:17101"
+    client_submit_address: "127.0.0.1:17102"
+  - id: 2
+    raft_address: "[2001:db8::2]:17101"
+    client_submit_address: "127.0.0.2:17102"
+vips:
+  - address: 10.0.0.1
+    interface: lo
+health:
+  command: ["/bin/true"]
+  interval_ms: 1000
+  timeout_ms: 500
+"#;
+        let err = parse_normalize(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("raft_address roster must use one IP family"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mixed_ip_families_in_submit_roster_are_rejected() {
+        let yaml = r#"
+node_id: 1
+raft_listen: "127.0.0.1:17101"
+client_submit_listen: "127.0.0.1:17102"
+cluster_secret: "test-secret"
+peers:
+  - id: 1
+    raft_address: "127.0.0.1:17101"
+    client_submit_address: "127.0.0.1:17102"
+  - id: 2
+    raft_address: "127.0.0.2:17101"
+    client_submit_address: "[2001:db8::2]:17102"
+vips:
+  - address: 10.0.0.1
+    interface: lo
+health:
+  command: ["/bin/true"]
+  interval_ms: 1000
+  timeout_ms: 500
+"#;
+        let err = parse_normalize(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("client_submit_address roster must use one IP family"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn get_peer_other_peers() {
         let c = parse_normalize(MINIMAL_YAML).unwrap();
         assert_eq!(c.get_peer(1).map(|p| p.id), Some(1));
@@ -967,17 +1300,20 @@ health:
     fn effective_stale_window_heuristics() {
         // Default heuristic: max(3, ceil(interval_ms/1000) * 3) seconds, at least one probe round.
         assert_eq!(hc(1, None).effective_stale_secs(), 3);
-        assert_eq!(hc(1, None).effective_stale_missed_probes(), 3);
+        assert_eq!(hc(1, None).effective_stale_missed_probes(), 3_000);
         assert_eq!(hc(1000, None).effective_stale_secs(), 3);
         assert_eq!(hc(1000, None).effective_stale_missed_probes(), 3);
         assert_eq!(hc(2000, None).effective_stale_secs(), 6);
         assert_eq!(hc(2000, None).effective_stale_missed_probes(), 3);
         assert_eq!(hc(5000, None).effective_stale_secs(), 15);
         assert_eq!(hc(5000, None).effective_stale_missed_probes(), 3);
-        // Explicit override is honored and converted to whole missed rounds (ceil).
+        // Explicit override is honored and converted to whole missed rounds (floor): eligibility
+        // uses `lag > threshold`, so fencing occurs on the first probe after the duration.
         assert_eq!(hc(1000, Some(10)).effective_stale_secs(), 10);
         assert_eq!(hc(1000, Some(10)).effective_stale_missed_probes(), 10);
-        assert_eq!(hc(3000, Some(10)).effective_stale_missed_probes(), 4);
+        assert_eq!(hc(3000, Some(10)).effective_stale_missed_probes(), 3);
+        assert_eq!(hc(1500, Some(5)).effective_stale_missed_probes(), 3);
+        assert_eq!(hc(500, Some(5)).effective_stale_missed_probes(), 10);
     }
 
     #[test]
@@ -1145,6 +1481,77 @@ health:
 "#;
         let err = parse_normalize(yaml).unwrap_err();
         assert!(err.to_string().contains("must differ"));
+    }
+
+    #[test]
+    fn ipv4_mapped_raft_and_ipv4_submit_aliases_are_rejected() {
+        let yaml = r#"
+node_id: 1
+raft_listen: "[::ffff:127.0.0.1]:17001"
+client_submit_listen: "127.0.0.1:17001"
+cluster_secret: "test-secret"
+peers:
+  - id: 1
+    raft_address: "[::ffff:127.0.0.1]:17001"
+    client_submit_address: "127.0.0.1:17001"
+vips:
+  - address: 10.0.0.1
+    interface: lo
+health:
+  command: ["/bin/true"]
+  interval_ms: 1000
+  timeout_ms: 500
+"#;
+
+        let error = parse_normalize(yaml)
+            .expect_err("Linux treats IPv4-mapped and IPv4 listeners as one endpoint");
+        assert!(error.to_string().contains("must differ"));
+    }
+
+    fn two_peer_yaml(second_raft: &str, second_submit: &str) -> String {
+        format!(
+            r#"
+node_id: 1
+raft_listen: "127.0.0.1:1"
+client_submit_listen: "127.0.0.1:2"
+cluster_secret: "test-secret"
+peers:
+  - id: 1
+    raft_address: "127.0.0.1:1"
+    client_submit_address: "127.0.0.1:2"
+  - id: 2
+    raft_address: "{second_raft}"
+    client_submit_address: "{second_submit}"
+vips:
+  - address: 10.0.0.1
+    interface: lo
+health:
+  command: ["/bin/true"]
+  interval_ms: 1000
+  timeout_ms: 500
+"#
+        )
+    }
+
+    #[test]
+    fn duplicate_peer_raft_endpoints_are_rejected() {
+        let err = parse_normalize(&two_peer_yaml("127.0.0.1:1", "127.0.0.1:4"))
+            .expect_err("two Raft identities cannot share one endpoint");
+        assert!(err.to_string().contains("endpoint"));
+    }
+
+    #[test]
+    fn duplicate_peer_submit_endpoints_are_rejected() {
+        let err = parse_normalize(&two_peer_yaml("127.0.0.1:3", "127.0.0.1:2"))
+            .expect_err("two submit identities cannot share one endpoint");
+        assert!(err.to_string().contains("endpoint"));
+    }
+
+    #[test]
+    fn cross_peer_raft_and_submit_endpoint_collision_is_rejected() {
+        let err = parse_normalize(&two_peer_yaml("127.0.0.1:2", "127.0.0.1:4"))
+            .expect_err("Raft and submit listeners cannot collide across peers");
+        assert!(err.to_string().contains("endpoint"));
     }
 
     fn vlan_yaml(vlan_line: &str) -> String {
@@ -1355,7 +1762,7 @@ failback_delay_secs: 0
 
     #[test]
     fn effective_failback_delay_ticks_converts_seconds_to_probe_rounds() {
-        // interval_ms=1000 → interval_secs=1 → delay_ticks = ceil(10/1) = 10
+        // interval_ms=1000, interval_secs=1, delay_ticks = ceil(10/1) = 10
         let yaml = r#"
 node_id: 1
 raft_listen: "127.0.0.1:1"
@@ -1377,7 +1784,7 @@ failback_delay_secs: 10
         let c = parse_normalize(yaml).unwrap();
         assert_eq!(c.effective_failback_delay_ticks(), 10);
 
-        // interval_ms=3000 → interval_secs=3 → delay_ticks = ceil(10/3) = 4
+        // interval_ms=3000, interval_secs=3, delay_ticks = ceil(10/3) = 4
         let yaml2 = r#"
 node_id: 1
 raft_listen: "127.0.0.1:1"
@@ -1399,7 +1806,7 @@ failback_delay_secs: 10
         let c2 = parse_normalize(yaml2).unwrap();
         assert_eq!(c2.effective_failback_delay_ticks(), 4);
 
-        // interval_ms=500 (<1s) → interval_secs=1 → delay_ticks = ceil(5/1) = 5
+        // interval_ms=500, delay_ticks = ceil(5000/500) = 10
         let yaml3 = r#"
 node_id: 1
 raft_listen: "127.0.0.1:1"
@@ -1419,6 +1826,60 @@ health:
 failback_delay_secs: 5
 "#;
         let c3 = parse_normalize(yaml3).unwrap();
-        assert_eq!(c3.effective_failback_delay_ticks(), 5);
+        assert_eq!(c3.effective_failback_delay_ticks(), 10);
+
+        let yaml4 = r#"
+node_id: 1
+raft_listen: "127.0.0.1:1"
+client_submit_listen: "127.0.0.1:2"
+cluster_secret: "test-secret"
+peers:
+  - id: 1
+    raft_address: "127.0.0.1:1"
+    client_submit_address: "127.0.0.1:2"
+vips:
+  - address: 10.0.0.1
+    interface: lo
+health:
+  command: ["/bin/true"]
+  interval_ms: 1500
+  timeout_ms: 500
+failback_delay_secs: 5
+"#;
+        let c4 = parse_normalize(yaml4).unwrap();
+        assert_eq!(c4.effective_failback_delay_ticks(), 4);
+    }
+
+    #[test]
+    fn failover_delay_defaults_to_zero_and_converts_exact_milliseconds() {
+        let defaulted = parse_normalize(MINIMAL_YAML).unwrap();
+        assert_eq!(defaulted.failover_delay_secs, 0);
+        assert_eq!(defaulted.effective_failover_delay_ticks(), 0);
+
+        let yaml = r#"
+node_id: 1
+raft_listen: "127.0.0.1:1"
+client_submit_listen: "127.0.0.1:2"
+cluster_secret: "test-secret"
+peers:
+  - id: 1
+    raft_address: "127.0.0.1:1"
+    client_submit_address: "127.0.0.1:2"
+vips:
+  - address: 10.0.0.1
+    interface: lo
+health:
+  command: ["/bin/true"]
+  interval_ms: 500
+  timeout_ms: 500
+failover_delay_secs: 5
+"#;
+        let configured = parse_normalize(yaml).unwrap();
+        assert_eq!(configured.failover_delay_secs, 5);
+        assert_eq!(configured.effective_failover_delay_ticks(), 10);
+        assert_eq!(duration_to_probe_rounds_ceil(5, 100), 50);
+        assert_eq!(duration_to_probe_rounds_ceil(5, 500), 10);
+        assert_eq!(duration_to_probe_rounds_ceil(5, 1_500), 4);
+        assert_eq!(duration_to_probe_rounds_ceil(5, 3_000), 2);
     }
 }

@@ -2,14 +2,14 @@
 set -euo pipefail
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
-COMPOSE_FILE="${COMPOSE_FILE:-${ROOT_DIR}/tests/e2e/docker-compose.yml}"
+COMPOSE_FILE="${COMPOSE_FILE:-${ROOT_DIR}/docker-compose.yml}"
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-keepafloatd-e2e}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-${ROOT_DIR}/e2e-artifacts/compose}"
 export COMPOSE_PROJECT_NAME
 
 # Cluster topology. Overridable via space-separated env vars so a larger suite (e.g. the
 # 5-node/4-VIP minimal-movement scenario driven by run5.sh) can reuse this library unchanged.
-# Defaults are the 3-node/3-VIP layout used by scenarios 01–11; leaving the env vars unset keeps
+# Defaults are the 3-node/3-VIP layout used by scenarios 01-13; leaving the env vars unset keeps
 # that behavior identical.
 #
 # Note: there are deliberately no fixed expected-assignment arrays. The minimal-movement assignment
@@ -127,6 +127,8 @@ dump_cluster_diagnostics() {
   service_status_summary >&2 || true
 
   local service
+  local config_dir="${KEEPAFLOATD_E2E_CONFIG_DIR:-configs}"
+  local config_suffix="${KEEPAFLOATD_E2E_CONFIG_SUFFIX:-}"
   for service in e2e-fixtures "${NODES[@]}" e2e-runner; do
     printf '[e2e] --- logs: %s ---\n' "${service}" >&2
     compose logs --no-color --tail 200 "${service}" >&2 || true
@@ -135,7 +137,7 @@ dump_cluster_diagnostics() {
   for service in "${NODES[@]}"; do
     if service_is_running "${service}"; then
       printf '[e2e] --- inspect: %s ---\n' "${service}" >&2
-      node_sh "${service}" "ls -l /opt/keepafloatd-tests /opt/keepafloatd-tests/configs /shared && echo '--- config ---' && cat /opt/keepafloatd-tests/configs/${service#node-}.yaml && echo '--- ip addr ---' && ip -o addr show && echo '--- routes ---' && ip route show table main && echo '--- health check ---' && /bin/sh /opt/keepafloatd-tests/health.sh /shared/${service}.unhealthy; echo status:$?" >&2 || true
+      node_sh "${service}" "ls -l /opt/keepafloatd-tests /opt/keepafloatd-tests/${config_dir} /shared && echo '--- config ---' && cat /opt/keepafloatd-tests/${config_dir}/${service#node-}${config_suffix}.yaml && echo '--- ip addr ---' && ip -o addr show && echo '--- routes ---' && ip route show table main && echo '--- health check ---' && /bin/sh /opt/keepafloatd-tests/health.sh /shared/${service}.unhealthy; health_status=\$?; echo status:\${health_status}" >&2 || true
     fi
   done
 }
@@ -168,6 +170,34 @@ holder_for_vip() {
     1) printf '%s\n' "${holders[0]}" ;;
     *) printf 'duplicate:%s\n' "$(IFS=,; echo "${holders[*]}")" ;;
   esac
+}
+
+# Wait until one unique holder remains unchanged for a sustained interval. This is stronger than
+# even_over_nodes for topologies with fewer VIPs than nodes, where an in-flight placement is
+# already mathematically even.
+wait_for_stable_vip_holder() {
+  local vip="${1:?vip required}"
+  local timeout_secs="${2:?timeout required}"
+  local stable_secs="${3:?stable interval required}"
+  local deadline=$((SECONDS + timeout_secs))
+  local stable_since="${SECONDS}"
+  local previous="" current
+
+  while ((SECONDS < deadline)); do
+    current="$(holder_for_vip "${vip}")"
+    if [[ "${current}" == "none" || "${current}" == duplicate:* ]]; then
+      previous=""
+      stable_since="${SECONDS}"
+    elif [[ "${current}" != "${previous}" ]]; then
+      previous="${current}"
+      stable_since="${SECONDS}"
+    elif ((SECONDS - stable_since >= stable_secs)); then
+      printf '%s\n' "${current}"
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
 }
 
 current_assignments_summary() {
@@ -332,6 +362,11 @@ assert_service_exit_code() {
 set_node_unhealthy() {
   local service="${1:?service required}"
   runner_sh "touch /shared/${service}.unhealthy"
+}
+
+set_node_healthy() {
+  local service="${1:?service required}"
+  runner_sh "rm -f /shared/${service}.unhealthy"
 }
 
 add_blackhole_route() {

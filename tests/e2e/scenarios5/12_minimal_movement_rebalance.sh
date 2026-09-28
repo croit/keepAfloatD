@@ -13,7 +13,7 @@ export ROOT_DIR
 # hardcoded one: the assignment is a stable, minimal-movement, load-balancing rebalance, so the
 # absolute cold-start holder of each VIP depends on join/election timing and is not deterministic
 # across runs. Reading the real placement and asserting the relative behavior is strictly stronger
-# than hardcoding holders — it also proves that uninvolved VIPs do NOT move (the property that
+# than hardcoding holders - it also proves that uninvolved VIPs do NOT move (the property that
 # distinguishes minimal-movement from a global round-robin reshuffle).
 #
 # Narrative (A..E are physical nodes; victim1/victim2 are the two we kill; E0 is the idle node):
@@ -29,7 +29,7 @@ IPB="${VIPS[1]}"
 IPC="${VIPS[2]}"
 IPD="${VIPS[3]}"
 
-# expect_holders vip1 holder1 vip2 holder2 ... — true iff every VIP currently maps to its holder.
+# expect_holders vip1 holder1 vip2 holder2 ... - true iff every VIP currently maps to its holder.
 expect_holders() {
   while (($#)); do
     local vip="$1" want="$2"
@@ -43,9 +43,45 @@ higher_ip() {
 }
 
 snapshot_holders() {
-  local out="" vip
-  for vip in "${VIPS[@]}"; do out+="${vip}=$(holder_for_vip "${vip}") "; done
+  local -A holders=()
+  local node addresses vip out=""
+
+  # Read each node once. The old implementation called holder_for_vip once per VIP after already
+  # doing the same work in even_over_nodes: 40 sequential docker execs per sample on this topology.
+  # A valid layout could therefore exhaust the settlement deadline before its second sample.
+  for node in "${NODES[@]}"; do
+    addresses="$(node_sh "${node}" "ip -o -4 addr show dev eth0")" || return 1
+    for vip in "${VIPS[@]}"; do
+      if [[ " ${addresses} " == *" ${vip}/32 "* ]]; then
+        [[ -z "${holders[${vip}]+x}" ]] || return 1
+        holders["${vip}"]="${node}"
+      fi
+    done
+  done
+
+  for vip in "${VIPS[@]}"; do
+    [[ -n "${holders[${vip}]+x}" ]] || return 1
+    out+="${vip}=${holders[${vip}]} "
+  done
   printf '%s' "${out}"
+}
+
+snapshot_is_even() {
+  local snapshot="${1:?snapshot required}"
+  local -A counts=()
+  local node pair holder
+  for node in "${NODES[@]}"; do counts["${node}"]=0; done
+  for pair in ${snapshot}; do
+    holder="${pair#*=}"
+    [[ -n "${counts[${holder}]+x}" ]] || return 1
+    counts["${holder}"]=$((counts["${holder}"] + 1))
+  done
+
+  local total="${#VIPS[@]}" node_count="${#NODES[@]}"
+  local floor=$((total / node_count)) ceil=$(((total + node_count - 1) / node_count))
+  for node in "${NODES[@]}"; do
+    ((counts["${node}"] >= floor && counts["${node}"] <= ceil)) || return 1
+  done
 }
 
 # Wait until the VIP->holder map is even AND unchanged across a sustained interval, so the cluster
@@ -57,8 +93,7 @@ wait_for_settled() {
   local deadline=$((SECONDS + timeout_secs))
   local prev="" cur
   while ((SECONDS < deadline)); do
-    if even_over_nodes "${NODES[@]}"; then
-      cur="$(snapshot_holders)"
+    if cur="$(snapshot_holders)" && snapshot_is_even "${cur}"; then
       [[ -n "${prev}" && "${cur}" == "${prev}" ]] && return 0
       prev="${cur}"
     else
@@ -162,7 +197,7 @@ log "victim2 down: IPB landed on ${overloaded} (now holds ${over_vips[*]}); high
 restart_checkpoint="$(log_checkpoint)"
 start_services_no_deps "${victim1}"
 wait_for_service_running "${victim1}" 10
-wait_for_log_any_after "${restart_checkpoint}" 40 'joining via replication instead of forming a new one'
+wait_for_log_any_after "${restart_checkpoint}" 40 'reports a compatible existing cluster'
 
 # Expected: the higher-IP VIP moves from ${overloaded} to the rejoined ${victim1}; the lower-IP VIP
 # stays on ${overloaded}; the other two VIPs keep their holders from H2.

@@ -1,4 +1,10 @@
 #!/bin/sh
 set -e
 
+for config in /etc/keepafloatd/config.yaml /etc/keepafloatd/config-*.yaml; do
+    [ -f "${config}" ] && [ ! -L "${config}" ] || continue
+    chown root:root "${config}"
+    chmod 0600 "${config}"
+done
+
 #DEBHELPER#

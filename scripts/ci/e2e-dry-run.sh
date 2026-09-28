@@ -139,7 +139,8 @@ start_cluster() {
   write_node_config 3 false 17120 17121
 
   for node_id in 1 2 3; do
-    "${BINARY}" -c "${CURRENT_CONFIG_DIR}/node${node_id}.yaml" \
+    # Ownership assertions consume the daemon's dry-run bind/unbind events, which are info-level.
+    RUST_LOG=keepafloatd=info "${BINARY}" -c "${CURRENT_CONFIG_DIR}/node${node_id}.yaml" \
       >"$(node_log "${node_id}")" 2>&1 &
     PIDS+=("$!")
   done
@@ -179,8 +180,8 @@ node_has_vip_bound() {
   [[ -f "${log_file}" ]] || { echo 0; return; }
 
   awk -v vip="${vip}" '
-    index($0, "dry-run: would bind " vip " on ") { bound = 1 }
-    index($0, "dry-run: would unbind " vip " on ") { bound = 0 }
+    index($0, "dry-run: would bind " vip "/") { bound = 1 }
+    index($0, "dry-run: would unbind " vip "/") { bound = 0 }
     END { print bound ? 1 : 0 }
   ' "${log_file}"
 }
@@ -248,19 +249,58 @@ wait_for_state() {
   done
 }
 
+wait_for_unique_spread() {
+  local timeout_secs="${1:?timeout required}"
+  local max_iters=$((timeout_secs * 5))
+  local iter=0
+
+  while true; do
+    local node_id holder1 holder2
+    for node_id in 1 2 3; do
+      assert_node_alive "${node_id}"
+    done
+    holder1="$(current_holder_for_vip "${VIP1}")"
+    holder2="$(current_holder_for_vip "${VIP2}")"
+
+    if [[ "${holder1}" =~ ^[123]$ && "${holder2}" =~ ^[123]$ && "${holder1}" != "${holder2}" ]]; then
+      return 0
+    fi
+    if [[ "${holder1}" == duplicate:* || "${holder2}" == duplicate:* ]]; then
+      echo "duplicate dry-run bind detected: ${VIP1}=${holder1} ${VIP2}=${holder2}" >&2
+      exit 1
+    fi
+
+    iter=$((iter + 1))
+    if (( iter <= max_iters )); then
+      sleep "${WAIT_STEP}"
+      continue
+    fi
+    echo "timed out waiting for a unique two-node VIP spread" >&2
+    echo "current state: $(current_cluster_state)" >&2
+    exit 1
+  done
+}
+
 run_handoff_phase() {
   start_phase "handoff"
   start_cluster
 
-  wait_for_state "1" "2" 30
+  # V2 placement is deterministic for a replicated history, but concurrent initial health updates
+  # need not commit in node-id order. Assert the public rules rather than one cold-start permutation.
+  wait_for_unique_spread 30
+  local holder1 holder2 idle
+  holder1="$(current_holder_for_vip "${VIP1}")"
+  holder2="$(current_holder_for_vip "${VIP2}")"
+  idle=$((6 - holder1 - holder2))
 
-  set_node_health 1 0
-  wait_for_state "2" "3" 30
+  set_node_health "${holder1}" 0
+  wait_for_state "${idle}" "${holder2}" 30
 
-  kill -TERM "${PIDS[1]}"
-  wait "${PIDS[1]}" 2>/dev/null || true
-  PIDS[1]=""
-  wait_for_state "3" "3" 30
+  local holder2_idx=$((holder2 - 1))
+  kill -TERM "${PIDS[holder2_idx]}"
+  wait "${PIDS[holder2_idx]}" 2>/dev/null || true
+  PIDS[holder2_idx]=""
+  wait_for_state "${idle}" "${idle}" 30
 
   stop_cluster
 }

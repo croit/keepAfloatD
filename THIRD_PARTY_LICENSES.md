@@ -7,7 +7,7 @@ It does not attempt to enumerate Debian or other OS packages pulled in by contai
 installation paths; its scope is the Rust/Cargo dependency graph for this repository.
 
 - Scope: `cargo metadata --format-version 1 --locked`
-- Non-root crates observed: `182`
+- Non-root crates observed: `190`
 - Distinct third-party license expressions observed: `13`
 
 Every third-party crate in the current lockfile is usable under a permissive license. The only
@@ -77,15 +77,16 @@ with a commercial licensing path available from `croit.io`.
 ### `MIT`
 
 - `bitvec` `1.0.1`
+- `byte-unit` `5.2.0`
 - `bytecheck` `0.6.12`
 - `bytecheck_derive` `0.6.12`
 - `bytes` `1.11.1`
-- `byte-unit` `5.2.0`
 - `cfg_aliases` `0.2.1`
 - `convert_case` `0.10.0`
 - `derive_more` `2.1.1`
 - `derive_more-impl` `2.1.1`
 - `funty` `2.0.0`
+- `generic-array` `0.14.7`
 - `matchers` `0.2.0`
 - `mio` `1.2.0`
 - `nu-ansi-term` `0.50.3`
@@ -131,14 +132,15 @@ with a commercial licensing path available from `croit.io`.
 - `anstyle-parse` `1.0.0`
 - `anstyle-query` `1.1.5`
 - `anstyle-wincon` `3.0.11`
-- `anyhow` `1.0.102`
+- `anyhow` `1.0.104`
 - `arrayvec` `0.7.6`
 - `bitflags` `2.11.1`
+- `block-buffer` `0.10.4`
 - `borsh` `1.6.1`
 - `bumpalo` `3.20.2`
 - `cc` `1.2.61`
 - `cfg-if` `1.0.4`
-- `chacha20` `0.10.1`
+- `chacha20` `0.10.2`
 - `chrono` `0.4.44`
 - `chrono-tz` `0.8.6`
 - `chrono-tz-build` `0.2.1`
@@ -148,7 +150,10 @@ with a commercial licensing path available from `croit.io`.
 - `clap_lex` `1.1.0`
 - `colorchoice` `1.0.5`
 - `core-foundation-sys` `0.8.7`
+- `cpufeatures` `0.2.17`
 - `cpufeatures` `0.3.0`
+- `crypto-common` `0.1.7`
+- `digest` `0.10.7`
 - `dyn-clone` `1.0.20`
 - `either` `1.16.0`
 - `errno` `0.3.14`
@@ -180,15 +185,15 @@ with a commercial licensing path available from `croit.io`.
 - `num-traits` `0.2.19`
 - `once_cell` `1.21.4`
 - `once_cell_polyfill` `1.70.2`
-- `openraft` `0.10.0-alpha.25`
-- `openraft-macros` `0.10.0-alpha.25`
-- `openraft-rt` `0.10.0-alpha.25`
-- `openraft-rt-tokio` `0.10.0-alpha.25`
+- `openraft` `0.10.0-alpha.32`
+- `openraft-macros` `0.10.0-alpha.34`
+- `openraft-rt` `0.10.0-alpha.34`
+- `openraft-rt-tokio` `0.10.0-alpha.34`
 - `parking_lot` `0.12.5`
 - `parking_lot_core` `0.9.12`
 - `ppv-lite86` `0.2.21`
-- `proc-macro2` `1.0.106`
 - `proc-macro-crate` `3.5.0`
+- `proc-macro2` `1.0.106`
 - `quote` `1.0.45`
 - `rand` `0.10.1`
 - `rand` `0.8.6`
@@ -209,6 +214,7 @@ with a commercial licensing path available from `croit.io`.
 - `serde_derive` `1.0.228`
 - `serde_json` `1.0.149`
 - `serde_yaml` `0.9.34+deprecated`
+- `sha2` `0.10.9`
 - `shlex` `1.3.0`
 - `signal-hook-registry` `1.4.8`
 - `simdutf8` `0.1.5`
@@ -216,15 +222,17 @@ with a commercial licensing path available from `croit.io`.
 - `socket2` `0.6.3`
 - `syn` `1.0.109`
 - `syn` `2.0.117`
+- `syn` `3.0.4`
 - `thiserror` `2.0.18`
 - `thiserror-impl` `2.0.18`
 - `thread_local` `1.1.9`
 - `toml_datetime` `1.1.1+spec-1.1.0`
 - `toml_edit` `0.25.11+spec-1.1.0`
 - `toml_parser` `1.1.2+spec-1.1.0`
+- `typenum` `1.20.1`
 - `unicode-segmentation` `1.13.3`
 - `unicode-xid` `0.2.6`
-- `validit` `0.2.5`
+- `validit` `0.2.6`
 - `wasm-bindgen` `0.2.120`
 - `wasm-bindgen-macro` `0.2.120`
 - `wasm-bindgen-macro-support` `0.2.120`

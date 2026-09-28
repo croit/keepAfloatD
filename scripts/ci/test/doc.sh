@@ -6,4 +6,4 @@ set -eu
 WORKDIR="${CI_PROJECT_DIR:-/app}"
 cd "${WORKDIR}"
 
-cargo doc --no-deps
+RUSTDOCFLAGS="${RUSTDOCFLAGS:+${RUSTDOCFLAGS} }-D warnings" cargo doc --no-deps

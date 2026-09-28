@@ -9,8 +9,16 @@ set -eu
 
 cd "${CI_PROJECT_DIR:-$(pwd)}"
 
-TARBALL="$(find dist -maxdepth 1 -name 'keepafloatd-*.tar.gz' | sort | tail -1)"
-[ -n "${TARBALL}" ] || { echo "No source tarball in dist/" >&2; exit 1; }
+if [ -z "${TARBALL:-}" ]; then
+  set -- dist/keepafloatd-*.tar.gz
+  [ -e "$1" ] || { echo "No source tarball in dist/" >&2; exit 1; }
+  [ "$#" -eq 1 ] || {
+    echo "Multiple source tarballs in dist/; set TARBALL to the exact archive" >&2
+    exit 1
+  }
+  TARBALL="$1"
+fi
+[ -f "${TARBALL}" ] || { echo "Source tarball not found: ${TARBALL}" >&2; exit 1; }
 
 STAGING="$(mktemp -d)"
 trap 'rm -rf "${STAGING}"' EXIT

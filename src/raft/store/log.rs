@@ -49,10 +49,10 @@ impl RaftLogReader<TypeConfig> for KafLogStore {
             Bound::Excluded(&i) => i.checked_sub(1),
             Bound::Unbounded => None,
         };
-        if let (Some(s), Some(e)) = (start, end) {
-            if s > e {
-                return Ok(Vec::new());
-            }
+        if let (Some(s), Some(e)) = (start, end)
+            && s > e
+        {
+            return Ok(Vec::new());
         }
         let state = self.state.read().await;
         Ok(state.log.range(range).map(|(_, e)| e.clone()).collect())
@@ -87,7 +87,7 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
         // committed suffix whose floor is non-zero. Report the highest of {saved committed,
         // last_applied, the physical log floor}: this guarantees the engine's first commit-driven
         // apply reads `get_log_entries(frontier.next_index()..)` at or above the log floor, never
-        // index 0 — which is what trips `Defensive(LogIndexNotFound { want: 0 })` on a wiped node.
+        // index 0 - which is what trips `Defensive(LogIndexNotFound { want: 0 })` on a wiped node.
         let state = self.state.read().await;
         // Return the highest of {saved committed, applied frontier, purge floor}. The purge floor
         // (last_purged_log_id, seeded to `lowest_log_index - 1` on backfill) is the key term for a
@@ -101,10 +101,10 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
         // machine reached the latter, so both always point at a real, servable position. Start the
         // frontier from the higher of the two; never clamp below this.
         let mut best = state.committed;
-        if let Some(applied) = state.last_applied_log {
-            if best.map(|b| b.index()).unwrap_or(0) < applied.index() || best.is_none() {
-                best = Some(applied);
-            }
+        if let Some(applied) = state.last_applied_log
+            && (best.map(|b| b.index()).unwrap_or(0) < applied.index() || best.is_none())
+        {
+            best = Some(applied);
         }
 
         // `last_purged_log_id` is only a compaction boundary marker, NOT a servable entry. On a
@@ -119,7 +119,7 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
         //
         // Only let the purge floor RAISE the frontier when the log actually holds entries at/above
         // it (the restart-then-backfill case: the leader resent the committed suffix, so the log
-        // tail covers the floor and reading `get_log_entries(floor.next..)` stays in-bounds — which
+        // tail covers the floor and reading `get_log_entries(floor.next..)` stays in-bounds - which
         // is what avoids `LogIndexNotFound { want: 0 }`). When the log is empty or sits below the
         // floor, the purged entries are unreachable, so the floor must NOT bump the frontier.
         let log_tail = state.log.iter().next_back().map(|(_, e)| e.log_id);
@@ -148,7 +148,7 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
         let last_purged_log_id = match state.last_purged_log_id {
             Some(p) => Some(p),
             // Only derive a floor when the log starts ABOVE index 1 (a 1-based start has nothing
-            // purged below it). idx > 1 ⇒ indices 1..idx-1 were purged pre-restart.
+            // purged below it). idx > 1 means indices 1..idx-1 were purged pre-restart.
             None => state.log.iter().next().and_then(|(&idx, e)| {
                 (idx > 1).then(|| LogId::new(*e.log_id.committed_leader_id(), idx - 1))
             }),
@@ -179,15 +179,15 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
                 // Never resurrect the compacted prefix. openraft only appends above the purge point;
                 // an entry at or below it would re-open a hole below last_purged_log_id and desync the
                 // log view, so drop it and surface the broken upstream invariant.
-                if let Some(p) = purged {
-                    if entry.log_id.index() <= p {
-                        tracing::warn!(
-                            index = entry.log_id.index(),
-                            purged_upto = p,
-                            "append: ignoring entry at or below the purge point"
-                        );
-                        continue;
-                    }
+                if let Some(p) = purged
+                    && entry.log_id.index() <= p
+                {
+                    tracing::warn!(
+                        index = entry.log_id.index(),
+                        purged_upto = p,
+                        "append: ignoring entry at or below the purge point"
+                    );
+                    continue;
                 }
                 // Restart-then-backfill seed: after a restart the in-memory store is empty
                 // (last_purged_log_id = None). When the leader backfills the committed suffix starting
@@ -231,7 +231,7 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
         // Lower the purge floor if this truncation rolls the kept log below it. After a full cluster
         // reform the leader truncates a survivor's log back to a low index and replays from there;
         // if `last_purged_log_id` stayed at the old high floor, `append`'s drop-guard would silently
-        // drop every resent low entry and the log would never repopulate — leaving a permanent
+        // drop every resent low entry and the log would never repopulate - leaving a permanent
         // `LogIndexNotFound { want: 0 }` crash loop. After truncate_after, everything above
         // `last_log_id.index()` is gone, so the floor must be at most that index (or `None` when the
         // whole log was truncated). Lower it only when it currently sits above the kept tail.

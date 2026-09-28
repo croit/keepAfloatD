@@ -9,7 +9,7 @@ export ROOT_DIR
 
 # Two nodes go down INCLUDING the leader, leaving one survivor that still holds the committed
 # cluster state in memory. When the two blank (diskless) nodes return, they must DISCOVER the
-# survivor's existing cluster and JOIN it via replication — not form a fresh one. This is the
+# survivor's existing cluster and JOIN it via replication - not form a fresh one. This is the
 # opposite of scenario 08 (full outage, no survivor -> cold-form): here a stateful node remains, so
 # its session is preserved and the survivor's log wins (only it can be elected against blank peers).
 wait_for_single_agreed_leader 20
@@ -52,7 +52,7 @@ wait_for_service_running "${leader_svc}" 10
 wait_for_service_running "${victim}" 10
 
 # Evidence of rejoin (not re-formation): returning nodes join via replication...
-wait_for_log_any_after "${restart_checkpoint}" 40 'joining via replication instead of forming a new one'
+wait_for_log_any_after "${restart_checkpoint}" 40 'reports a compatible existing cluster'
 
 # ...the cluster returns to an even 3-node spread with one leader and unique holders...
 wait_for_even_over_nodes 45 "${NODES[@]}"

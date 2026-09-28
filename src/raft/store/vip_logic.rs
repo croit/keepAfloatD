@@ -1,8 +1,8 @@
 //! Pure, deterministic VIP eligibility and assignment logic.
 //!
 //! These functions take only plain data (health maps, probe ticks, membership, the VIP list) and
-//! produce the holder map. No clocks, no RNG, no hash-map iteration-order dependence — every
-//! iteration is over sorted structures — so all nodes and all replays agree. The state machine in
+//! produce the holder map. No clocks, no RNG, no hash-map iteration-order dependence - every
+//! iteration is over sorted structures - so all nodes and all replays agree. The state machine in
 //! [`super::state_machine`] feeds committed state through here on every applied entry.
 
 use super::super::types::TypeConfig;
@@ -36,7 +36,7 @@ pub(crate) fn assign_vips_round_robin_eligible(
 /// Extreme-load node, ties broken by the lowest id.
 ///
 /// `load` is a `BTreeMap`, so it is iterated in ascending id order and the first node seen at the
-/// extreme — the lowest id — wins. `keep_current` decides the extreme: `l >= bl` keeps the smaller
+/// extreme - the lowest id - wins. `keep_current` decides the extreme: `l >= bl` keeps the smaller
 /// load (least-loaded), `l <= bl` keeps the larger (most-loaded). Returns `None` only for an empty
 /// map.
 fn extreme_loaded_node(
@@ -81,10 +81,30 @@ fn most_loaded_node(load: &BTreeMap<u64, usize>) -> Option<(u64, usize)> {
 /// nodes and replays agree. Idempotent on an already balanced assignment (it then makes no moves).
 ///
 /// With an empty `current_holders` (cold start) every VIP is an orphan placed in sorted order onto
-/// loads seeded to zero, which is exactly round-robin over the sorted eligible list — so cold-start
+/// loads seeded to zero, which is exactly round-robin over the sorted eligible list - so cold-start
 /// steady state matches `assign_vips_round_robin_eligible` for an already-sorted VIP list.
 pub(crate) fn assign_vips_minimal_movement(
     eligible: &[u64],
+    vip_addrs_in_order: &[IpAddr],
+    current_holders: &HashMap<IpAddr, u64>,
+    out: &mut HashMap<IpAddr, u64>,
+) {
+    assign_vips_minimal_movement_with_receivers(
+        eligible,
+        eligible,
+        vip_addrs_in_order,
+        current_holders,
+        out,
+    );
+}
+
+/// Minimal-movement assignment with a restricted set of proactive rebalance recipients.
+///
+/// Orphans may use every node in `eligible`; only pass-three load balancing restricts recipients
+/// to `rebalance_receivers`. This models nopreempt without sacrificing availability.
+fn assign_vips_minimal_movement_with_receivers(
+    eligible: &[u64],
+    rebalance_receivers: &[u64],
     vip_addrs_in_order: &[IpAddr],
     current_holders: &HashMap<IpAddr, u64>,
     out: &mut HashMap<IpAddr, u64>,
@@ -104,7 +124,7 @@ pub(crate) fn assign_vips_minimal_movement(
     let mut vips_sorted = vip_addrs_in_order.to_vec();
     vips_sorted.sort_unstable();
 
-    // Pass 1 — stability: keep VIPs whose current holder is still eligible.
+    // Pass 1 - stability: keep VIPs whose current holder is still eligible.
     let mut orphans: Vec<IpAddr> = Vec::new();
     for vip in &vips_sorted {
         match current_holders.get(vip) {
@@ -117,7 +137,7 @@ pub(crate) fn assign_vips_minimal_movement(
         }
     }
 
-    // Pass 2 — orphan placement: least-loaded eligible node, ties broken by the lowest id.
+    // Pass 2 - orphan placement: least-loaded eligible node, ties broken by the lowest id.
     for vip in orphans {
         let Some((target, _)) = least_loaded_node(&load) else {
             break;
@@ -127,12 +147,19 @@ pub(crate) fn assign_vips_minimal_movement(
         held.entry(target).or_default().insert(vip);
     }
 
-    // Pass 3 — rebalance until the load spread is at most one VIP. Each iteration strictly reduces
+    // Pass 3 - rebalance until the load spread is at most one VIP. Each iteration strictly reduces
     // the spread (a non-negative integer), so it terminates. `load` is non-empty here, so the
     // most/least lookups always yield `Some`; the loop ends via the spread check below.
-    while let (Some((donor, donor_load)), Some((recv, recv_load))) =
-        (most_loaded_node(&load), least_loaded_node(&load))
-    {
+    let receiver_set: BTreeSet<u64> = rebalance_receivers.iter().copied().collect();
+    while let Some((donor, donor_load)) = most_loaded_node(&load) {
+        let receiver_load: BTreeMap<u64, usize> = load
+            .iter()
+            .filter(|(node_id, _)| receiver_set.contains(node_id))
+            .map(|(&node_id, &node_load)| (node_id, node_load))
+            .collect();
+        let Some((recv, recv_load)) = least_loaded_node(&receiver_load) else {
+            break;
+        };
         if donor_load.saturating_sub(recv_load) <= 1 {
             break;
         }
@@ -152,10 +179,46 @@ pub(crate) fn assign_vips_minimal_movement(
     }
 }
 
-/// Decide whether `node_id` is currently eligible to hold a VIP.
+/// Health/freshness eligibility before legacy blocking or recovery-delay policy is applied.
+#[must_use]
+pub(crate) fn is_node_base_eligible(
+    node_id: u64,
+    node_health: &HashMap<u64, bool>,
+    node_probe_ticks: &HashMap<u64, u64>,
+    latest_probe_tick: u64,
+    stale_missed_probes: u64,
+) -> bool {
+    if !*node_health.get(&node_id).unwrap_or(&false) {
+        return false;
+    }
+    is_node_probe_fresh(
+        node_id,
+        node_probe_ticks,
+        latest_probe_tick,
+        stale_missed_probes,
+    )
+}
+
+/// Whether `node_id` is still publishing within the committed probe-staleness window, independent
+/// of its reported health or failback eligibility. A fresh unhealthy holder is alive and must
+/// confirm VIP deletion; only a stale holder may use the crash-failover handoff fallback (#24).
+#[must_use]
+pub fn is_node_probe_fresh(
+    node_id: u64,
+    node_probe_ticks: &HashMap<u64, u64>,
+    latest_probe_tick: u64,
+    stale_missed_probes: u64,
+) -> bool {
+    let Some(&last_tick) = node_probe_ticks.get(&node_id) else {
+        return false;
+    };
+    latest_probe_tick.saturating_sub(last_tick) <= stale_missed_probes
+}
+
+/// Decide whether `node_id` is eligible under the legacy placement policy.
 ///
 /// Eligibility requires:
-/// 1. Not permanently blocked by `failback: false` (`node_failback_blocked`).
+/// 1. Not in the legacy permanent block set (`node_failback_blocked`).
 /// 2. Last reported health is `true`.
 /// 3. Most recent committed probe round is within `stale_missed_probes` of the cluster frontier.
 /// 4. If `failback_delay_ticks > 0` and the node is recovering (has a `node_recovery_tick`), at
@@ -173,29 +236,26 @@ pub fn is_node_eligible(
     node_recovery_tick: &HashMap<u64, u64>,
     node_failback_blocked: &HashSet<u64>,
 ) -> bool {
-    // Permanently blocked (failback: false path).
+    // Permanent block retained only for legacy failback:false compatibility.
     if node_failback_blocked.contains(&node_id) {
         return false;
     }
-    if !*node_health.get(&node_id).unwrap_or(&false) {
-        return false;
-    }
-    let last_tick = match node_probe_ticks.get(&node_id) {
-        Some(&t) => t,
-        None => return false,
-    };
-    if latest_probe_tick.saturating_sub(last_tick) > stale_missed_probes {
+    if !is_node_base_eligible(
+        node_id,
+        node_health,
+        node_probe_ticks,
+        latest_probe_tick,
+        stale_missed_probes,
+    ) {
         return false;
     }
     // Failback delay: if the node is in recovery, it must have been healthy for enough rounds.
-    if failback_delay_ticks > 0 {
-        if let Some(&recovery_tick) = node_recovery_tick.get(&node_id) {
-            if latest_probe_tick.saturating_sub(recovery_tick) < failback_delay_ticks {
-                return false;
-            }
-        }
-        // No recovery tick = node was never unhealthy on this run = eligible immediately.
+    if let Some(&recovery_tick) = node_recovery_tick.get(&node_id)
+        && latest_probe_tick.saturating_sub(recovery_tick) < failback_delay_ticks
+    {
+        return false;
     }
+    // No recovery tick = node was never unhealthy on this run = eligible immediately.
     true
 }
 
@@ -204,7 +264,7 @@ pub fn is_node_eligible(
 /// A publishing node advances by one but never trails the cluster frontier
 /// (`latest_probe_tick`): a node returning after downtime (or a freshly joined node) catches up to
 /// the frontier in a single update and so regains freshness immediately, while a node that has
-/// *stopped* publishing keeps falling behind as the frontier advances — which is what drives
+/// *stopped* publishing keeps falling behind as the frontier advances - which is what drives
 /// failover. Pure and deterministic (no clocks), so every node and every replay agree.
 #[must_use]
 pub fn next_probe_tick(prev: Option<u64>, latest_probe_tick: u64) -> u64 {
@@ -275,6 +335,47 @@ pub fn recompute_vip_holder(
     assign_vips_minimal_movement(&eligible, &vips, current_holders, out);
 }
 
+/// Recompute V2 ownership: failed nopreempt nodes may receive orphans but not proactive moves.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn recompute_vip_holder_v2(
+    membership: &StoredMembershipOf<TypeConfig>,
+    node_health: &HashMap<u64, bool>,
+    node_probe_ticks: &HashMap<u64, u64>,
+    latest_probe_tick: u64,
+    stale_missed_probes: u64,
+    failback_delay_ticks: u64,
+    node_recovery_tick: &HashMap<u64, u64>,
+    node_nopreempt: &HashSet<u64>,
+    vip_list: &[(VipAddr, String)],
+    current_holders: &HashMap<IpAddr, u64>,
+    out: &mut HashMap<IpAddr, u64>,
+) {
+    let no_legacy_blocks = HashSet::new();
+    let eligible = eligible_nodes(
+        membership,
+        node_health,
+        node_probe_ticks,
+        latest_probe_tick,
+        stale_missed_probes,
+        failback_delay_ticks,
+        node_recovery_tick,
+        &no_legacy_blocks,
+    );
+    let rebalance_receivers: Vec<u64> = eligible
+        .iter()
+        .copied()
+        .filter(|node_id| !node_nopreempt.contains(node_id))
+        .collect();
+    let vips: Vec<IpAddr> = vip_list.iter().map(|(vip, _)| vip.addr).collect();
+    assign_vips_minimal_movement_with_receivers(
+        &eligible,
+        &rebalance_receivers,
+        &vips,
+        current_holders,
+        out,
+    );
+}
+
 /// Merge the newly recomputed `vip_holder` map into the committed fenced assignment state.
 ///
 /// Every holder change bumps the per-VIP generation and records the previous holder that has to
@@ -285,6 +386,7 @@ pub fn reconcile_vip_assignments(
     vip_list: &[(VipAddr, String)],
     out_assignments: &mut HashMap<IpAddr, VipAssignment>,
     vip_generation: &mut HashMap<IpAddr, u64>,
+    vip_last_holder: &mut HashMap<IpAddr, u64>,
 ) {
     let mut next = HashMap::new();
 
@@ -293,6 +395,10 @@ pub fn reconcile_vip_assignments(
         let next_holder = new_holders.get(vip).copied();
         let old_assignment = out_assignments.remove(vip);
         let current_generation = vip_generation.get(vip).copied().unwrap_or(0);
+
+        if let Some(assignment) = &old_assignment {
+            vip_last_holder.insert(*vip, assignment.holder);
+        }
 
         let Some(holder) = next_holder else {
             continue;
@@ -313,18 +419,29 @@ pub fn reconcile_vip_assignments(
                 }
             }
             None => {
+                let previous_holder = vip_last_holder.get(vip).copied();
                 let generation = current_generation.saturating_add(1);
                 vip_generation.insert(*vip, generation);
+                // #22: a prior generation means ownership disappeared during an all-ineligible
+                // interval. Treat its return as a handoff and retain the same deterministic
+                // activation holdoff used for a direct holder change; only a true cold start may
+                // activate immediately.
+                let activation_tick = if current_generation == 0 {
+                    latest_probe_tick
+                } else {
+                    latest_probe_tick.saturating_add(OWNERSHIP_ACTIVATION_HOLDOFF_TICKS)
+                };
                 VipAssignment {
                     holder,
                     generation,
-                    previous_holder: None,
-                    previous_holder_released: true,
-                    activation_tick: latest_probe_tick,
+                    previous_holder,
+                    previous_holder_released: previous_holder.is_none(),
+                    activation_tick,
                 }
             }
         };
 
+        vip_last_holder.insert(*vip, holder);
         next.insert(*vip, assignment);
     }
 
@@ -334,7 +451,9 @@ pub fn reconcile_vip_assignments(
 #[cfg(test)]
 mod tests {
     use super::super::super::types::TypeConfig;
-    use super::super::state::{KafSnapshot, OWNERSHIP_ACTIVATION_HOLDOFF_TICKS, VipAssignment};
+    use super::super::state::{
+        FailoverSemantics, KafSnapshot, OWNERSHIP_ACTIVATION_HOLDOFF_TICKS, VipAssignment,
+    };
     use super::{
         assign_vips_minimal_movement, assign_vips_round_robin_eligible, is_node_eligible,
         next_probe_tick, recompute_vip_holder, reconcile_vip_assignments,
@@ -631,6 +750,7 @@ mod tests {
             &vip_list,
             &mut assignments,
             &mut generations,
+            &mut HashMap::new(),
         );
 
         let a = assignments.get(&vip).unwrap();
@@ -662,10 +782,80 @@ mod tests {
             &vip_list,
             &mut assignments,
             &mut generations,
+            &mut HashMap::new(),
         );
 
         assert_eq!(assignments.get(&vip), Some(&existing));
         assert_eq!(generations.get(&vip), Some(&6_u64));
+    }
+
+    #[test]
+    fn reassignment_after_an_ownerless_gap_keeps_the_activation_holdoff() {
+        let vip = ip4(10, 0, 0, 52);
+        let vip_list = vec![(VipAddr::host(vip), "eth0".into())];
+        let mut assignments = HashMap::from([(
+            vip,
+            VipAssignment {
+                holder: 1,
+                generation: 4,
+                previous_holder: None,
+                previous_holder_released: true,
+                activation_tick: 2,
+            },
+        )]);
+        let mut generations = HashMap::from([(vip, 4_u64)]);
+        let mut last_holder = HashMap::new();
+
+        reconcile_vip_assignments(
+            &HashMap::new(),
+            9,
+            &vip_list,
+            &mut assignments,
+            &mut generations,
+            &mut last_holder,
+        );
+        assert!(assignments.is_empty());
+
+        reconcile_vip_assignments(
+            &HashMap::from([(vip, 2_u64)]),
+            10,
+            &vip_list,
+            &mut assignments,
+            &mut generations,
+            &mut last_holder,
+        );
+
+        let reassigned = assignments.get(&vip).unwrap();
+        assert_eq!(reassigned.holder, 2);
+        assert_eq!(reassigned.generation, 5);
+        assert_eq!(reassigned.previous_holder, Some(1));
+        assert!(!reassigned.previous_holder_released);
+        assert_eq!(
+            reassigned.activation_tick,
+            10 + OWNERSHIP_ACTIVATION_HOLDOFF_TICKS,
+            "an earlier generation proves this is a handoff, not a cold-start assignment"
+        );
+    }
+
+    #[test]
+    fn first_assignment_without_generation_history_activates_immediately() {
+        let vip = ip4(10, 0, 0, 53);
+        let vip_list = vec![(VipAddr::host(vip), "eth0".into())];
+        let mut assignments = HashMap::new();
+        let mut generations = HashMap::new();
+
+        reconcile_vip_assignments(
+            &HashMap::from([(vip, 2_u64)]),
+            10,
+            &vip_list,
+            &mut assignments,
+            &mut generations,
+            &mut HashMap::new(),
+        );
+
+        let assignment = assignments.get(&vip).unwrap();
+        assert_eq!(assignment.generation, 1);
+        assert_eq!(assignment.activation_tick, 10);
     }
 
     // Four VIPs in ascending IP order for the minimal-movement tests:
@@ -955,15 +1145,24 @@ mod tests {
         // `None` case here so the `Value` DOM round-trip stays within range.
         let none_snap = KafSnapshot::default();
         let mut val = serde_json::to_value(&none_snap).unwrap();
-        val.as_object_mut().unwrap().remove("cluster_epoch");
+        let object = val.as_object_mut().unwrap();
+        object.remove("cluster_epoch");
+        object.remove("failover_semantics");
+        object.remove("config_identity_enforced");
+        object.remove("node_nopreempt");
+        object.remove("node_recovery_pending");
         let legacy: KafSnapshot = serde_json::from_value(val).unwrap();
         assert_eq!(legacy.cluster_epoch, None);
+        assert_eq!(legacy.failover_semantics, FailoverSemantics::Legacy);
+        assert!(!legacy.config_identity_enforced);
+        assert!(legacy.node_nopreempt.is_empty());
+        assert!(legacy.node_recovery_pending.is_empty());
     }
 
     #[test]
     fn is_node_eligible_exact_staleness_boundary() {
         let nh = HashMap::from([(1_u64, true)]);
-        // latest - last == stale → still eligible.
+        // At latest - last == stale, the node remains eligible.
         let at = HashMap::from([(1_u64, 7_u64)]);
         assert!(is_node_eligible(
             1,
@@ -975,7 +1174,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new()
         ));
-        // latest - last == stale + 1 → fenced off.
+        // At latest - last == stale + 1, the node is fenced off.
         let past = HashMap::from([(1_u64, 6_u64)]);
         assert!(!is_node_eligible(
             1,
@@ -1055,7 +1254,7 @@ mod tests {
         let ticks = HashMap::from([(1_u64, 10_u64)]);
         // Recovery tick = 8, delay = 3: need latest - recovery >= 3, i.e. latest >= 11.
         let recovery = HashMap::from([(1_u64, 8_u64)]);
-        // At tick 10: 10 - 8 = 2 < 3 → not eligible yet.
+        // At tick 10, 10 - 8 = 2 < 3, so the node is not eligible yet.
         assert!(!is_node_eligible(
             1,
             &nh,
@@ -1066,7 +1265,7 @@ mod tests {
             &recovery,
             &HashSet::new()
         ));
-        // At tick 11: 11 - 8 = 3 >= 3 → eligible.
+        // At tick 11, 11 - 8 = 3 >= 3, so the node is eligible.
         let ticks11 = HashMap::from([(1_u64, 11_u64)]);
         assert!(is_node_eligible(
             1,
@@ -1099,10 +1298,10 @@ mod tests {
             &recovery_at_5,
             &HashSet::new()
         ));
-        // After unhealthy→healthy again, recovery_tick resets to 7.
+        // After another unhealthy-to-healthy transition, recovery_tick resets to 7.
         let recovery_at_7 = HashMap::from([(1_u64, 7_u64)]);
         let ticks10 = HashMap::from([(1_u64, 10_u64)]);
-        // 10 - 7 = 3 >= 3 → eligible.
+        // 10 - 7 = 3 >= 3, so the node is eligible.
         assert!(is_node_eligible(
             1,
             &nh,

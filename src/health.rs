@@ -1,89 +1,60 @@
 //! Local script/command health probe.
+//!
+//! The shared `process` module owns Linux process-group setup and teardown so cancellation can
+//! synchronously kill the direct probe and every descendant before Tokio drops the async task.
 
 use crate::config::HealthConfig;
-use std::io;
+use crate::process::Completion;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::task::JoinHandle;
+
+/// Converts raw probe results into effective local health with deterministic failure dampening.
+///
+/// Only a node that has already been healthy receives the configured grace period. This prevents
+/// a failing startup probe from becoming optimistically healthy merely because a delay is set.
+pub(crate) struct FailureDampener {
+    delay_ticks: u64,
+    failure_ticks: u64,
+    effective_healthy: bool,
+}
+
+impl FailureDampener {
+    #[must_use]
+    pub(crate) fn new(delay_ticks: u64) -> Self {
+        Self {
+            delay_ticks,
+            failure_ticks: 0,
+            effective_healthy: false,
+        }
+    }
+
+    /// Observe one raw probe result and return the health value exposed to binding and Raft.
+    pub(crate) fn observe(&mut self, raw_healthy: bool) -> bool {
+        if raw_healthy {
+            self.failure_ticks = 0;
+            self.effective_healthy = true;
+            return true;
+        }
+        if !self.effective_healthy {
+            return false;
+        }
+
+        self.failure_ticks = self.failure_ticks.saturating_add(1);
+        if self.failure_ticks > self.delay_ticks {
+            self.effective_healthy = false;
+        }
+        self.effective_healthy
+    }
+
+    #[must_use]
+    pub(crate) fn failure_ticks(&self) -> u64 {
+        self.failure_ticks
+    }
+}
 
 /// Bound diagnostic previews so a noisy probe cannot flood logs or memory.
 const MAX_CAPTURE_BYTES: usize = 4 * 1024;
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct CapturedOutput {
-    bytes: Vec<u8>,
-    truncated_bytes: usize,
-}
-
-impl CapturedOutput {
-    fn record_chunk(&mut self, chunk: &[u8], limit: usize) {
-        let keep = limit.saturating_sub(self.bytes.len()).min(chunk.len());
-        self.bytes.extend_from_slice(&chunk[..keep]);
-        self.truncated_bytes += chunk.len().saturating_sub(keep);
-    }
-
-    fn preview(&self) -> String {
-        String::from_utf8_lossy(&self.bytes).into_owned()
-    }
-}
-
-async fn read_captured_output<R>(mut reader: R, limit: usize) -> io::Result<CapturedOutput>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut captured = CapturedOutput::default();
-    let mut buf = [0_u8; 1024];
-
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(captured);
-        }
-        captured.record_chunk(&buf[..n], limit);
-    }
-}
-
-fn spawn_output_reader<R>(reader: Option<R>) -> Option<JoinHandle<io::Result<CapturedOutput>>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    reader.map(|reader| {
-        // Drain this child pipe until EOF so a chatty probe cannot block on a full buffer.
-        tokio::spawn(read_captured_output(reader, MAX_CAPTURE_BYTES))
-    })
-}
-
-/// Grace period for draining a probe's stdout/stderr after it has exited (or been killed). A probe
-/// that forks a background child inheriting the pipe (`curl … &`, `nc -l &`) keeps the write-end
-/// open, so the reader never sees EOF; without this bound `run_health_check` would never return and
-/// the health-publication loop would stop ticking, fencing the node as stale forever.
-const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-
-async fn collect_output(task: Option<JoinHandle<io::Result<CapturedOutput>>>) -> CapturedOutput {
-    match task {
-        Some(task) => {
-            let abort = task.abort_handle();
-            match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, task).await {
-                Ok(Ok(Ok(output))) => output,
-                Ok(_) => CapturedOutput::default(),
-                Err(_) => {
-                    abort.abort();
-                    CapturedOutput::default()
-                }
-            }
-        }
-        None => CapturedOutput::default(),
-    }
-}
-
-async fn collect_stdio(
-    stdout_task: Option<JoinHandle<io::Result<CapturedOutput>>>,
-    stderr_task: Option<JoinHandle<io::Result<CapturedOutput>>>,
-) -> (CapturedOutput, CapturedOutput) {
-    tokio::join!(collect_output(stdout_task), collect_output(stderr_task))
-}
 
 /// Run `command[0]` with `command[1..]` as argv, returning `true` only for exit status 0.
 ///
@@ -95,12 +66,12 @@ pub async fn run_health_check(cfg: &HealthConfig) -> bool {
         None => return false,
     };
 
-    let mut child = match Command::new(prog)
+    let mut command = Command::new(prog);
+    command
         .args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let child = match crate::process::spawn_grouped(&mut command) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
@@ -111,60 +82,59 @@ pub async fn run_health_check(cfg: &HealthConfig) -> bool {
             return false;
         }
     };
-
-    let stdout_task = spawn_output_reader(child.stdout.take());
-    let stderr_task = spawn_output_reader(child.stderr.take());
     let timeout = Duration::from_millis(cfg.timeout_ms.max(1));
 
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => {
-            let (stdout, stderr) = collect_stdio(stdout_task, stderr_task).await;
+    let run = child.wait_captured(timeout, MAX_CAPTURE_BYTES).await;
+    let stdout_preview = run.stdout.preview();
+    let stderr_preview = run.stderr.preview();
+    match run.completion {
+        Completion::Exited(status) => {
+            if let Some(error) = run.cleanup_error {
+                tracing::warn!(
+                    command = ?cfg.command,
+                    %error,
+                    "health probe exited but descendant cleanup failed"
+                );
+                return false;
+            }
             if status.success() {
                 return true;
             }
-
-            let stdout_preview = stdout.preview();
-            let stderr_preview = stderr.preview();
             tracing::warn!(
                 command = ?cfg.command,
                 exit_status = %status,
                 exit_code = ?status.code(),
                 stdout = ?stdout_preview,
-                stdout_truncated_bytes = stdout.truncated_bytes,
+                stdout_truncated_bytes = run.stdout.truncated_bytes(),
                 stderr = ?stderr_preview,
-                stderr_truncated_bytes = stderr.truncated_bytes,
+                stderr_truncated_bytes = run.stderr.truncated_bytes(),
                 "health probe exited non-zero"
             );
             false
         }
-        Ok(Err(e)) => {
-            let _ = child.kill().await;
-            let (stdout, stderr) = collect_stdio(stdout_task, stderr_task).await;
-            let stdout_preview = stdout.preview();
-            let stderr_preview = stderr.preview();
+        Completion::WaitFailed(e) => {
             tracing::warn!(
                 command = ?cfg.command,
                 error = %e,
+                cleanup_error = ?run.cleanup_error.map(|error| error.to_string()),
                 stdout = ?stdout_preview,
-                stdout_truncated_bytes = stdout.truncated_bytes,
+                stdout_truncated_bytes = run.stdout.truncated_bytes(),
                 stderr = ?stderr_preview,
-                stderr_truncated_bytes = stderr.truncated_bytes,
+                stderr_truncated_bytes = run.stderr.truncated_bytes(),
                 "health probe wait failed"
             );
             false
         }
-        Err(_) => {
-            let _ = child.kill().await;
-            let (stdout, stderr) = collect_stdio(stdout_task, stderr_task).await;
-            let stdout_preview = stdout.preview();
-            let stderr_preview = stderr.preview();
+        Completion::TimedOut { reap_error } => {
             tracing::warn!(
                 command = ?cfg.command,
                 timeout_ms = cfg.timeout_ms,
+                cleanup_error = ?run.cleanup_error.map(|error| error.to_string()),
+                reap_error = ?reap_error,
                 stdout = ?stdout_preview,
-                stdout_truncated_bytes = stdout.truncated_bytes,
+                stdout_truncated_bytes = run.stdout.truncated_bytes(),
                 stderr = ?stderr_preview,
-                stderr_truncated_bytes = stderr.truncated_bytes,
+                stderr_truncated_bytes = run.stderr.truncated_bytes(),
                 "health probe timed out"
             );
             false
@@ -175,6 +145,80 @@ pub async fn run_health_check(cfg: &HealthConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument::WithSubscriber;
+
+    #[derive(Clone, Default)]
+    struct DiagnosticBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for DiagnosticBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn recorded_probe(cfg: &HealthConfig) -> (bool, String) {
+        let output = DiagnosticBuffer::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let healthy = run_health_check(cfg).with_subscriber(subscriber).await;
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        (healthy, text)
+    }
+
+    #[tokio::test]
+    async fn failed_probe_reports_bounded_output_and_exit_code() {
+        let cfg = health_cfg(
+            &[
+                "/bin/sh",
+                "-c",
+                "i=0; while [ $i -lt 5000 ]; do printf x; i=$((i+1)); done; printf failure >&2; exit 7",
+            ],
+            2000,
+        );
+        let (healthy, log) = recorded_probe(&cfg).await;
+        assert!(!healthy);
+        assert!(log.contains("health probe exited non-zero"), "{log}");
+        assert!(log.contains("exit_code=Some(7)"), "{log}");
+        assert!(log.contains("stderr=\"failure\""), "{log}");
+        assert!(log.contains("stdout_truncated_bytes=904"), "{log}");
+        assert!(log.contains(&"x".repeat(MAX_CAPTURE_BYTES)), "{log}");
+        assert!(!log.contains(&"x".repeat(MAX_CAPTURE_BYTES + 1)));
+    }
+
+    #[tokio::test]
+    async fn failed_spawn_and_timeout_have_distinct_diagnostics() {
+        let (healthy, log) =
+            recorded_probe(&health_cfg(&["/definitely/missing-keepafloatd-probe"], 200)).await;
+        assert!(!healthy);
+        assert!(log.contains("health probe spawn failed"), "{log}");
+        assert!(!log.contains("health probe timed out"));
+
+        let (healthy, log) =
+            recorded_probe(&health_cfg(&["/bin/sh", "-c", "exec sleep 10"], 200)).await;
+        assert!(!healthy);
+        assert!(log.contains("health probe timed out"), "{log}");
+        assert!(log.contains("timeout_ms=200"), "{log}");
+        assert!(!log.contains("health probe spawn failed"));
+    }
+
+    #[tokio::test]
+    async fn successful_probe_emits_no_failure_diagnostics() {
+        let (healthy, log) = recorded_probe(&health_cfg(&["/bin/sh", "-c", "exit 0"], 200)).await;
+        assert!(healthy);
+        assert!(log.is_empty(), "{log}");
+    }
 
     fn health_cfg(command: &[&str], timeout_ms: u64) -> HealthConfig {
         HealthConfig {
@@ -185,15 +229,91 @@ mod tests {
         }
     }
 
-    #[test]
-    fn captured_output_truncates_across_chunks() {
-        let mut captured = CapturedOutput::default();
-        captured.record_chunk(b"abcd", 5);
-        captured.record_chunk(b"efgh", 5);
+    fn unique_pid_file(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "keepafloatd-health-{label}-{}-{nonce}.pid",
+            std::process::id()
+        ))
+    }
 
-        assert_eq!(captured.bytes, b"abcde");
-        assert_eq!(captured.truncated_bytes, 3);
-        assert_eq!(captured.preview(), "abcde");
+    async fn read_pid_file(path: &Path) -> u32 {
+        for _ in 0..100 {
+            if let Ok(contents) = tokio::fs::read_to_string(path).await {
+                return contents.trim().parse().unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for pid file {}", path.display());
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    async fn wait_for_processes_to_exit(pids: &[u32]) -> bool {
+        // Coverage runs trace child exits and may delay `/proc` disappearance beyond the normal
+        // sub-second path. Keep the oracle bounded below the five-second focused-test budget.
+        for _ in 0..300 {
+            if pids.iter().all(|pid| !process_exists(*pid)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    async fn cleanup_processes(pids: &[u32]) {
+        for pid in pids {
+            if process_exists(*pid) {
+                let _ = Command::new("/bin/kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status()
+                    .await;
+            }
+        }
+        let _ = wait_for_processes_to_exit(pids).await;
+    }
+
+    #[test]
+    fn failure_dampener_keeps_startup_failure_unhealthy() {
+        let mut dampener = FailureDampener::new(3);
+
+        assert!(!dampener.observe(false));
+        assert!(!dampener.observe(false));
+    }
+
+    #[test]
+    fn failure_dampener_delays_established_health_failure() {
+        let mut dampener = FailureDampener::new(2);
+
+        assert!(dampener.observe(true));
+        assert!(dampener.observe(false));
+        assert!(dampener.observe(false));
+        assert!(!dampener.observe(false));
+    }
+
+    #[test]
+    fn failure_dampener_zero_delay_fails_immediately() {
+        let mut dampener = FailureDampener::new(0);
+
+        assert!(dampener.observe(true));
+        assert!(!dampener.observe(false));
+    }
+
+    #[test]
+    fn failure_dampener_recovery_resets_failure_streak() {
+        let mut dampener = FailureDampener::new(2);
+
+        assert!(dampener.observe(true));
+        assert!(dampener.observe(false));
+        assert!(dampener.observe(true));
+        assert!(dampener.observe(false));
+        assert!(dampener.observe(false));
+        assert!(!dampener.observe(false));
     }
 
     #[tokio::test]
@@ -225,6 +345,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_health_check_kills_direct_child_and_descendant() {
+        let parent_file = unique_pid_file("cancel-parent");
+        let child_file = unique_pid_file("cancel-child");
+        let script = format!(
+            "echo $$ > {}; sleep 30 & echo $! > {}; wait",
+            parent_file.display(),
+            child_file.display()
+        );
+        let cfg = health_cfg(&["/bin/sh", "-c", &script], 30_000);
+        let task = tokio::spawn(async move { run_health_check(&cfg).await });
+        let parent_pid = read_pid_file(&parent_file).await;
+        let child_pid = read_pid_file(&child_file).await;
+
+        task.abort();
+        let _ = task.await;
+        let exited = wait_for_processes_to_exit(&[parent_pid, child_pid]).await;
+        cleanup_processes(&[parent_pid, child_pid]).await;
+        let _ = tokio::fs::remove_file(parent_file).await;
+        let _ = tokio::fs::remove_file(child_file).await;
+
+        assert!(
+            exited,
+            "cancelling a health future must kill and reap its whole process group"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_probe_kills_background_descendant_before_returning() {
+        let child_file = unique_pid_file("success-child");
+        let script = format!("sleep 30 & echo $! > {}; exit 0", child_file.display());
+
+        assert!(run_health_check(&health_cfg(&["/bin/sh", "-c", &script], 500)).await);
+        let child_pid = read_pid_file(&child_file).await;
+        let exited = wait_for_processes_to_exit(&[child_pid]).await;
+        cleanup_processes(&[child_pid]).await;
+        let _ = tokio::fs::remove_file(child_file).await;
+
+        assert!(
+            exited,
+            "a successful probe must not leave background descendants running"
+        );
+    }
+
+    #[tokio::test]
     async fn health_check_returns_when_a_grandchild_holds_the_pipe() {
         // The probe exits 0 immediately but backgrounds a child that inherits stdout, holding the
         // pipe write-end open. Draining must not hang past OUTPUT_DRAIN_TIMEOUT, or the health loop
@@ -241,26 +405,6 @@ mod tests {
             "run_health_check must not block on the inherited pipe (took {:?})",
             start.elapsed()
         );
-    }
-
-    #[test]
-    fn captured_output_limit_zero_truncates_everything() {
-        let mut c = CapturedOutput::default();
-        c.record_chunk(b"abc", 0);
-        assert!(c.bytes.is_empty());
-        assert_eq!(c.truncated_bytes, 3);
-    }
-
-    #[test]
-    fn captured_output_records_up_to_exact_limit() {
-        let mut c = CapturedOutput::default();
-        c.record_chunk(b"abcde", 5);
-        assert_eq!(c.bytes, b"abcde");
-        assert_eq!(c.truncated_bytes, 0);
-        // Once the limit is reached, a further chunk is fully truncated.
-        c.record_chunk(b"fg", 5);
-        assert_eq!(c.bytes, b"abcde");
-        assert_eq!(c.truncated_bytes, 2);
     }
 
     #[tokio::test]

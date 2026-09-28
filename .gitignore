@@ -7,6 +7,9 @@
 /version.env
 /config.yaml
 
-# Internal real-cluster test harness: hardcodes private cluster IPs, the croit jump host, SSH key
-# paths and a test cluster secret. Kept local-only (this repo is public); do not commit.
-/tests/realcluster/
+# Keep only topology, credentials, generated evidence, and internal audit notes private. The
+# reusable harness, scenario assertions, and sanitized environment template stay reviewable.
+/tests/realcluster/env.sh
+/tests/realcluster/results/
+/tests/realcluster/REPORT.md
+/tests/realcluster/FINDINGS.md

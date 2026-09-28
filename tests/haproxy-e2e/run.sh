@@ -217,6 +217,17 @@ cleanup() {
 
 trap cleanup EXIT
 
+verify_node_image_binary() {
+    local expected actual
+    expected="$(sha256sum target/release/keepafloatd | awk '{print $1}')"
+    actual="$(docker run --rm --entrypoint sha256sum \
+        keepafloatd-haproxy-e2e-node:local /usr/local/bin/keepafloatd | awk '{print $1}')"
+    [[ "${actual}" == "${expected}" ]] || {
+        fail "HAProxy node image does not contain the exact current release binary"
+        return 1
+    }
+}
+
 log "building release binary for HAProxy article lab"
 cargo build --release
 
@@ -227,6 +238,7 @@ rustc tests/haproxy-e2e/haproxy.rs -O -o target/haproxy-e2e/haproxy
 log "preparing compact node build context"
 rm -rf target/haproxy-e2e/docker-context
 mkdir -p target/haproxy-e2e/docker-context/configs
+cp target/release/keepafloatd target/haproxy-e2e/docker-context/keepafloatd
 cp target/haproxy-e2e/haproxy target/haproxy-e2e/docker-context/haproxy
 cp tests/haproxy-e2e/entrypoint.sh target/haproxy-e2e/docker-context/entrypoint.sh
 cp tests/haproxy-e2e/node.Dockerfile target/haproxy-e2e/docker-context/Dockerfile
@@ -234,6 +246,7 @@ cp tests/haproxy-e2e/configs/*.yaml target/haproxy-e2e/docker-context/configs/
 
 log "building node image"
 DOCKER_BUILDKIT=0 docker build --pull=false -t keepafloatd-haproxy-e2e-node:local target/haproxy-e2e/docker-context
+verify_node_image_binary
 
 log "starting HAProxy article lab"
 compose down -v --remove-orphans >/dev/null 2>&1 || true

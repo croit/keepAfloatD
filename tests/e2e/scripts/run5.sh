@@ -9,10 +9,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 export ROOT_DIR
 
-export COMPOSE_FILE="${ROOT_DIR}/tests/e2e/docker-compose.5node.yml"
+export COMPOSE_FILE="${ROOT_DIR}/docker-compose.5node.yml"
 export COMPOSE_PROJECT_NAME="keepafloatd-e2e-5node"
 export E2E_NODES="node-a node-b node-c node-d node-e"
 export E2E_VIPS="10.50.0.100 10.50.0.101 10.50.0.102 10.50.0.103"
+export KEEPAFLOATD_E2E_CONFIG_SUFFIX="5"
 
 # shellcheck source=tests/e2e/scripts/lib.sh
 . "${ROOT_DIR}/tests/e2e/scripts/lib.sh"

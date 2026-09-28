@@ -37,7 +37,7 @@ l1_svc="$(service_for_id "${l1_id}")"
 }
 log "leadership moved to ${l1_svc} (id ${l1_id})"
 
-# Phase 2: survivor-rejoin against the NEW leader L1 — kill L1 plus one follower, keep one survivor.
+# Phase 2: survivor-rejoin against the NEW leader L1 - kill L1 plus one follower, keep one survivor.
 others=()
 for svc in "${NODES[@]}"; do
   [[ "${svc}" == "${l1_svc}" ]] || others+=("${svc}")
@@ -69,7 +69,7 @@ start_service "${victim}"
 wait_for_service_running "${l1_svc}" 10
 wait_for_service_running "${victim}" 10
 
-wait_for_log_any_after "${restart_checkpoint}" 40 'joining via replication instead of forming a new one'
+wait_for_log_any_after "${restart_checkpoint}" 40 'reports a compatible existing cluster'
 wait_for_even_over_nodes 45 "${NODES[@]}"
 assert_unique_holders
 wait_for_single_agreed_leader 15

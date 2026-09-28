@@ -1,6 +1,3 @@
-# 5-node / 4-VIP compose stack for the minimal-movement rebalance suite (tests/e2e/scripts/run5.sh).
-# It mirrors docker-compose.yml but runs five keepafloatd nodes (ids 1..5) with the *5.yaml configs
-# and a fourth VIP. The default 3-node stack in docker-compose.yml is left untouched.
 x-e2e-node: &e2e-node
   image: ${KEEPAFLOATD_IMAGE:-ghcr.io/croit/keepafloatd:latest}
   user: "0:0"
@@ -20,7 +17,7 @@ x-e2e-node: &e2e-node
 services:
   e2e-fixtures:
     build:
-      context: .
+      context: ./tests/e2e
       dockerfile: fixtures/Dockerfile
     init: true
     restart: "no"
@@ -35,7 +32,7 @@ services:
         condition: service_completed_successfully
       e2e-runner:
         condition: service_started
-    command: ["-c", "/opt/keepafloatd-tests/configs/a5.yaml"]
+    command: ["-c", "/opt/keepafloatd-tests/${KEEPAFLOATD_E2E_CONFIG_DIR:-configs}/a.yaml"]
     networks:
       test-net:
         ipv4_address: 10.50.0.10
@@ -47,7 +44,7 @@ services:
         condition: service_completed_successfully
       node-a:
         condition: service_started
-    command: ["-c", "/opt/keepafloatd-tests/configs/b5.yaml"]
+    command: ["-c", "/opt/keepafloatd-tests/${KEEPAFLOATD_E2E_CONFIG_DIR:-configs}/b.yaml"]
     networks:
       test-net:
         ipv4_address: 10.50.0.11
@@ -59,38 +56,14 @@ services:
         condition: service_completed_successfully
       node-b:
         condition: service_started
-    command: ["-c", "/opt/keepafloatd-tests/configs/c5.yaml"]
+    command: ["-c", "/opt/keepafloatd-tests/${KEEPAFLOATD_E2E_CONFIG_DIR:-configs}/c.yaml"]
     networks:
       test-net:
         ipv4_address: 10.50.0.12
 
-  node-d:
-    <<: *e2e-node
-    depends_on:
-      e2e-fixtures:
-        condition: service_completed_successfully
-      node-c:
-        condition: service_started
-    command: ["-c", "/opt/keepafloatd-tests/configs/d5.yaml"]
-    networks:
-      test-net:
-        ipv4_address: 10.50.0.13
-
-  node-e:
-    <<: *e2e-node
-    depends_on:
-      e2e-fixtures:
-        condition: service_completed_successfully
-      node-d:
-        condition: service_started
-    command: ["-c", "/opt/keepafloatd-tests/configs/e5.yaml"]
-    networks:
-      test-net:
-        ipv4_address: 10.50.0.14
-
   e2e-runner:
     build:
-      context: ./runner
+      context: ./tests/e2e/runner
     init: true
     restart: "no"
     cap_add:

@@ -7,7 +7,7 @@ export ROOT_DIR
 # shellcheck source=tests/e2e/scripts/lib.sh
 . "${ROOT_DIR}/tests/e2e/scripts/lib.sh"
 
-# Capture the VIP(s) node-a currently holds before shutdown — placement is non-deterministic under
+# Capture the VIP(s) node-a currently holds before shutdown - placement is non-deterministic under
 # minimal-movement, so we assert it unbinds whatever it actually held, not a fixed address.
 held_by_a=()
 for vip in "${VIPS[@]}"; do

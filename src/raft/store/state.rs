@@ -19,7 +19,8 @@
 //! must release the VIP before the new holder may bind while the old node is still eligible. This
 //! is what eliminates the old "two healthy lagging nodes can both bind" window.
 
-use super::super::types::TypeConfig;
+pub use super::super::types::FailoverSemantics;
+use super::super::types::{KafSnapshotData, TypeConfig};
 use crate::config::VipAddr;
 use openraft::SnapshotMeta;
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf};
@@ -75,6 +76,9 @@ pub struct KafSnapshot {
     /// Last generation number used per VIP, including removed assignments.
     #[serde(default)]
     pub vip_generation: HashMap<IpAddr, u64>,
+    /// Last assigned holder, retained while a VIP has no eligible owner.
+    #[serde(default)]
+    pub vip_last_holder: HashMap<IpAddr, u64>,
     /// Per-formation cluster incarnation (see [`super::super::types::KafRequest::ClusterFormed`]).
     /// `None` until the first leader commits it; a snapshot built before that point carries `None`.
     #[serde(default)]
@@ -84,22 +88,34 @@ pub struct KafSnapshot {
     /// Absent means the node was never unhealthy (no delay applies on its current healthy streak).
     #[serde(default)]
     pub node_recovery_tick: HashMap<u64, u64>,
-    /// Nodes permanently blocked from eligibility until the cluster restarts (`failback: false`).
-    /// Only populated when the config has `failback: false`; always empty when `failback: true`.
+    /// Legacy-semantics nodes permanently blocked by `failback: false`. Legacy does not record
+    /// ownership evidence, so activation migrates every entry conservatively to `node_nopreempt`.
     #[serde(default)]
     pub node_failback_blocked: HashSet<u64>,
+    /// Active behavior version. Missing from an old snapshot means legacy.
+    #[serde(default)]
+    pub failover_semantics: FailoverSemantics,
+    /// Once true, peers without a concrete matching config identity are fenced.
+    #[serde(default)]
+    pub config_identity_enforced: bool,
+    /// V2 nodes that lost an owned VIP and must not receive proactive rebalancing assignments.
+    #[serde(default)]
+    pub node_nopreempt: HashSet<u64>,
+    /// V2 failed owners waiting to begin or complete their continuous-health recovery delay.
+    #[serde(default)]
+    pub node_recovery_pending: HashSet<u64>,
 }
 
 /// Shared Raft state (log + replicated state-machine fields).
 ///
 /// `vip_list`, `stale_missed_probes`, `failback`, `failback_delay_ticks` and activation holdoff
 /// are constants of the local config and never enter the Raft log; they must be **identical** on
-/// every member. Note: `failback` is especially critical — it controls what gets written into
-/// replicated state (`node_failback_blocked`), so a mismatch causes state-machine divergence.
+/// every member. Note: `failback` is especially critical - it controls replicated legacy blocks
+/// or V2 nopreempt history, so a mismatch causes state-machine divergence.
 ///
 /// The log-storage half ([`super::log::KafLogStore`]) and the state-machine half
 /// ([`super::state_machine::KafStateMachine`]) both hold an `Arc<RwLock<KafStorageState>>` pointing
-/// at one shared instance, so the openraft trait split is along method lines only — the data is not
+/// at one shared instance, so the openraft trait split is along method lines only - the data is not
 /// duplicated.
 pub struct KafStorageState {
     pub last_purged_log_id: Option<LogIdOf<TypeConfig>>,
@@ -109,7 +125,7 @@ pub struct KafStorageState {
     /// `read_committed` can resume the engine's commit frontier after a restart instead of
     /// returning `None`. Without this, a restarted node boots with `committed = None`, and the
     /// first commit-driven apply reads `get_log_entries(0..)` against a backfilled log whose floor
-    /// is non-zero — tripping `Defensive(LogIndexNotFound { want: 0 })`.
+    /// is non-zero - tripping `Defensive(LogIndexNotFound { want: 0 })`.
     pub committed: Option<LogIdOf<TypeConfig>>,
     pub last_applied_log: Option<LogIdOf<TypeConfig>>,
     pub last_membership: StoredMembershipOf<TypeConfig>,
@@ -118,6 +134,7 @@ pub struct KafStorageState {
     pub latest_probe_tick: u64,
     pub vip_assignments: HashMap<IpAddr, VipAssignment>,
     pub vip_generation: HashMap<IpAddr, u64>,
+    pub vip_last_holder: HashMap<IpAddr, u64>,
     /// Per-formation cluster incarnation; `None` until the first leader commits
     /// [`super::super::types::KafRequest::ClusterFormed`]. Read by the transport to fence
     /// foreign-incarnation peers and by `run_cluster_guard` to detect that this node is a stale
@@ -134,9 +151,13 @@ pub struct KafStorageState {
     /// Probe round when a node first became healthy after an unhealthy period. Cleared on each
     /// `healthy: false` update. Replicated via snapshot so it survives log compaction.
     pub node_recovery_tick: HashMap<u64, u64>,
-    /// Nodes permanently ineligible until the cluster restarts (`failback: false`). Only populated
-    /// when `failback` is `false`. Replicated via snapshot.
+    /// Legacy-semantics permanent block set for `failback: false`. Replicated for compatibility and
+    /// migrated to V2 `node_nopreempt` state at activation.
     pub node_failback_blocked: HashSet<u64>,
+    pub failover_semantics: FailoverSemantics,
+    pub config_identity_enforced: bool,
+    pub node_nopreempt: HashSet<u64>,
+    pub node_recovery_pending: HashSet<u64>,
     pub current_snapshot: Option<KafSnapshot>,
 }
 
@@ -147,12 +168,12 @@ impl KafStorageState {
     /// Shared by `build_snapshot` and `get_current_snapshot` so the snapshot payload and metadata
     /// are produced identically in both paths. The `snapshot_id` is derived from the full
     /// `last_applied` log id (`<leader>-<index>` via its `Display`), not the index alone, so two
-    /// snapshots taken at the same index in different terms get distinct ids — openraft uses the id
+    /// snapshots taken at the same index in different terms get distinct ids - openraft uses the id
     /// for snapshot identity and de-dup.
     pub(super) fn snapshot_at(
         &self,
         last_applied: LogIdOf<TypeConfig>,
-    ) -> std::io::Result<SnapshotOf<TypeConfig>> {
+    ) -> std::io::Result<SnapshotOf<TypeConfig, KafSnapshotData>> {
         let snap = KafSnapshot {
             last_applied: Some(last_applied),
             last_membership: self.last_membership.clone(),
@@ -161,9 +182,14 @@ impl KafStorageState {
             latest_probe_tick: self.latest_probe_tick,
             vip_assignments: self.vip_assignments.clone(),
             vip_generation: self.vip_generation.clone(),
+            vip_last_holder: self.vip_last_holder.clone(),
             cluster_epoch: self.cluster_epoch,
             node_recovery_tick: self.node_recovery_tick.clone(),
             node_failback_blocked: self.node_failback_blocked.clone(),
+            failover_semantics: self.failover_semantics,
+            config_identity_enforced: self.config_identity_enforced,
+            node_nopreempt: self.node_nopreempt.clone(),
+            node_recovery_pending: self.node_recovery_pending.clone(),
         };
 
         let data = serde_json::to_vec(&snap)
@@ -201,6 +227,7 @@ impl KafStorageState {
             latest_probe_tick: 0,
             vip_assignments: HashMap::new(),
             vip_generation: HashMap::new(),
+            vip_last_holder: HashMap::new(),
             cluster_epoch: None,
             vip_list,
             stale_missed_probes,
@@ -208,6 +235,10 @@ impl KafStorageState {
             failback_delay_ticks,
             node_recovery_tick: HashMap::new(),
             node_failback_blocked: HashSet::new(),
+            failover_semantics: FailoverSemantics::Legacy,
+            config_identity_enforced: false,
+            node_nopreempt: HashSet::new(),
+            node_recovery_pending: HashSet::new(),
             current_snapshot: None,
         }
     }

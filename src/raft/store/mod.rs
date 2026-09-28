@@ -4,7 +4,7 @@
 //! ([`log::KafLogStore`]: `RaftLogReader` + `RaftLogStorage`) and the state-machine half
 //! ([`state_machine::KafStateMachine`]: `RaftStateMachine` + `RaftSnapshotBuilder`) both hold an
 //! `Arc<RwLock<`[`state::KafStorageState`]`>>` pointing at one shared instance, so the split is along
-//! method lines only — the in-memory data is not duplicated. [`new_store`] builds the pair plus a
+//! method lines only - the in-memory data is not duplicated. [`new_store`] builds the pair plus a
 //! third handle on the shared state for the transport/reconciliation layers.
 
 mod log;
@@ -13,9 +13,9 @@ mod state_machine;
 mod vip_logic;
 
 pub use log::KafLogStore;
-pub use state::{KafStorageState, VipAssignment};
+pub use state::{KafStorageState, OWNERSHIP_ACTIVATION_HOLDOFF_TICKS, VipAssignment};
 pub use state_machine::KafStateMachine;
-pub use vip_logic::is_node_eligible;
+pub use vip_logic::is_node_probe_fresh;
 // `recompute_vip_holder`/`reconcile_vip_assignments` are part of the replicated-path public surface
 // but, outside the state machine itself, are only re-derived in `bind_policy`'s tests; gate the
 // re-export to test builds so a non-test build does not warn on the unused public alias.

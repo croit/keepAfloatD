@@ -10,8 +10,8 @@
 # success and failure, so no CI change is needed for it to ship.
 #
 # Inputs (shell vars set by run.sh before the call):
-#   PASSED  — space-separated scenario basenames that passed
-#   FAILED  — space-separated scenario basenames that failed
+#   PASSED - space-separated scenario basenames that passed
+#   FAILED - space-separated scenario basenames that failed
 # Relies on ROOT_DIR / ARTIFACT_DIR (lib.sh) and SCENARIO_DIR (run.sh).
 
 # One-line "what it checks" per scenario, kept next to the scenarios so drift is
@@ -30,12 +30,14 @@ declare -A SCENARIO_META=(
   [11_survivor_rejoin_after_leader_change]="Like 10, but after forcing a leadership change first, so the result can't depend on a particular node id"
   [12_sticky_vip]="Kill a VIP holder; only its VIP moves while healthy survivors keep theirs (sticky); rejoin rebalances evenly"
   [13_stale_survivor_rejected_after_reform]="Partition node-a, reform the majority with new state, heal: node-a's stale state is fenced; it resets and rejoins blank (no split brain)"
+  [14_connection_pressure]="Saturate unauthenticated and authenticated admission; excess work is shed and both listeners recover"
+  [15_crash_removed_vip_cleanup]="Remove a SIGKILL orphan while preserving unmarked and differently marked addresses from other owners"
 )
 
 # The decisive failure lines from a scenario's captured output, flattened into
 # one markdown table cell. Prefers the harness's own '[e2e] ERROR:' assertions
 # (printed by fail()) and takes the LAST two, since the run aborts at the failing
-# assertion near the end — earlier matches are usually build/daemon noise that
+# assertion near the end - earlier matches are usually build/daemon noise that
 # tee also captured. Falls back to panic/timeout lines. Best-effort: never fails
 # the caller.
 scenario_excerpt() {
@@ -96,7 +98,7 @@ generate_report() {
       [[ -e "${path}" ]] || continue
       name="$(basename "${path}" .sh)"
       status="${status_of[${name}]:-SKIP}"
-      desc="${SCENARIO_META[${name}]:-—}"
+      desc="${SCENARIO_META[${name}]:-n/a}"
       case "${status}" in
         PASS) icon="✅"; outcome="ok" ;;
         FAIL) icon="❌"; outcome="$(scenario_excerpt "${name}")" ;;

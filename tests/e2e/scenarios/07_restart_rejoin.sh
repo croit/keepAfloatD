@@ -22,7 +22,7 @@ wait_for_even_over_nodes 30 node-b node-c
 restart_checkpoint="$(log_checkpoint)"
 start_service node-a
 wait_for_service_running node-a 10
-wait_for_log_any_after "${restart_checkpoint}" 30 'joining via replication instead of forming a new one'
+wait_for_log_any_after "${restart_checkpoint}" 30 'reports a compatible existing cluster'
 
 # Cluster stays consistent (no split brain): unique holders, back to an even 3-node spread.
 wait_for_even_over_nodes 45 "${NODES[@]}"
