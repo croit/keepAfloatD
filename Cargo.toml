@@ -61,10 +61,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 # Pinned exactly: 0.10 is an alpha; the storage/network trait surface can churn between alphas.
 # The I/O-progress redesign in 0.10 fixes the diskless restart-past-snapshot crash.
-openraft = { version = "=0.10.0-alpha.32", features = ["serde", "type-alias"] }
+openraft = { version = "=0.10.0-alpha.35", features = ["serde", "type-alias"] }
 futures = "0.3"
 # Collision-resistant, versioned identity for cluster-wide configuration invariants.
-sha2 = "0.10"
+sha2 = "0.11"
 # Linux process-group termination for cancellation-safe health probes.
 libc = "0.2"
 
