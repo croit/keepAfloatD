@@ -25,5 +25,6 @@ trap 'rm -rf "${STAGING}"' EXIT
 tar -xzf "${TARBALL}" -C "${STAGING}"
 SRC="$(find "${STAGING}" -maxdepth 1 -type d -name 'keepafloatd-*')"
 
+( cd "${SRC}" && ./scripts/ci/test/realcluster-harness.sh )
 ( cd "${SRC}" && cargo build --release --locked --offline )
 echo "Offline build from ${TARBALL} succeeded"

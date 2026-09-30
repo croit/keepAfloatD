@@ -9,6 +9,9 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
+#[cfg(test)]
+mod test_probe;
+
 /// Converts raw probe results into effective local health with deterministic failure dampening.
 ///
 /// Only a node that has already been healthy receives the configured grace period. This prevents
@@ -145,7 +148,6 @@ pub async fn run_health_check(cfg: &HealthConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use tracing::instrument::WithSubscriber;
 
@@ -229,55 +231,6 @@ mod tests {
         }
     }
 
-    fn unique_pid_file(label: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "keepafloatd-health-{label}-{}-{nonce}.pid",
-            std::process::id()
-        ))
-    }
-
-    async fn read_pid_file(path: &Path) -> u32 {
-        for _ in 0..100 {
-            if let Ok(contents) = tokio::fs::read_to_string(path).await {
-                return contents.trim().parse().unwrap();
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for pid file {}", path.display());
-    }
-
-    fn process_exists(pid: u32) -> bool {
-        Path::new(&format!("/proc/{pid}")).exists()
-    }
-
-    async fn wait_for_processes_to_exit(pids: &[u32]) -> bool {
-        // Coverage runs trace child exits and may delay `/proc` disappearance beyond the normal
-        // sub-second path. Keep the oracle bounded below the five-second focused-test budget.
-        for _ in 0..300 {
-            if pids.iter().all(|pid| !process_exists(*pid)) {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        false
-    }
-
-    async fn cleanup_processes(pids: &[u32]) {
-        for pid in pids {
-            if process_exists(*pid) {
-                let _ = Command::new("/bin/kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status()
-                    .await;
-            }
-        }
-        let _ = wait_for_processes_to_exit(pids).await;
-    }
-
     #[test]
     fn failure_dampener_keeps_startup_failure_unhealthy() {
         let mut dampener = FailureDampener::new(3);
@@ -346,46 +299,17 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_health_check_kills_direct_child_and_descendant() {
-        let parent_file = unique_pid_file("cancel-parent");
-        let child_file = unique_pid_file("cancel-child");
-        let script = format!(
-            "echo $$ > {}; sleep 30 & echo $! > {}; wait",
-            parent_file.display(),
-            child_file.display()
-        );
-        let cfg = health_cfg(&["/bin/sh", "-c", &script], 30_000);
-        let task = tokio::spawn(async move { run_health_check(&cfg).await });
-        let parent_pid = read_pid_file(&parent_file).await;
-        let child_pid = read_pid_file(&child_file).await;
-
-        task.abort();
-        let _ = task.await;
-        let exited = wait_for_processes_to_exit(&[parent_pid, child_pid]).await;
-        cleanup_processes(&[parent_pid, child_pid]).await;
-        let _ = tokio::fs::remove_file(parent_file).await;
-        let _ = tokio::fs::remove_file(child_file).await;
-
-        assert!(
-            exited,
-            "cancelling a health future must kill and reap its whole process group"
-        );
+        let mut probe = test_probe::Probe::start("wait", 30_000).await;
+        probe.assert_running();
+        probe.cancel().await;
+        probe.assert_stopped().await;
     }
 
     #[tokio::test]
     async fn successful_probe_kills_background_descendant_before_returning() {
-        let child_file = unique_pid_file("success-child");
-        let script = format!("sleep 30 & echo $! > {}; exit 0", child_file.display());
-
-        assert!(run_health_check(&health_cfg(&["/bin/sh", "-c", &script], 500)).await);
-        let child_pid = read_pid_file(&child_file).await;
-        let exited = wait_for_processes_to_exit(&[child_pid]).await;
-        cleanup_processes(&[child_pid]).await;
-        let _ = tokio::fs::remove_file(child_file).await;
-
-        assert!(
-            exited,
-            "a successful probe must not leave background descendants running"
-        );
+        let mut probe = test_probe::Probe::start("exit 0", 500).await;
+        assert!(probe.finish().await);
+        probe.assert_stopped().await;
     }
 
     #[tokio::test]

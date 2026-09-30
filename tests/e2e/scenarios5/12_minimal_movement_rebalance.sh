@@ -209,16 +209,18 @@ for vip in "${VIPS[@]}"; do
     expected+=("${vip}" "${H2[${vip}]}")
   fi
 done
-wait_until 50 expect_holders "${expected[@]}" || {
-  dump_cluster_diagnostics
-  fail "after restarting ${victim1}: expected ${hi} to rebalance onto ${victim1}, ${lo} to stay on ${overloaded}, others unchanged"
-  exit 1
+rebalanced_and_reachable() {
+  expect_holders "${expected[@]}" || return 1
+  all_vips_arpable || return 1
+  # Recheck exact, unique ownership after ARP: handoff cleanup can withdraw a retained VIP.
+  expect_holders "${expected[@]}"
 }
-wait_until 5 all_vips_arpable || {
-  fail "rebalanced VIPs are not ARP-reachable"
-  exit 1
-}
-assert_unique_holders
+
 wait_for_single_agreed_leader 20
+wait_until 50 rebalanced_and_reachable || {
+  dump_cluster_diagnostics
+  fail "after restarting ${victim1}: expected reachable VIPs with ${hi} on ${victim1}, ${lo} on ${overloaded}, others unchanged"
+  exit 1
+}
 assert_node_lacks_all_vips "${victim2}"
 log "victim1 back: ${hi} rebalanced onto ${victim1}; ${lo} stayed on ${overloaded}; spread even again"

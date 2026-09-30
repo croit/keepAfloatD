@@ -29,6 +29,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
+mod health_proof;
+
 // These tests release ephemeral-port reservations immediately before starting the daemons. Keep
 // the complete network-test lifetime serial so another in-process cluster cannot claim that port
 // window when the Rust test runner executes this module in parallel.

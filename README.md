@@ -299,16 +299,18 @@ The E2E fixtures live under `tests/e2e/`:
 - `configs22/` contains the isolated one-VIP timing/nopreempt configuration
 - `configs26/` contains one deliberately mismatched node for config-identity fencing
 - `scripts/health.sh` is the toggleable local probe used to flip one node unhealthy
-- `scenarios/` contains the 15 failover and hardening scenarios (steady state, holder death,
+- `scenarios/` contains the 16 failover and hardening scenarios (steady state, holder death,
   leader death, local
   unhealthy, minority partition, graceful SIGINT, restart/rejoin, full-outage majority recovery,
   concurrent cold start, returning nodes joining a survivor, and survivor rejoin after a leadership
   change, sticky VIP placement, stale-survivor rejection after cluster reform, bounded connection
-  pressure, and crash-time removal of a marked VIP while preserving an unmarked address)
+  pressure, crash-time removal of a marked VIP while preserving an unmarked address, and SIGHUP
+  cleanup with supervisor restart)
 - `scenarios22/` covers delayed explicit failover and recovered-nopreempt orphan fallback
 - `scenarios26/` proves a mismatched node exits VIP-less and rejoins after exact repair
 
-The reusable real-cluster harness lives under `tests/realcluster/`. Its scenario code, assertions,
+The reusable [real-cluster harness](tests/realcluster/README.md) contains 35 scenarios, including
+two legacy compatibility experiments with additional prerequisites. Its scenario code, assertions,
 sanitized `env.example.sh`, and local self-test are versioned; `env.sh`, credentials, internal audit
 notes, and generated evidence remain ignored. VIP and address-count assertions fail closed if any
 node query fails or returns malformed data. Leader assertions accept evidence only from active
@@ -317,6 +319,10 @@ majority agreement. Every unchecked scenario command failure terminates through 
 The campaign runner traps normal exit, interruption, and termination, then restores the exact
 captured configs and binaries before returning the original status. CI parses every script, rejects
 embedded private topology addresses, and runs the harness self-test with the example environment.
+The same checks run against the exported public tree and packaged source archive. The scenario
+inventory is checked against its README coverage table. These local checks do not run the live
+cluster campaign or certify that every scenario passed on a release. Live runs require a
+separately authorized disposable cluster; their logs and topology stay private.
 
 `tests/e2e/scripts/run.sh` resets the Compose stack between scenarios, waits for steady state, and
 runs every scenario (continuing past failures). It captures per-scenario logs under

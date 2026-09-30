@@ -46,17 +46,56 @@ Both are granted by the packaged unit; running as root also works.
 
 ## Changing the VIP list or config
 
-The effective cluster-wide settings must agree on every node: `peers`, resolved `vips`,
-`health.interval_ms`, the missed-probe threshold derived from `health.stale_secs`,
-`failover_delay_secs`, `failback`, `cluster_secret`, `max_frame_bytes`, and Raft timing.
-`failback_delay_secs` must also agree when `failback: true`; nopreempt ignores it. To add or remove
-a VIP:
+The effective cluster-wide settings must agree on every node: `peers`,
+resolved `vips`, `health.interval_ms`, the missed-probe threshold
+derived from `health.stale_secs`, `failover_delay_secs`, `failback`,
+`cluster_secret`, `max_frame_bytes`, and Raft timing.
+`failback_delay_secs` must also agree when `failback: true`; nopreempt
+ignores it.
 
-1. Edit the `vips` list in the config on **every** node.
-2. Restart the daemon on each node, one at a time (see rolling upgrade below).
+Changing the VIP list, a VIP's prefix or effective interface, or another
+effective cluster-wide setting requires a coordinated stop and restart.
+Plan a maintenance window with an interruption of VIP service. Do not
+apply these changes through rolling restarts or `SIGHUP`.
 
-`node_id`, local listen addresses, health command/timeout, submit timeout, dry-run mode, and notify
-hook may differ per host.
+Each process reads its config only at startup. Editing every YAML file
+does not update running processes. VIPs are part of the configuration
+fingerprint, so a restarted node with a changed VIP list cannot join
+peers still running the old config. In a three-node cluster, the first
+restarted node can confirm the two old-config peers as a mismatched
+majority and exit with status 4.
+
+1. Save each node's current config securely, including the old VIP list
+   and interfaces. Include offline nodes in the plan so none can return
+   with the old config.
+2. Stop every daemon using its current config with
+   `systemctl stop keepafloatd@nodeX` on its node, or stop its
+   supervisor so it cannot restart automatically. Do not start an
+   updated daemon while an old-config daemon can still run.
+3. Verify that all old daemons have stopped and all old VIPs are absent
+   from every node, including VIPs being removed or moved to another
+   interface. Check IPv4 and IPv6 with `ip -4 addr show` and
+   `ip -6 addr show`. If a node or VIP cannot be checked, stop here
+   until it can be verified or the node is confirmed powered off.
+   Keep offline nodes stopped until their configs are updated.
+4. Apply the new cluster-wide settings on every node, preserving the
+   node-local values and restricted config-file permissions. Verify that
+   the effective settings agree before starting any daemon. Do not rely
+   on startup cleanup to remove VIPs omitted from the new config.
+5. Start the daemons with the new config. Once a majority is running,
+   confirm that the cluster forms and health checks pass. Before ending
+   maintenance, check that every new VIP has exactly one holder, removed
+   VIPs remain absent, and clients can reach the intended services.
+
+To roll back, repeat the coordinated stop. Verify that VIPs from both
+the old and new lists are absent before restoring each node's saved
+config and starting the daemons. Do not roll back one node at a time.
+
+`node_id`, local listen addresses, health command/timeout, submit
+timeout, dry-run mode, and notify hook may differ per host. Node IDs and
+listen addresses must still match the shared peer roster. Changes
+confined to node-local settings may use rolling maintenance below if
+the effective cluster-wide settings remain unchanged.
 
 ## Coordinated upgrade for retained-holder fencing
 
@@ -85,12 +124,14 @@ identity. See [Upgrading ownerless-gap fencing](../README.md#upgrading-ownerless
 
 ## Rolling upgrade / maintenance
 
-Use the following procedure only for compatible binary versions. It does
-not apply to the retained-holder upgrade described above. For compatible
-maintenance, work on one node at a time so the cluster keeps quorum:
+Use the following procedure only for compatible binary versions with
+unchanged effective cluster-wide settings. It does not apply to the
+retained-holder upgrade or the VIP/config changes described above. For
+compatible maintenance, work on one node at a time so the cluster keeps
+quorum:
 
 1. `systemctl stop keepafloatd@nodeX` - its VIPs fail over to the survivors within seconds.
-2. Upgrade the binary / edit the config.
+2. Upgrade to a compatible binary or edit only node-local settings.
 3. `systemctl start keepafloatd@nodeX` - it rejoins via Raft. VIPs rebalance evenly when
    `failback: true`; nopreempt nodes remain available for future orphaned VIPs without taking from
    healthy holders.
@@ -110,15 +151,22 @@ Pre-existing Legacy recovery and nopreempt entries are retained at activation be
 does not record whether each failed node owned a VIP. This preserves real delay/nopreempt guarantees;
 ownership-aware tracking applies to failures committed after activation.
 
-Current binaries also exchange a non-secret fingerprint of every cluster-wide setting before the
-first Raft frame. Concrete mismatches are rejected immediately. Existing clusters require missing
-legacy identities only after every configured voter is online with the same fingerprint and the
-leader commits activation. Until that log line appears, an old binary cannot describe its config,
-so continue comparing cluster-wide fields manually during the mixed-version window. After
-activation, a mismatched node logs `cluster configuration mismatch`, stops reconciliation, unbinds
-its locally tracked VIPs, shuts down Raft, exits with status 4, and must have its config repaired
-before the service restart can rejoin. Only one coherent foreign fingerprint can trigger this
-fence; unrelated mismatches do not add into a false majority.
+Current binaries exchange a non-secret fingerprint of the effective
+cluster-wide consensus settings before the first Raft frame. Concrete
+mismatches are rejected immediately, even before identity enforcement is
+activated. A node that repeatedly observes a roster majority sharing one
+different fingerprint logs `cluster configuration mismatch`, stops
+reconciliation, unbinds its locally tracked VIPs, shuts down Raft and
+exits with status 4. Repair its config before restarting it. Unrelated
+mismatches do not add into a false majority.
+
+Identity activation controls acceptance of legacy peers with no
+fingerprint, not concrete mismatches. In an existing cluster, the leader
+commits activation only after every configured voter is online with the
+same fingerprint and supports enforcement. Until activation, compare
+cluster-wide fields manually because a legacy binary cannot describe its
+config. The shared secret authenticates peers separately and is not
+included in the fingerprint.
 
 ## Security and networking
 

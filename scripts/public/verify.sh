@@ -69,4 +69,14 @@ for forbidden in .gitlab-ci.yml .mailmap AGENTS.md CLAUDE.md; do
   fi
 done
 
+for private in tests/realcluster/env.sh tests/realcluster/results \
+  tests/realcluster/REPORT.md tests/realcluster/FINDINGS.md; do
+  if [ -e "${TREE}/${private}" ]; then
+    echo "Public tree contains private harness data: ${private}" >&2
+    exit 1
+  fi
+done
+
+"${TREE}/scripts/ci/test/realcluster-harness.sh"
+
 echo "Public tree verification passed"

@@ -741,9 +741,13 @@ cleanup, and waits for a new proof before restarting binding reconciliation. Whi
 it still publishes proven release acknowledgements. On renewal, the adapter validates the
 current VIP effect and every retained bound VIP against newly applied state. An unchanged assignment, binding policy and
 mandatory gates allow the existing effect to finish, including effects longer than a probe
-interval. A changed or expired intent cancels active work and cleans all tracked addresses
-before the rotating cursor advances. This uncommon cleanup also covers an already-bound
-tail VIP whose revocation would otherwise wait behind another VIP's slow RPC. Each VIP reads current applied state when its work begins;
+interval. A changed intent cancels active work and cleans only the affected addresses
+before the rotating cursor advances. Unchanged VIPs stay bound without redundant notify
+events. Selective cleanup remains inside the same proof lifetime guard: expiry,
+invalidation or a closed mandatory gate still withdraws every tracked address, even if
+a fresh proof immediately follows an invalidation. Revocations arriving during cleanup
+are queued before reconciliation resumes. This also covers an already-bound tail VIP
+whose revocation would otherwise wait behind another VIP's slow RPC. Each VIP reads current applied state when its work begins;
 generation and takeover-delay memory survive renewals. This independent
 expiry prevents an isolated leader's blocked health probe or release RPC from retaining
 VIPs after survivors reassign them (#26). The elapsed-time check is entirely process-local;

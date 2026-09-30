@@ -304,6 +304,8 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
       - name: Build vendored source tarball
         run: VERSION="${RELEASE_VERSION}" ./scripts/ci/build/source-tarball.sh
+      - name: Install harness dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends python3
       - name: Verify it builds fully offline
         run: ./scripts/ci/test/source-build.sh
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
@@ -314,10 +316,9 @@ jobs:
   build-images:
     name: release images
     runs-on: ubuntu-latest
-    # Depend on the per-arch binary builds so the runtime image copies those pre-cross-compiled
-    # binaries instead of recompiling under QEMU emulation - the old multi-arch in-image compile was
-    # the dominant release cost.
-    needs: [prepare, build-binary]
+    # Publish image tags only after every package and source archive has passed its build gate.
+    # Reuse the per-arch binaries rather than recompiling under QEMU.
+    needs: [prepare, build-binary, build-deb, build-rpm, build-source-tarball]
     permissions:
       contents: read
       packages: write

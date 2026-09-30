@@ -107,6 +107,8 @@ pub struct LocalVip {
     bind_completions: Mutex<HashMap<IpAddr, usize>>,
     #[cfg(test)]
     bind_starts: Mutex<HashMap<IpAddr, usize>>,
+    #[cfg(test)]
+    next_announcement: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     ownership_marker: ownership::OwnershipMarker,
     #[cfg(test)]
     next_bind_result: Mutex<Option<std::io::Result<std::process::ExitStatus>>>,
@@ -148,6 +150,8 @@ impl LocalVip {
             bind_completions: Mutex::new(HashMap::new()),
             #[cfg(test)]
             bind_starts: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            next_announcement: Mutex::new(None),
             ownership_marker: ownership::OwnershipMarker::new(address_protocol),
             #[cfg(test)]
             next_bind_result: Mutex::new(None),
@@ -373,8 +377,8 @@ impl LocalVip {
             return Err(bind_error);
         }
         if first_bind {
-            self.pending_first_bind.write().await.remove(&ip);
             self.announce(iface, ip).await;
+            self.pending_first_bind.write().await.remove(&ip);
             tracing::info!(target: "keepafloatd::vip", "bound {ip}/{prefix} on {iface}");
         }
         Ok(())
@@ -387,6 +391,11 @@ impl LocalVip {
     /// Send gratuitous ARP for an already-bound IPv4 VIP. `arping` remains optional: inability to
     /// run it does not change consensus ownership or fail reconciliation.
     async fn announce(&self, iface: &str, ip: IpAddr) {
+        #[cfg(test)]
+        if let Some(completed) = self.next_announcement.lock().await.take() {
+            let _ = completed.await;
+            return;
+        }
         if self.dry_run || !ip.is_ipv4() {
             return;
         }
@@ -529,6 +538,35 @@ const SHUTDOWN_UNBIND_ATTEMPTS: usize = 3;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelled_first_announcement_keeps_bind_pending_until_retry() {
+        let vip = super::LocalVip::new(false);
+        let address = "192.0.2.99".parse().unwrap();
+        vip.force_next_bind_result(Ok(ExitStatus::from_raw(0)))
+            .await;
+        let (finish, announcement) = tokio::sync::oneshot::channel();
+        *vip.next_announcement.lock().await = Some(announcement);
+        let mut bind = Box::pin(vip.bind("lo", address, 32));
+        assert!(futures::poll!(bind.as_mut()).is_pending());
+        assert!(vip.bound_addrs().await.contains(&address));
+        drop(bind);
+        drop(finish);
+        assert!(
+            !vip.is_confirmed_bound(address).await,
+            "an interrupted first announcement must remain pending for MASTER and ARP retry"
+        );
+        vip.force_next_bind_result(Ok(ExitStatus::from_raw(0)))
+            .await;
+        let (finish, announcement) = tokio::sync::oneshot::channel();
+        *vip.next_announcement.lock().await = Some(announcement);
+        finish.send(()).unwrap();
+        vip.bind("lo", address, 32).await.unwrap();
+        assert!(vip.is_confirmed_bound(address).await);
+        assert!(
+            vip.next_announcement.lock().await.is_none(),
+            "retry must finish the announcement"
+        );
+    }
     use super::{
         LocalVip, VipAddr, VipAssignment, VipState, command_output_with_timeout,
         command_status_with_timeout, ensure_failed_delete_is_absent, fire_notify_script,

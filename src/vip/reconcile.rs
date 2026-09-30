@@ -10,7 +10,7 @@ use crate::raft::store::VipAssignment;
 use crate::raft::{KafRaft, KafRequest, KafStorageState};
 use crate::submit;
 use openraft::async_runtime::WatchReceiver;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,19 +110,50 @@ pub async fn run_reconcile_loop(
             continue;
         }
         let (intent, _) = tokio::sync::watch::channel::<Option<EffectIntent>>(None);
-        let active = run_active_reconcile_loop(
-            cfg.clone(),
-            raft.clone(),
-            sm.clone(),
-            vip_local.clone(),
-            vip_table.clone(),
-            local_healthy.clone(),
-            consensus_fresh.clone(),
-            node_id,
-            &mut memory,
-            &intent,
-            &retained,
-        );
+        let (revoked, mut revocations) = tokio::sync::watch::channel(HashSet::<IpAddr>::new());
+        let active = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = revocations.changed() => {
+                        if changed.is_err() { return; }
+                    }
+                    _ = run_active_reconcile_loop(
+                        cfg.clone(), raft.clone(), sm.clone(), vip_local.clone(),
+                        vip_table.clone(), local_healthy.clone(), consensus_fresh.clone(),
+                        node_id, &mut memory, &intent, &retained,
+                    ) => return,
+                }
+                // Cancel captured work before cleanup; keep unchanged effects under the same proof guard.
+                intent.send_replace(None);
+                let addresses = revocations.borrow_and_update().clone();
+                revoked.send_modify(HashSet::clear);
+                revocations.borrow_and_update();
+                let cleanup: Vec<_> = vip_table
+                    .iter()
+                    .filter(|(vip, _)| addresses.contains(&vip.addr))
+                    .cloned()
+                    .collect();
+                for addr in &addresses {
+                    memory.activated_generations.remove(addr);
+                    memory.announced_release_generations.remove(addr);
+                }
+                loop {
+                    let state = release_notify_state(local_healthy.load(Ordering::SeqCst));
+                    match vip_local
+                        .unbind_all(&cleanup, cfg.notify.as_deref(), cfg.dry_run, state)
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::error!("revoked VIP effects cleanup failed: {error}");
+                            tokio::time::sleep(RECONCILE_TICK).await;
+                        }
+                    }
+                }
+                retained.send_modify(|bound| bound.retain(|addr, _| !addresses.contains(addr)));
+            }
+        };
         if consensus_fresh
             .run_while_fresh_if(active, || async {
                 let captured = intent.borrow().clone();
@@ -132,22 +163,31 @@ pub async fn run_reconcile_loop(
                     local_healthy: local_healthy.load(Ordering::SeqCst),
                     consensus_fresh: consensus_fresh.is_fresh(),
                 };
-                captured
-                    .as_ref()
-                    .is_none_or(|captured| captured.remains_valid(&state, gates))
-                    && retained
-                        .borrow()
-                        .values()
-                        .all(|bound| bound.remains_valid(&state, gates))
+                if !gates.has_leader || !gates.local_healthy || !gates.consensus_fresh {
+                    return false;
+                }
+                let bound = retained.borrow();
+                let invalid: HashSet<_> = captured
+                    .iter()
+                    .chain(bound.values())
+                    .filter(|effect| !effect.remains_valid(&state, gates))
+                    .map(|effect| effect.vip)
+                    .collect();
+                if !invalid.is_empty() {
+                    tracing::debug!(
+                        ?invalid,
+                        "restarting reconciliation for revoked VIP effects"
+                    );
+                    revoked.send_modify(|pending| pending.extend(invalid));
+                }
+                true
             })
             .await
             .is_some()
         {
             return;
         }
-        // #26: renewal validates every retained kernel effect, not just the current syscall.
-        // Canceling an invalid/expired view requires complete cleanup before any more work;
-        // a coalesced fresh proof must not bypass it. Stable renewals never take this path.
+        // Proof loss or a closed global gate requires full cleanup, even after a coalesced renewal.
         loop {
             let state = release_notify_state(local_healthy.load(Ordering::SeqCst));
             match vip_local

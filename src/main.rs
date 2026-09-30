@@ -373,21 +373,3 @@ fn fence_unavailable_health_proof(consensus_fresh: &consensus_freshness::Consens
     // #26: protocol availability fences consensus eligibility, not the local probe result.
     consensus_fresh.invalidate();
 }
-
-#[cfg(test)]
-#[test]
-fn legacy_proof_fencing_preserves_probe_health_and_backup_notification() {
-    let local_healthy = AtomicBool::new(true);
-    let consensus_fresh = consensus_freshness::ConsensusFreshness::for_probe_cadence(1_000, 1);
-    consensus_fresh.record_success(tokio::time::Instant::now());
-    fence_unavailable_health_proof(&consensus_fresh);
-    assert!(!consensus_fresh.is_fresh());
-    assert!(
-        local_healthy.load(Ordering::SeqCst),
-        "a protocol capability failure is not a failed local probe"
-    );
-    assert_eq!(
-        vip::release_notify_state(local_healthy.load(Ordering::SeqCst)).as_str(),
-        "BACKUP"
-    );
-}

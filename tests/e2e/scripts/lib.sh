@@ -266,7 +266,7 @@ assignments_match() {
 all_vips_arpable() {
   local vip
   for vip in "${VIPS[@]}"; do
-    runner_sh "arping -q -c 1 -w 1 -I eth0 ${vip}"
+    runner_sh "arping -q -c 1 -w 1 -I eth0 ${vip}" || return 1
   done
 }
 

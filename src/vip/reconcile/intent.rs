@@ -64,7 +64,19 @@ impl EffectIntent {
             state,
             self.activated_generation,
         );
-        if self.assignment != current.assignment
+        let mut expected = self.assignment.clone();
+        if let Some(assignment) = expected.as_mut()
+            && assignment.holder == self.node_id
+            && self.activated_generation == Some(assignment.generation)
+            && current
+                .assignment
+                .as_ref()
+                .is_some_and(|a| a.previous_holder_released)
+        {
+            // A completed release opens the same handoff fence without revoking its incumbent.
+            assignment.previous_holder_released = true;
+        }
+        if expected != current.assignment
             || self.gates != gates
             || self.bind_policy != current.bind_policy
         {
@@ -93,6 +105,45 @@ mod tests {
             local_healthy: true,
             consensus_fresh: true,
         }
+    }
+
+    #[tokio::test]
+    async fn activated_holder_survives_its_predecessors_release_ack() {
+        let (_, _, state) = crate::raft::store::new_store(Arc::new(Vec::new()), 1, true, 0);
+        let mut state = state.write().await;
+        let vip = "192.0.2.1".parse().unwrap();
+        state.latest_probe_tick = 10;
+        state.node_probe_ticks.insert(2, 1);
+        state.vip_assignments.insert(
+            vip,
+            VipAssignment {
+                holder: 1,
+                generation: 2,
+                previous_holder: Some(2),
+                previous_holder_released: false,
+                activation_tick: 10,
+            },
+        );
+        let pending = EffectIntent::capture(vip, 1, gates(), &state, None);
+        let activated = pending.clone().activated();
+        state
+            .vip_assignments
+            .get_mut(&vip)
+            .unwrap()
+            .previous_holder_released = true;
+        assert!(
+            !pending.remains_valid(&state, gates()),
+            "first activation still needs a fresh intent"
+        );
+        assert!(
+            activated.remains_valid(&state, gates()),
+            "a release ack must not withdraw an activated incumbent"
+        );
+        state.vip_assignments.get_mut(&vip).unwrap().generation = 3;
+        assert!(
+            !activated.remains_valid(&state, gates()),
+            "activation cannot cross generations"
+        );
     }
 
     #[tokio::test]

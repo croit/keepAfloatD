@@ -53,6 +53,11 @@ tracked_under deploy | LC_ALL=C sort -u > "${TRACKED}"
 comm -23 "${TRACKED}" "${MANIFEST_SOURCES}" > "${MISSING}"
 report_missing "tracked deploy file"
 
+# Tests are public reproducibility inputs, including shell helpers and example environments.
+tracked_under tests | LC_ALL=C sort -u > "${TRACKED}"
+comm -23 "${TRACKED}" "${MANIFEST_SOURCES}" > "${MISSING}"
+report_missing "tracked test file"
+
 # Cargo.toml references: every quoted repository-relative path that is tracked at REVISION
 # (assets, maintainer scripts, package scripts) must be exported so the public tree builds
 # the same packages. Absolute and untracked paths (install destinations, build outputs) are

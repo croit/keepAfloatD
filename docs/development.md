@@ -78,6 +78,19 @@ container), then assert the observable outcome with the `wait_for_*` helpers. Sc
 so they run in order; each starts from a fresh stack. Keep them deterministic - assert on VIP
 placement and leadership, not on wall-clock timing.
 
+### Real-cluster scenarios
+
+The [real-cluster guide](../tests/realcluster/README.md) lists the 35 SSH-driven scenarios,
+their prerequisites, and the distinction between live campaign results and local self-tests.
+Validate the complete harness without accessing a cluster:
+
+```bash
+./scripts/ci/test/realcluster-harness.sh
+```
+
+This checks the documented inventory, shell syntax, and failure-handling self-tests using
+only the sanitized example environment. It never runs `run-all.sh` against a live cluster.
+
 ### Signal and supervisor regressions
 
 `cargo test --test signals` sends real signals to a dry-run daemon child and
