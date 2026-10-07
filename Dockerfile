@@ -23,7 +23,7 @@ RUN apt-get update \
         libssl-dev \
         pkg-config \
     && rm -rf /var/lib/apt/lists/* \
-    && rustup component add rustfmt clippy \
+    && rustup component add rustfmt clippy llvm-tools-preview \
     && cargo install cargo-tarpaulin --locked \
     && rm -rf "${CARGO_HOME}/registry" "${CARGO_HOME}/git"
 
@@ -70,6 +70,7 @@ RUN apt-get update \
         ca-certificates \
         iproute2 \
         iputils-arping \
+        libndp-tools \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /etc/keepafloatd /var/lib/keepafloatd /usr/share/doc/keepafloatd/licenses \
     && echo 'keepafloatd:x:10001:' >> /etc/group \
@@ -87,17 +88,17 @@ HEALTHCHECK NONE
 ENTRYPOINT ["/usr/local/bin/keepafloatd"]
 CMD ["-c", "/etc/keepafloatd/config.yaml"]
 
-# Release runtime: built from the pre-cross-compiled binary in ./dist instead of recompiling in the
+# Artifact runtime: built from the pre-cross-compiled binary in ./dist instead of recompiling in the
 # image, so an arm64 image does not run the whole Rust build under QEMU emulation. `docker buildx`
-# sets TARGETARCH per target platform, selecting the matching binary the release build already made.
+# sets TARGETARCH per target platform, selecting the matching binary the pipeline already made.
 FROM runtime-base AS runtime-dist
 ARG TARGETARCH
 COPY dist/keepafloatd-linux-${TARGETARCH} /usr/local/bin/keepafloatd
 RUN chmod 0755 /usr/local/bin/keepafloatd
 USER 10001:10001
 
-# CI / e2e runtime: binary compiled in-image from the `builder` stage. Keep this last so a bare
-# `docker build .` does not select the release-only stage, which requires pre-built binaries.
+# Source-built runtime: binary compiled in-image from the `builder` stage. Keep this last so a bare
+# `docker build .` does not select the artifact stage, which requires pre-built binaries.
 FROM runtime-base AS runtime
 COPY --from=builder /app/target/release/keepafloatd /usr/local/bin/keepafloatd
 USER 10001:10001

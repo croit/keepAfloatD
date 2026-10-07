@@ -6,6 +6,7 @@
 //! drop-below-purge, inverted-range normalisation, conflict-truncation floor lowering) live here.
 
 use super::super::types::TypeConfig;
+use super::authority::check_mutation;
 use super::state::KafStorageState;
 use openraft::alias::{EntryOf, LogIdOf, VoteOf};
 use openraft::storage::{IOFlushed, LogState, RaftLogReader, RaftLogStorage};
@@ -67,7 +68,9 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
     type LogReader = Self;
 
     async fn save_vote(&mut self, vote: &VoteOf<TypeConfig>) -> Result<(), io::Error> {
-        self.state.write().await.vote = Some(*vote);
+        let mut state = self.state.write().await;
+        check_mutation(&state)?;
+        state.vote = Some(*vote);
         Ok(())
     }
 
@@ -77,7 +80,9 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
     ) -> Result<(), io::Error> {
         // openraft calls this before every apply; persist it so a restart can resume the commit
         // frontier instead of booting with `committed = None`.
-        self.state.write().await.committed = committed;
+        let mut state = self.state.write().await;
+        check_mutation(&state)?;
+        state.committed = committed;
         Ok(())
     }
 
@@ -172,47 +177,57 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
         I: IntoIterator<Item = EntryOf<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        {
+        let result = {
             let mut state = self.state.write().await;
-            let purged = state.last_purged_log_id.map(|l| l.index());
-            for entry in entries {
-                // Never resurrect the compacted prefix. openraft only appends above the purge point;
-                // an entry at or below it would re-open a hole below last_purged_log_id and desync the
-                // log view, so drop it and surface the broken upstream invariant.
-                if let Some(p) = purged
-                    && entry.log_id.index() <= p
-                {
-                    tracing::warn!(
-                        index = entry.log_id.index(),
-                        purged_upto = p,
-                        "append: ignoring entry at or below the purge point"
-                    );
-                    continue;
+            (|| {
+                check_mutation(&state)?;
+                let purged = state.last_purged_log_id.map(|l| l.index());
+                for entry in entries {
+                    check_mutation(&state)?;
+                    // Never resurrect the compacted prefix. openraft only appends above the purge point;
+                    // an entry at or below it would re-open a hole below last_purged_log_id and desync the
+                    // log view, so drop it and surface the broken upstream invariant.
+                    if let Some(p) = purged
+                        && entry.log_id.index() <= p
+                    {
+                        tracing::warn!(
+                            index = entry.log_id.index(),
+                            purged_upto = p,
+                            "append: ignoring entry at or below the purge point"
+                        );
+                        continue;
+                    }
+                    // Restart-then-backfill seed: after a restart the in-memory store is empty
+                    // (last_purged_log_id = None). When the leader backfills the committed suffix starting
+                    // ABOVE the lost purge floor (index > 1) into a still-empty log, seed
+                    // last_purged_log_id = index - 1 so the floor matches the physical log minimum.
+                    // Otherwise the store reports None with a non-zero log floor and openraft reads index 0,
+                    // tripping Defensive(LogIndexNotFound). A normal log begins at index 1 (no purge below
+                    // it), so only index > 1 signals a real compacted gap; we never seed for a 1-based
+                    // start, and only when the floor is unset and the log is still empty.
+                    if state.last_purged_log_id.is_none()
+                        && state.log.is_empty()
+                        && entry.log_id.index() > 1
+                    {
+                        state.last_purged_log_id = Some(LogId::new(
+                            *entry.log_id.committed_leader_id(),
+                            entry.log_id.index() - 1,
+                        ));
+                    }
+                    state.log.insert(entry.log_id.index(), entry);
                 }
-                // Restart-then-backfill seed: after a restart the in-memory store is empty
-                // (last_purged_log_id = None). When the leader backfills the committed suffix starting
-                // ABOVE the lost purge floor (index > 1) into a still-empty log, seed
-                // last_purged_log_id = index - 1 so the floor matches the physical log minimum.
-                // Otherwise the store reports None with a non-zero log floor and openraft reads index 0,
-                // tripping Defensive(LogIndexNotFound). A normal log begins at index 1 (no purge below
-                // it), so only index > 1 signals a real compacted gap; we never seed for a 1-based
-                // start, and only when the floor is unset and the log is still empty.
-                if state.last_purged_log_id.is_none()
-                    && state.log.is_empty()
-                    && entry.log_id.index() > 1
-                {
-                    state.last_purged_log_id = Some(LogId::new(
-                        *entry.log_id.committed_leader_id(),
-                        entry.log_id.index() - 1,
-                    ));
-                }
-                state.log.insert(entry.log_id.index(), entry);
-            }
-        }
+                Ok(())
+            })()
+        };
         // Volatile store: the entries are durable enough the instant they are in the BTreeMap, so
         // signal flush completion inline. Must fire after the insert and before returning Ok.
-        callback.io_completed(Ok(()));
-        Ok(())
+        callback.io_completed(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error: &io::Error| io::Error::new(error.kind(), error.to_string())),
+        );
+        result
     }
 
     async fn truncate_after(
@@ -225,6 +240,7 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
         let mut state = self.state.write().await;
         let start = last_log_id.map(|l| l.index() + 1).unwrap_or(0);
         let rm: Vec<u64> = state.log.range(start..).map(|(k, _)| *k).collect();
+        check_mutation(&state)?;
         for i in rm {
             state.log.remove(&i);
         }
@@ -249,6 +265,7 @@ impl RaftLogStorage<TypeConfig> for KafLogStore {
             .range(..=log_id.index())
             .map(|(k, _)| *k)
             .collect();
+        check_mutation(&state)?;
         for i in rm {
             state.log.remove(&i);
         }

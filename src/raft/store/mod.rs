@@ -4,10 +4,12 @@
 //! ([`log::KafLogStore`]: `RaftLogReader` + `RaftLogStorage`) and the state-machine half
 //! ([`state_machine::KafStateMachine`]: `RaftStateMachine` + `RaftSnapshotBuilder`) both hold an
 //! `Arc<RwLock<`[`state::KafStorageState`]`>>` pointing at one shared instance, so the split is along
-//! method lines only - the in-memory data is not duplicated. [`new_store`] builds the pair plus a
+//! method lines only - the in-memory data is not duplicated. [`new_admitted_store`] builds the pair plus a
 //! third handle on the shared state for the transport/reconciliation layers.
 
+mod authority;
 mod log;
+mod membership;
 mod state;
 mod state_machine;
 mod vip_logic;
@@ -20,6 +22,8 @@ pub use vip_logic::is_node_probe_fresh;
 // but, outside the state machine itself, are only re-derived in `bind_policy`'s tests; gate the
 // re-export to test builds so a non-test build does not warn on the unused public alias.
 #[cfg(test)]
+pub(crate) use vip_logic::EligibilityInputs;
+#[cfg(test)]
 pub use vip_logic::{recompute_vip_holder, reconcile_vip_assignments};
 
 use crate::config::VipAddr;
@@ -29,18 +33,53 @@ use tokio::sync::RwLock;
 /// Build the log-storage half, the state-machine half, and a shared-state handle from one volatile
 /// in-memory [`KafStorageState`]. The two storage halves go to `Raft::new`; the `state_ref` handle
 /// is read by the transport (epoch fencing) and the VIP reconciliation loop.
+pub fn new_admitted_store(
+    vip_list: Arc<Vec<(VipAddr, String)>>,
+    stale_missed_probes: u64,
+    failback: bool,
+    failback_delay_ticks: u64,
+) -> (KafLogStore, KafStateMachine, Arc<RwLock<KafStorageState>>) {
+    new_store_inner(
+        vip_list,
+        stale_missed_probes,
+        failback,
+        failback_delay_ticks,
+        true,
+    )
+}
+
+/// Pure storage fixtures opt out of process-local admission explicitly.
+#[cfg(test)]
 pub fn new_store(
     vip_list: Arc<Vec<(VipAddr, String)>>,
     stale_missed_probes: u64,
     failback: bool,
     failback_delay_ticks: u64,
 ) -> (KafLogStore, KafStateMachine, Arc<RwLock<KafStorageState>>) {
-    let state = Arc::new(RwLock::new(KafStorageState::new(
+    new_store_inner(
         vip_list,
         stale_missed_probes,
         failback,
         failback_delay_ticks,
-    )));
+        false,
+    )
+}
+
+fn new_store_inner(
+    vip_list: Arc<Vec<(VipAddr, String)>>,
+    stale_missed_probes: u64,
+    failback: bool,
+    failback_delay_ticks: u64,
+    admission_required: bool,
+) -> (KafLogStore, KafStateMachine, Arc<RwLock<KafStorageState>>) {
+    let mut state = KafStorageState::new(
+        vip_list,
+        stale_missed_probes,
+        failback,
+        failback_delay_ticks,
+    );
+    state.admission_required = admission_required;
+    let state = Arc::new(RwLock::new(state));
     let log_store = KafLogStore::new(state.clone());
     let state_machine = KafStateMachine::new(state.clone());
     (log_store, state_machine, state)

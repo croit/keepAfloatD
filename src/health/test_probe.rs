@@ -29,8 +29,10 @@ impl Probe {
         ));
         let name = CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: name is a valid C string; the FIFO is private to this fixture.
+        #[allow(unsafe_code)]
+        let result = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
         assert_eq!(
-            unsafe { libc::mkfifo(name.as_ptr(), 0o600) },
+            result,
             0,
             "mkfifo {}: {}",
             path.display(),
@@ -152,7 +154,9 @@ impl Drop for Probe {
         }
         if let Some(group) = self.group {
             // SAFETY: the positive PID comes from this fixture's grouped shell.
-            if unsafe { libc::kill(-group, libc::SIGKILL) } != 0 {
+            #[allow(unsafe_code)]
+            let result = unsafe { libc::kill(-group, libc::SIGKILL) };
+            if result != 0 {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::ESRCH) {
                     eprintln!("failed to clean up health fixture group {group}: {error}");

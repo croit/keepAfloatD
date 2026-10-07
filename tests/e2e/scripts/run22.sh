@@ -10,6 +10,7 @@ export COMPOSE_PROJECT_NAME="keepafloatd-e2e-issue22"
 export ARTIFACT_DIR="${ROOT_DIR}/e2e-artifacts/compose22"
 export E2E_VIPS="10.50.0.100"
 export KEEPAFLOATD_E2E_CONFIG_DIR="configs22"
+export KEEPAFLOATD_RUST_LOG="${KEEPAFLOATD_RUST_LOG:-info,keepafloatd::vip::takeover=debug}"
 
 # shellcheck source=tests/e2e/scripts/lib.sh
 . "${ROOT_DIR}/tests/e2e/scripts/lib.sh"
@@ -31,7 +32,7 @@ run_scenario() {
   log "starting ${scenario_name}"
   if {
     reset_cluster &&
-      wait_for_steady_state &&
+      wait_for_startup_state &&
       bash "${scenario_path}"
   } 2>&1 | tee "${run_log}"; then
     status=0

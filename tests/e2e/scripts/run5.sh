@@ -43,7 +43,7 @@ run_scenario() {
 
   if {
     reset_cluster &&
-      wait_for_steady_state &&
+      wait_for_startup_state &&
       bash "${scenario_path}"
   } 2>&1 | tee "${run_log}"; then
     status=0

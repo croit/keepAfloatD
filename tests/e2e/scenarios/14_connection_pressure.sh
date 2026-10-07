@@ -55,8 +55,8 @@ assert_pressure_bounded() {
 }
 
 runner_sh "rm -f '${PRESSURE_STOP}' '${PRESSURE_STATUS}'"
-compose exec -T e2e-runner timeout 100 python3 -u - \
-  --status "${PRESSURE_STATUS}" --stop "${PRESSURE_STOP}" --duration 90 \
+compose exec -T e2e-runner timeout "$(cleanup_budget_seconds 100)" python3 -u - \
+  --status "${PRESSURE_STATUS}" --stop "${PRESSURE_STOP}" --duration "$(cleanup_budget_seconds 90)" \
   --endpoint node-a,10.50.0.10,17100,raft \
   --endpoint node-a,10.50.0.10,17101,submit \
   --endpoint node-b,10.50.0.11,17110,raft \
@@ -92,14 +92,12 @@ survivors=()
 for node in "${NODES[@]}"; do
   [[ "${node}" == "${old_leader_svc}" ]] || survivors+=("${node}")
 done
-# #26: after election, stale detection can take 7 probe intervals, followed by
-# the 6.5s proof lifetime + 1.75s cleanup allowance and bounded bind work.
-# Reserve 20s for that normal fence and a Docker ownership observation.
-wait_for_even_over_nodes 20 "${survivors[@]}"
+# Include the configured cleanup allowance only in the silent-holder fallback.
+wait_for_even_over_nodes "$(cleanup_budget_seconds 20)" "${survivors[@]}"
 assert_pressure_bounded
 log "leader failover and unique reachable VIPs passed under sustained connection pressure"
 
 stop_pressure
 start_services_no_deps "${old_leader_svc}"
-wait_for_steady_state
+wait_for_startup_state
 log "all three nodes recovered after connection pressure stopped"

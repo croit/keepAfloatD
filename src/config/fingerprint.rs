@@ -172,7 +172,7 @@ mod tests {
 node_id: 1
 raft_listen: "127.0.0.1:17101"
 client_submit_listen: "127.0.0.1:17102"
-cluster_secret: "alpha-secret"
+cluster_secret: "alpha-secret-0123456789abcdef012345"
 peers:
   - id: 2
     raft_address: "127.0.0.2:17101"
@@ -226,7 +226,7 @@ failback_delay_secs: 10
                 "client_submit_listen: \"127.0.0.1:17102\"",
                 "client_submit_listen: \"127.0.0.2:17102\"",
             )
-            .replace("alpha-secret", "different-secret")
+            .replace("alpha-secret-0123456789abcdef012345", "different-secret-0123456789abcdef012345")
             .replace("/bin/check-local", "/bin/other-local-check")
             .replace("--node\", \"1", "--node\", \"2")
             .replace("timeout_ms: 500", "timeout_ms: 900")

@@ -13,7 +13,8 @@ use std::net::IpAddr;
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FailoverSemantics {
-    /// Original behavior retained while a rolling upgrade may still contain old voters.
+    /// Historical state-machine behavior retained for compatibility decoding only.
+    /// It does not permit mixed-protocol voters or a rolling protocol upgrade.
     #[default]
     Legacy,
     /// Ownership-aware nopreempt and silent-recovery behavior.
@@ -23,13 +24,21 @@ pub enum FailoverSemantics {
 /// Commands replicated through Raft and applied to the state machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KafRequest {
+    /// Consumer-specific challenge whose complete contents must be applied before use.
+    HealthProgress(super::admission::HealthProgress),
+    /// Immutable descriptor committed only after admission's reservation quorum.
+    AdmissionGenesis(super::admission::Genesis),
+    AdmissionMembership(super::admission::AdmissionCommand),
     /// Local health result for `node_id`.
     ///
     /// Each daemon process must publish updates only for **its own**
     /// [`crate::config::Config::node_id`]. The state machine maintains a per-node committed probe
     /// counter, incremented on every applied update, and expires stale peers by comparing that
     /// node-local counter with the most recent committed probe round seen anywhere in the cluster.
-    HealthUpdate { node_id: u64, healthy: bool },
+    HealthUpdate {
+        node_id: u64,
+        healthy: bool,
+    },
     /// Best-effort acknowledgement from the previous holder after it has already removed `vip`
     /// from the local kernel. `generation` fences delayed acks from older handoff attempts.
     VipReleased {
@@ -37,27 +46,21 @@ pub enum KafRequest {
         vip: IpAddr,
         generation: u64,
     },
-    /// Per-formation cluster incarnation, committed exactly once by the first leader after a fresh
-    /// `Raft::initialize`. It carries no `node_id` because it identifies the *cluster*, not a
-    /// member. The state machine records the first committed value and ignores any later ones (the
-    /// formation is idempotent), so every node converges on the same incarnation. Peers advertise
-    /// this value in the transport handshake; a node that already holds a *different* incarnation
-    /// rejects another's Raft RPCs, which is what stops a stale survivor from overwriting a
-    /// majority that reformed without it. See `src/raft/network.rs` and `run_cluster_guard`.
+    /// Historical set-once incarnation record retained for compatibility decoding.
+    /// Current formation uses `AdmissionGenesis`; decoding this record grants no runtime authority.
     ClusterFormed {
         cluster_id: u128,
-        /// Fresh formations can select V2 immediately. Old serialized entries omit this field and
-        /// therefore remain legacy.
+        /// Historical entries without this field retain legacy state-machine semantics.
         #[serde(default)]
         failover_semantics: FailoverSemantics,
-        /// Fresh compatible formations can require every peer to advertise config identity.
-        /// Old serialized entries omit this field and therefore retain rolling-upgrade mode.
+        /// Historical entries without this field leave identity enforcement disabled.
+        /// Current admitted genesis enables enforcement without a mixed-protocol mode.
         #[serde(default)]
         config_identity_enforced: bool,
     },
-    /// One-way activation after every voter in an existing cluster advertises V2 support.
+    /// Historical one-way semantics activation retained for compatibility decoding.
     EnableFailoverSemanticsV2,
-    /// One-way activation after every voter advertises the same concrete config identity.
+    /// Historical one-way identity activation retained for compatibility decoding.
     EnableConfigIdentityV1,
 }
 
@@ -66,6 +69,13 @@ impl std::fmt::Display for KafRequest {
     // bound). Used only for tracing/diagnostics; keep it compact and side-effect-free.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::HealthProgress(progress) => {
+                write!(f, "HealthProgress(replica={})", progress.replica)
+            }
+            Self::AdmissionGenesis(genesis) => {
+                write!(f, "AdmissionGenesis(epoch={})", genesis.epoch)
+            }
+            Self::AdmissionMembership(command) => write!(f, "AdmissionMembership({command:?})"),
             Self::HealthUpdate { node_id, healthy } => {
                 write!(f, "HealthUpdate(node={node_id}, healthy={healthy})")
             }
@@ -98,6 +108,8 @@ impl KafRequest {
     #[must_use]
     pub fn node_id(&self) -> Option<u64> {
         match self {
+            Self::HealthProgress(progress) => Some(progress.node_id),
+            Self::AdmissionGenesis(_) | Self::AdmissionMembership(_) => None,
             Self::HealthUpdate { node_id, .. } | Self::VipReleased { node_id, .. } => {
                 Some(*node_id)
             }
@@ -112,6 +124,7 @@ impl KafRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KafResponse {
     Ok,
+    Rejected(String),
 }
 
 /// In-memory snapshot payload shared by the state machine and Raft transport.
@@ -120,18 +133,75 @@ pub type KafSnapshotData = Cursor<Vec<u8>>;
 openraft::declare_raft_types!(
     /// Marker type wiring OpenRaft generics for this daemon.
     ///
-    /// Only the application-specific associated types are set here; the rest (`NodeId = u64`,
-    /// `Node = BasicNode`, `AsyncRuntime = TokioRuntime`, and the leader-id/vote/entry/responder
-    /// types) take the `declare_raft_types!` defaults.
+    /// Physical configuration IDs never serve as volatile consensus identities.
     pub TypeConfig:
+        NodeId = crate::raft::admission::ReplicaId,
         D = KafRequest,
         R = KafResponse,
 );
 
 #[cfg(test)]
+pub(crate) fn test_replica(physical_id: u64) -> crate::raft::admission::ReplicaId {
+    crate::raft::admission::ReplicaId {
+        physical_id,
+        boot_nonce: [42; 32],
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{FailoverSemantics, KafRequest, KafResponse};
     use serde::Deserialize;
+
+    #[test]
+    fn openraft_node_id_is_the_exact_boot_replica() {
+        assert_eq!(
+            std::any::TypeId::of::<<super::TypeConfig as openraft::RaftTypeConfig>::NodeId>(),
+            std::any::TypeId::of::<crate::raft::admission::ReplicaId>()
+        );
+    }
+
+    #[test]
+    fn admission_membership_commands_are_cluster_scoped_and_roundtrip() {
+        use crate::raft::admission::{AdmissionCommand, Genesis, JoinPlan};
+        let consumer = super::test_replica(2);
+        let previous = std::collections::BTreeSet::from([super::test_replica(1)]);
+        let commands = [
+            AdmissionCommand::PrepareJoin(JoinPlan {
+                genesis: Genesis {
+                    config: crate::config::ClusterConfigFingerprint {
+                        version: 1,
+                        digest: [8; 32],
+                    },
+                    epoch: 9,
+                    voters: previous.clone(),
+                },
+                consumer,
+                request_nonce: [4; 32],
+                previous_voters: previous,
+                next_voters: std::collections::BTreeSet::from([super::test_replica(1), consumer]),
+            }),
+            AdmissionCommand::LearnerApplied {
+                consumer,
+                request_nonce: [4; 32],
+                prepared: openraft::testing::log_id::<super::TypeConfig>(
+                    1,
+                    super::test_replica(1),
+                    2,
+                ),
+            },
+        ];
+        for command in commands {
+            let request = KafRequest::AdmissionMembership(command);
+            assert_eq!(request.node_id(), None);
+            assert!(request.to_string().starts_with("AdmissionMembership("));
+            assert_eq!(
+                serde_json::from_slice::<KafRequest>(&serde_json::to_vec(&request).unwrap())
+                    .unwrap(),
+                request
+            );
+        }
+    }
 
     #[derive(Deserialize)]
     enum LegacyKafRequest {

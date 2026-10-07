@@ -29,6 +29,6 @@ wait_for_service_running node-b 10
 wait_for_service_running node-c 10
 
 # Exactly one cluster forms.
-wait_for_even_over_nodes 45 "${NODES[@]}"
+wait_for_startup_over_nodes 45 "${NODES[@]}"
 assert_unique_holders
 wait_for_single_agreed_leader 15

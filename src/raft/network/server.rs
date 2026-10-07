@@ -1,16 +1,16 @@
 //! Raft listener admission, authentication, and inbound stream supervision.
 
 use super::inbound;
-use super::wire::{read_handshake, secrets_match};
+use crate::auth::{self, Listener, Peer};
 use crate::config::{ClusterConfigFingerprint, Config, canonical_socket_addr};
 use crate::connection_admission::{ConnectionAdmission, FrameByteBudget};
+use crate::listener::{AcceptBackoff, ConnectionListener};
 use crate::raft::tasks::{CleanExit, SupervisedTask, spawn_supervised_task};
 use crate::raft::{KafRaft, KafStorageState};
-use anyhow::Context;
+use crate::warning_limit::{WarningLimiter, warn_limited};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinSet;
 
@@ -20,6 +20,7 @@ const RAFT_AUTHENTICATED_CONNECTION_LIMIT: usize = 64;
 const RAFT_INFLIGHT_FRAME_BYTE_LIMIT: usize = 128 * 1024 * 1024;
 
 pub(super) struct RaftAcceptContext {
+    pub(super) admission: Arc<dyn super::authorization::AdmissionController>,
     pub(super) config: Arc<Config>,
     pub(super) raft: KafRaft,
     pub(super) state_ref: Arc<RwLock<KafStorageState>>,
@@ -58,7 +59,7 @@ pub(super) fn raft_source_matches_peer(
 }
 
 pub(super) fn spawn_raft_accept_task(
-    listener: TcpListener,
+    listener: impl ConnectionListener,
     context: RaftAcceptContext,
     failure_tx: mpsc::UnboundedSender<String>,
 ) -> SupervisedTask {
@@ -82,22 +83,24 @@ pub(super) fn spawn_raft_accept_task(
                     .filter_map(|peer| peer.raft_address.parse().ok()),
             );
             let mut inbound_tasks = JoinSet::new();
+            let mut accept_backoff = AcceptBackoff::default();
+            let warnings = WarningLimiter::default();
             loop {
                 if context.shutdown.load(Ordering::SeqCst) {
                     break;
                 }
                 tokio::select! {
-                    accepted = listener.accept() => match accepted {
+                    accepted = accept_backoff.accept(&listener) => match accepted {
                         Ok((stream, addr)) => spawn_inbound_stream(
                             &mut inbound_tasks,
                             &context,
                             &admission,
                             &source_admission,
                             &frame_byte_budget,
-                            stream,
-                            addr,
+                            &warnings,
+                            (stream, addr),
                         ),
-                        Err(error) => return Err(error).context("accept Raft connection"),
+                        Err(error) => accept_backoff.failed("Raft", error),
                     },
                     joined = inbound_tasks.join_next(), if !inbound_tasks.is_empty() => {
                         if let Some(Err(error)) = joined {
@@ -117,71 +120,109 @@ fn spawn_inbound_stream(
     admission: &ConnectionAdmission,
     source_admission: &crate::admission::ConnectionAdmission,
     frame_byte_budget: &FrameByteBudget,
-    mut stream: tokio::net::TcpStream,
-    addr: std::net::SocketAddr,
+    warnings: &WarningLimiter,
+    (mut stream, addr): (tokio::net::TcpStream, std::net::SocketAddr),
 ) {
     if !is_known_raft_source(&context.config, addr.ip()) {
-        tracing::warn!(
+        warn_limited!(
+            warnings,
             "raft accept from {}: unknown source rejected before admission",
             addr
         );
         return;
     }
     let Some(unauthenticated) = admission.try_begin() else {
-        tracing::warn!(
+        warn_limited!(
+            warnings,
             "raft accept from {}: unauthenticated connection limit reached",
             addr
         );
         return;
     };
-    let Some(source_permit) = source_admission.try_acquire(addr.ip()) else {
-        tracing::warn!("raft accept from {}: source connection limit reached", addr);
+    let Some(source_unauthenticated) = source_admission.try_begin(addr.ip()) else {
+        warn_limited!(
+            warnings,
+            "raft accept from {}: source unauthenticated connection limit reached",
+            addr
+        );
         return;
     };
     let cfg = context.config.clone();
+    let admission_controller = context.admission.clone();
     let raft = context.raft.clone();
     let state_ref = context.state_ref.clone();
     let config_fingerprint = context.config_fingerprint;
     let frame_byte_budget = frame_byte_budget.clone();
+    let warnings = warnings.clone();
     // Lifetime: the accept task owns this stream and its source quota through dispatch.
     inbound_tasks.spawn(async move {
-        let _source_permit = source_permit;
-        let handshake =
-            tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, read_handshake(&mut stream)).await;
-        let (peer_id, peer_secret, peer_epoch, peer_supports_v2) = match handshake {
+        let handshake = tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, async {
+            let state = state_ref.read().await;
+            let local = Peer::for_replica(
+                admission_controller.local_replica(),
+                state.cluster_epoch,
+                state.failover_semantics == crate::raft::FailoverSemantics::V2,
+            );
+            drop(state);
+            auth::server_bound(
+                &mut stream,
+                local,
+                cfg.cluster_secret.as_deref(),
+                Listener::Raft,
+            )
+            .await
+        })
+        .await;
+        let authenticated = match handshake {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
-                tracing::warn!("raft accept from {}: handshake io: {}", addr, error);
+                warn_limited!(
+                    warnings,
+                    "raft accept from {}: handshake io: {}",
+                    addr,
+                    error
+                );
                 return;
             }
             Err(_) => {
-                tracing::warn!("raft accept from {}: handshake timeout", addr);
+                warn_limited!(warnings, "raft accept from {}: handshake timeout", addr);
                 return;
             }
         };
+        let peer = authenticated.peer;
+        let channel_binding = authenticated.binding;
+        let (peer_id, peer_epoch, peer_supports_v2) = (peer.id, peer.epoch, peer.supports_v2);
         if !cfg.peers.iter().any(|peer| peer.id == peer_id) {
-            tracing::warn!("raft accept from {}: unknown peer_id {}", addr, peer_id);
+            warn_limited!(
+                warnings,
+                "raft accept from {}: unknown peer_id {}",
+                addr,
+                peer_id
+            );
             return;
         }
         if !raft_source_matches_peer(&cfg, peer_id, addr.ip()) {
-            tracing::warn!(
+            warn_limited!(
+                warnings,
                 "raft accept from {}: source does not match peer_id {}; dropping",
                 addr,
                 peer_id
             );
             return;
         }
-        if !secrets_match(cfg.cluster_secret.as_deref(), peer_secret.as_deref()) {
-            tracing::warn!(
-                "raft accept from {} (peer_id {}): cluster_secret mismatch; dropping",
+        let Ok(_authenticated_connection) = unauthenticated.try_authenticate() else {
+            warn_limited!(
+                warnings,
+                "raft accept from {} (peer_id {}): authenticated connection limit reached",
                 addr,
                 peer_id
             );
             return;
-        }
-        let Ok(_authenticated_connection) = unauthenticated.try_authenticate() else {
-            tracing::warn!(
-                "raft accept from {} (peer_id {}): authenticated connection limit reached",
+        };
+        let Ok(_source_authenticated) = source_unauthenticated.try_authenticate() else {
+            warn_limited!(
+                warnings,
+                "raft accept from {} (peer_id {}): source authenticated connection limit reached",
                 addr,
                 peer_id
             );
@@ -192,17 +233,22 @@ fn spawn_inbound_stream(
             state_ref,
             stream,
             inbound::InboundPeer {
+                channel_binding,
                 id: peer_id,
                 epoch: peer_epoch,
                 supports_v2: peer_supports_v2,
+                replica: peer.replica(),
             },
             inbound::InboundStreamPolicy {
                 local_config_fingerprint: config_fingerprint,
+                admission: admission_controller,
+                secret: cfg.cluster_secret.clone(),
                 max_frame_bytes: cfg.max_frame_bytes,
                 legacy_response_budget: inbound::legacy_response_budget(
                     cfg.raft.heartbeat_interval_ms,
                 ),
                 frame_byte_budget,
+                warnings,
                 idle_timeout: Duration::from_secs(5)
                     .max(Duration::from_millis(cfg.raft.heartbeat_interval_ms).saturating_mul(2)),
             },

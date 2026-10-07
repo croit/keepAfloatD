@@ -10,6 +10,10 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
 ]
+exceptions = [
+    # Full copyright and license text ships in LICENSES/subtle-2.6.1.txt.
+    { name = "subtle", version = "=2.6.1", allow = ["BSD-3-Clause"] },
+]
 
 [advisories]
 version = 2
@@ -19,5 +23,18 @@ unmaintained = "all"
 ignore = []
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+skip = [
+    # SHA-2 and OpenRaft's random generator use different CPU feature APIs.
+    { name = "cpufeatures", version = "=0.2.17" },
+    # chrono-tz's build-time PHF generator still uses rand 0.8.
+    { name = "rand", version = "=0.8.6" },
+    { name = "rand_core", version = "=0.6.4" },
+    # OpenRaft macros use syn 3; the remaining derive macros still use syn 2.
+    { name = "syn", version = "=2.0.117" },
+]

@@ -1,11 +1,12 @@
 //! Consensus-to-kernel VIP reconciliation.
 
 use super::{
-    LocalVip, VipState, fire_notify_script, release_notify_state, should_reannounce_after_release,
+    LocalVip, VipState, release_notify_state, should_reannounce_after_release,
     startup_effects_may_arm,
 };
 use crate::config::{Config, VipAddr};
 use crate::consensus_freshness::ConsensusFreshness;
+use crate::health::LocalHealth;
 use crate::raft::store::VipAssignment;
 use crate::raft::{KafRaft, KafRequest, KafStorageState};
 use crate::submit;
@@ -13,13 +14,12 @@ use openraft::async_runtime::WatchReceiver;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 mod intent;
 use intent::EffectIntent;
 
 /// Reconciliation tick period.
-const RECONCILE_TICK: tokio::time::Duration = tokio::time::Duration::from_millis(250);
+pub(crate) const RECONCILE_TICK: tokio::time::Duration = tokio::time::Duration::from_millis(250);
 
 struct ReconcileMemory {
     released_generations: HashMap<IpAddr, u64>,
@@ -32,21 +32,29 @@ struct ReconcileMemory {
 
 impl ReconcileMemory {
     fn new(proof_lifetime: tokio::time::Duration, vip_count: usize) -> Self {
-        // #26: reserve a reconcile tick plus bounded address/marker deletion per VIP.
-        let commands = (vip_count.min(u32::MAX as usize) as u32).saturating_mul(2);
-        let cleanup_margin = RECONCILE_TICK
-            .saturating_add(super::effects::IP_COMMAND_TIMEOUT.saturating_mul(commands));
         Self {
             released_generations: HashMap::new(),
             activated_generations: HashMap::new(),
             announced_release_generations: HashMap::new(),
             vip_effects_armed: false,
             next_vip: 0,
-            takeover_delay: super::takeover::TakeoverDelay::new(
-                proof_lifetime.saturating_add(cleanup_margin),
-            ),
+            takeover_delay: super::takeover::TakeoverDelay::new(takeover_lifetime(
+                proof_lifetime,
+                vip_count,
+            )),
         }
     }
+}
+
+fn takeover_lifetime(
+    proof_lifetime: tokio::time::Duration,
+    vip_count: usize,
+) -> tokio::time::Duration {
+    // #26: reserve a reconcile tick plus bounded address/marker deletion per VIP.
+    let cleanup_work = u32::try_from(vip_count).map_or(tokio::time::Duration::MAX, |count| {
+        super::SHUTDOWN_VIP_BUDGET.saturating_mul(count)
+    });
+    proof_lifetime.saturating_add(RECONCILE_TICK.saturating_add(cleanup_work))
 }
 
 /// Fence effects independently of a stalled health probe, bind, or release submit (#26).
@@ -57,7 +65,7 @@ pub async fn run_reconcile_loop(
     sm: Arc<RwLock<KafStorageState>>,
     vip_local: Arc<LocalVip>,
     vip_table: Arc<Vec<(VipAddr, String)>>,
-    local_healthy: Arc<AtomicBool>,
+    local_healthy: Arc<LocalHealth>,
     consensus_fresh: Arc<ConsensusFreshness>,
     node_id: u64,
 ) {
@@ -66,7 +74,7 @@ pub async fn run_reconcile_loop(
     loop {
         if !consensus_fresh.is_fresh() {
             loop {
-                let state = release_notify_state(local_healthy.load(Ordering::SeqCst));
+                let state = release_notify_state(local_healthy.is_healthy());
                 match vip_local
                     .unbind_all(
                         vip_table.as_ref(),
@@ -139,7 +147,7 @@ pub async fn run_reconcile_loop(
                     memory.announced_release_generations.remove(addr);
                 }
                 loop {
-                    let state = release_notify_state(local_healthy.load(Ordering::SeqCst));
+                    let state = release_notify_state(local_healthy.is_healthy());
                     match vip_local
                         .unbind_all(&cleanup, cfg.notify.as_deref(), cfg.dry_run, state)
                         .await
@@ -160,7 +168,7 @@ pub async fn run_reconcile_loop(
                 let state = sm.read().await;
                 let gates = crate::bind_policy::BindGates {
                     has_leader: raft.metrics().borrow_watched().current_leader.is_some(),
-                    local_healthy: local_healthy.load(Ordering::SeqCst),
+                    local_healthy: local_healthy.is_healthy(),
                     consensus_fresh: consensus_fresh.is_fresh(),
                 };
                 if !gates.has_leader || !gates.local_healthy || !gates.consensus_fresh {
@@ -189,7 +197,7 @@ pub async fn run_reconcile_loop(
         }
         // Proof loss or a closed global gate requires full cleanup, even after a coalesced renewal.
         loop {
-            let state = release_notify_state(local_healthy.load(Ordering::SeqCst));
+            let state = release_notify_state(local_healthy.is_healthy());
             match vip_local
                 .unbind_all(
                     vip_table.as_ref(),
@@ -223,7 +231,7 @@ async fn run_active_reconcile_loop(
     sm: Arc<RwLock<KafStorageState>>,
     vip_local: Arc<LocalVip>,
     vip_table: Arc<Vec<(VipAddr, String)>>,
-    local_healthy: Arc<AtomicBool>,
+    local_healthy: Arc<LocalHealth>,
     consensus_fresh: Arc<ConsensusFreshness>,
     node_id: u64,
     memory: &mut ReconcileMemory,
@@ -278,7 +286,7 @@ async fn run_active_reconcile_loop(
             let prefix = vip.prefix;
             let already_bound = vip_local.is_confirmed_bound(addr).await;
             let activated_generation = activated_generations.get(&addr).copied();
-            let local_ok = local_healthy.load(Ordering::SeqCst);
+            let local_ok = local_healthy.is_healthy();
             let (captured, takeover_ready) = {
                 let state = sm.read().await;
                 let captured = EffectIntent::capture(
@@ -317,7 +325,9 @@ async fn run_active_reconcile_loop(
                 // Snapshot before bind so we detect genuine first-bind transitions only.
                 let was_not_bound = cfg.notify.is_some() && !already_bound;
                 if let Err(e) = vip_local.bind(iface, addr, prefix).await {
-                    tracing::warn!("bind {}: {}", addr, e);
+                    local_healthy.fail_binding();
+                    tracing::error!(%addr, %iface, error = %format_args!("{e:#}"),
+                        "VIP bind failed; node remains unhealthy until restart");
                 } else {
                     retained.send_modify(|bound| {
                         bound.insert(addr, captured.clone().activated());
@@ -342,12 +352,14 @@ async fn run_active_reconcile_loop(
                         }
                     }
                     if was_not_bound && let Some(script) = cfg.notify.as_deref() {
-                        let _ = fire_notify_script(
-                            script,
-                            &addr.to_string(),
-                            VipState::Master,
-                            cfg.dry_run,
-                        );
+                        vip_local
+                            .notify_transition(
+                                script,
+                                &addr.to_string(),
+                                VipState::Master,
+                                cfg.dry_run,
+                            )
+                            .await;
                     }
                 }
                 continue;
@@ -368,12 +380,14 @@ async fn run_active_reconcile_loop(
                     if was_bound {
                         // FAULT is only for local health failures; cluster events use BACKUP.
                         if let Some(script) = cfg.notify.as_deref() {
-                            let _ = fire_notify_script(
-                                script,
-                                &addr.to_string(),
-                                release_notify_state(local_ok),
-                                cfg.dry_run,
-                            );
+                            vip_local
+                                .notify_transition(
+                                    script,
+                                    &addr.to_string(),
+                                    release_notify_state(local_ok),
+                                    cfg.dry_run,
+                                )
+                                .await;
                         }
                     }
                     true
@@ -467,3 +481,94 @@ async fn maybe_publish_release(
 
 #[cfg(test)]
 mod release_tests;
+
+#[cfg(test)]
+mod cleanup_budget_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    fn assignment() -> VipAssignment {
+        VipAssignment {
+            holder: 2,
+            generation: 2,
+            previous_holder: Some(1),
+            previous_holder_released: false,
+            activation_tick: 0,
+        }
+    }
+
+    fn ready(
+        memory: &mut ReconcileMemory,
+        assignment: &VipAssignment,
+        activated_generation: Option<u64>,
+    ) -> bool {
+        memory.takeover_delay.ready(
+            "192.0.2.1".parse().unwrap(),
+            2,
+            Some(assignment),
+            &BTreeMap::from([(1, 1)]),
+            10,
+            1,
+            activated_generation,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn takeover_wait_includes_cleanup_verification_and_retries() {
+        let mut memory = ReconcileMemory::new(Duration::from_secs(1), 1);
+        let assignment = assignment();
+        assert!(!ready(&mut memory, &assignment, None));
+        tokio::time::advance(Duration::from_millis(1_750)).await;
+        assert!(
+            !ready(&mut memory, &assignment, None),
+            "two bare command timeouts do not cover verified cleanup retries"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn takeover_wait_scales_with_the_full_configured_vip_count() {
+        for count in [0_u32, 1, 2] {
+            let mut memory = ReconcileMemory::new(Duration::from_secs(1), count as usize);
+            let assignment = assignment();
+            let expected =
+                Duration::from_millis(1_250) + Duration::from_secs(12 * u64::from(count));
+            assert!(!ready(&mut memory, &assignment, None));
+            tokio::time::advance(expected - Duration::from_millis(1)).await;
+            assert!(!ready(&mut memory, &assignment, None), "count {count}");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(ready(&mut memory, &assignment, None), "count {count}");
+        }
+    }
+
+    #[test]
+    fn maximum_supported_vip_count_preserves_full_cleanup_budget() {
+        assert_eq!(
+            takeover_lifetime(Duration::from_secs(1), u32::MAX as usize),
+            Duration::from_millis(1_250) + Duration::from_secs(12 * u64::from(u32::MAX))
+        );
+    }
+
+    #[test]
+    fn oversized_vip_counts_cannot_truncate_the_cleanup_wait() {
+        if let Some(oversized) = (u32::MAX as usize).checked_add(1) {
+            for count in [oversized, usize::MAX] {
+                assert_eq!(takeover_lifetime(Duration::ZERO, count), Duration::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_proof_lifetime_does_not_wrap_the_cleanup_wait() {
+        assert_eq!(takeover_lifetime(Duration::MAX, 2), Duration::MAX);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_allowance_preserves_release_and_activation_shortcuts() {
+        let mut memory = ReconcileMemory::new(Duration::from_secs(1), 2);
+        let mut assignment = assignment();
+        assert!(ready(&mut memory, &assignment, Some(assignment.generation)));
+        assignment.previous_holder_released = true;
+        assert!(ready(&mut memory, &assignment, None));
+    }
+}

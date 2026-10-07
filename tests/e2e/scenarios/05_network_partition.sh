@@ -11,5 +11,5 @@ install_minority_partition
 # node-a becomes the minority (1 of 3): it loses quorum and unbinds, while the majority {node-b,
 # node-c} keeps serving and holds every VIP. Reaching the two-node assignment is itself proof the
 # majority has a working leader; the leader id is not asserted (it is non-deterministic).
-wait_for_even_over_nodes 20 node-b node-c
+wait_for_even_over_nodes "$(cleanup_budget_seconds 20)" node-b node-c
 assert_node_lacks_all_vips node-a

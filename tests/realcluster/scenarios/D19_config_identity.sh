@@ -44,6 +44,8 @@ kafd_restart "${peers[0]}"
 sleep 2
 kafd_restart "${peers[1]}"
 
+check "new-config majority completes its startup fence without overlapping VIPs" \
+  wait_for_startup_activation 30 "${peers[@]}"
 check "new-config majority serves every VIP uniquely and reachably" \
   wait_for_live_service_without 90 "${victim}"
 check "old-config owner leaves no kernel VIP after fatal cleanup" \

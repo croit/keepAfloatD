@@ -2,6 +2,7 @@
 """Exercise authenticated Raft read deadlines without writing cluster state or exposing secrets."""
 
 import json
+import re
 import select
 import socket
 import struct
@@ -9,6 +10,13 @@ import sys
 import time
 
 import yaml
+
+try:
+    import auth_wire
+except ModuleNotFoundError:
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "e2e" / "scripts"))
+    import auth_wire
 
 
 def endpoint(value):
@@ -27,22 +35,22 @@ def read_exact(stream, size):
 
 
 def status(stream, node_id, fingerprint):
-    body = json.dumps({
+    body = auth_wire.encode_rpc("status", {
         "probe_from": node_id,
         "config_fingerprint": fingerprint,
         "supports_cancellation_safe_rpc_v1": True,
-    }).encode()
+    })
     stream.sendall(struct.pack("!I", len(body)) + body)
     size = struct.unpack("!I", read_exact(stream, 4))[0]
     if size > 65536:
         raise RuntimeError("status response exceeds its protocol cap")
-    response = json.loads(read_exact(stream, size))
+    response = auth_wire.decode_rpc(read_exact(stream, size), "status")
     if not response.get("initialized") or response.get("current_leader") is None:
         raise RuntimeError("target does not report an initialized cluster with a leader")
     return response
 
 
-def run(config_path, target_id, status_only=False):
+def run(config_path, target_id, status_only=False, legacy_rejection=False):
     with open(config_path, encoding="utf-8") as source:
         config = yaml.safe_load(source)
     node_id = config["node_id"]
@@ -55,8 +63,25 @@ def run(config_path, target_id, status_only=False):
     idle_timeout = max(5, 2 * heartbeat)
     if idle_timeout > 30:
         raise ValueError("heartbeat exceeds this bounded test's 30-second idle budget")
-    secret = config["cluster_secret"].encode()
-    handshake = struct.pack("!QI", node_id, len(secret)) + secret + b"\x02"
+    secret = config.get("cluster_secret")
+    if secret is None:
+        from pathlib import Path
+        path = Path(config["cluster_secret_file"])
+        if not path.is_absolute():
+            path = Path(config_path).parent / path
+        secret = path.read_text(encoding="utf-8").removesuffix("\n").removesuffix("\r")
+    if legacy_rejection:
+        for address in (peers[target_id]["raft_address"], peers[target_id]["client_submit_address"]):
+            with socket.create_connection(endpoint(address), timeout=2,
+                                          source_address=(source_host, 0)) as rejected:
+                # Deliberately never transmit the configured secret, even in a negative test.
+                rejected.sendall(struct.pack("!QI", node_id, 0) + b"\x00")
+                try:
+                    data = rejected.recv(1)
+                except ConnectionResetError:
+                    data = b""
+                if data:
+                    raise AssertionError("legacy authentication was accepted")
 
     def connect():
         family = socket.AF_INET6 if ":" in source_host else socket.AF_INET
@@ -65,7 +90,7 @@ def run(config_path, target_id, status_only=False):
         try:
             stream.bind((source_host, 0))
             stream.connect((target_host, target_port))
-            stream.sendall(handshake)
+            auth_wire.client(stream, node_id, target_id, secret)
             return stream
         except BaseException:
             stream.close()
@@ -76,7 +101,10 @@ def run(config_path, target_id, status_only=False):
         fingerprint = discovered.get("config_fingerprint")
     if not fingerprint:
         raise RuntimeError("target must advertise config identity for authenticated pressure")
-    if discovered.get("member_count") != len(peers) or discovered["current_leader"] not in peers:
+    leader = discovered["current_leader"]
+    if not isinstance(leader, str) or not re.fullmatch(r"[0-9a-f]{16}:[0-9a-f]{64}", leader):
+        raise RuntimeError("target reports a malformed exact leader identity")
+    if discovered.get("member_count") != len(peers) or int(leader[:16], 16) not in peers:
         raise RuntimeError("target reports a different voter roster or an unknown leader")
     if status_only:
         print(json.dumps({"source_id": node_id, "target_id": target_id,
@@ -136,6 +164,7 @@ def run(config_path, target_id, status_only=False):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] != "--status-only"):
-        raise SystemExit("usage: raft-deadline-probe.py CONFIG TARGET_NODE_ID [--status-only]")
-    run(sys.argv[1], int(sys.argv[2]), len(sys.argv) == 4)
+    if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] not in ("--status-only", "--legacy-rejection")):
+        raise SystemExit("usage: raft-deadline-probe.py CONFIG TARGET_NODE_ID [--status-only|--legacy-rejection]")
+    run(sys.argv[1], int(sys.argv[2]), len(sys.argv) == 4,
+        len(sys.argv) == 4 and sys.argv[3] == "--legacy-rejection")

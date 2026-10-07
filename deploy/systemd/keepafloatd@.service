@@ -5,18 +5,22 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Only the daemon and ExecStopPost may extend the finite stop deadline.
+NotifyAccess=exec
 Environment=RUST_LOG=info
 EnvironmentFile=-/etc/default/keepafloatd
 ExecStart=/usr/bin/keepafloatd --config /etc/keepafloatd/config-%i.yaml
+ExecStopPost=/usr/bin/keepafloatd --config /etc/keepafloatd/config-%i.yaml --cleanup-only
 Restart=on-failure
 RestartSec=1
 TimeoutStopSec=15
+# Progress checkpoints add bounded work to this no-progress guard.
 # Signal only the daemon during graceful stop; remaining children are still SIGKILLed on timeout.
 KillMode=mixed
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 
 # Sandbox: the daemon needs only NET_ADMIN (ip addr add/del) and NET_RAW
-# (arping). Health and notify commands run inside this sandbox too - if yours
+# (arping/ndptool). Health and notify commands run inside this sandbox too - if yours
 # needs more access, relax the unit with a systemctl drop-in, don't edit it.
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes

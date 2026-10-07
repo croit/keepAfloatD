@@ -27,7 +27,7 @@ check "silent-death victim starts with a VIP" test -n "${victim_vip}"
 evid "SIGKILLing ${victim}; no unhealthy report will be published"
 kafd_kill "${victim}"
 check "silent owner is staled and every VIP gains a live holder" \
-  wait_until 30 vips_uniquely_served_by_live "${victim}"
+  wait_until "$(cleanup_budget_seconds 30)" vips_uniquely_served_by_live "${victim}"
 
 replacement=""
 capture_live_replacement() {
@@ -48,6 +48,8 @@ evid "${victim_vip} live replacement is ${replacement:-none}"
 
 kafd_start "${victim}"
 check "startup cleanup removes the killed node's orphan" wait_until 30 all_vips_uniquely_held
+check "recovered node reaches activation before checking nopreempt" \
+  wait_for_startup_activation 30 "${victim}"
 check "silent-recovered node does not preempt healthy holders" holds_for 6 \
   node_lacks_all_vips "${victim}"
 

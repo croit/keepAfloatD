@@ -7,8 +7,7 @@ export ROOT_DIR
 # shellcheck source=tests/e2e/scripts/lib.sh
 . "${ROOT_DIR}/tests/e2e/scripts/lib.sh"
 
-# Same property as scenario 10 (two nodes down incl. leader -> survivor keeps the cluster ->
-# returning nodes join, not re-form), but exercised against a DIFFERENT leader placement: we first
+# Same safe expiry and restart property as scenario 10, against a DIFFERENT leader placement: we first
 # force a leadership change so the leader under test is not whichever node happens to win the
 # cold-start election. This guards against any hidden dependence on a particular node id.
 
@@ -25,7 +24,7 @@ wait_for_service_exit "${l0_svc}" 10
 wait_for_leader_other_than "${l0_id}" 30
 start_service "${l0_svc}"
 wait_for_service_running "${l0_svc}" 10
-wait_for_even_over_nodes 45 "${NODES[@]}"
+wait_for_startup_without_overlap 45 "${NODES[@]}"
 wait_for_single_agreed_leader 15
 
 l1_id="$(current_leader_id)"
@@ -44,6 +43,7 @@ for svc in "${NODES[@]}"; do
 done
 victim="${others[0]}"
 survivor="${others[1]}"
+survivor_boot="$(node_boot_replica "${survivor}")"
 log "killing leader ${l1_svc} + ${victim}; survivor=${survivor}"
 
 kill_service "${l1_svc}" KILL
@@ -58,25 +58,24 @@ wait_until 20 node_lacks_all_vips "${survivor}" || {
   exit 1
 }
 
-# Returning blank nodes must join the survivor's cluster, not re-form one.
-# Snapshot the auto-form count before the restart (see scenario 10): a count increase afterwards
-# means a returning node re-formed. Robust to compose-log reordering, unlike a line-number
-# checkpoint.
-autoform_before="$(cluster_logs_count 'auto-formed Raft cluster')"
-restart_checkpoint="$(log_checkpoint)"
-start_service "${l1_svc}"
-start_service "${victim}"
+wait_for_admission_exit "${survivor}" "$(admission_exit_budget_seconds "${survivor}" 20)"
+start_services_no_deps "${l1_svc}" "${victim}"
 wait_for_service_running "${l1_svc}" 10
 wait_for_service_running "${victim}" 10
+service_is_not_running "${survivor}" || fail 'majority startup restarted the expired survivor'
 
-wait_for_log_any_after "${restart_checkpoint}" 40 'reports a compatible existing cluster'
-wait_for_even_over_nodes 45 "${NODES[@]}"
+wait_for_startup_without_overlap 45 "${l1_svc}" "${victim}"
+wait_for_single_agreed_leader 15
+service_is_not_running "${survivor}" || fail 'expired survivor resumed without a restart'
+majority_leader="$(node_last_leader_replica "${l1_svc}")"
+restart_checkpoint="$(log_checkpoint)"
+start_service "${survivor}"
+startup_budget="$(startup_budget_seconds 40 "${survivor}")"
+wait_for_log_after_without_overlap "${restart_checkpoint}" "${startup_budget}" 'committed learner promotion'
+wait_for_startup_without_overlap 45 "${NODES[@]}"
 assert_unique_holders
 wait_for_single_agreed_leader 15
 
-autoform_after="$(cluster_logs_count 'auto-formed Raft cluster')"
-if (( autoform_after > autoform_before )); then
-  dump_cluster_diagnostics
-  fail "a returning node re-formed a cluster instead of joining survivor ${survivor} (auto-formed ${autoform_before} -> ${autoform_after})"
-  exit 1
-fi
+[[ "$(node_boot_replica "${survivor}")" != "${survivor_boot}" ]]
+[[ "$(node_last_leader_replica "${survivor}")" == "${majority_leader}" ]]
+log 'changed-leader outage recovered only after the expired survivor stopped'

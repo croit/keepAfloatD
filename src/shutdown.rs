@@ -7,6 +7,7 @@ pub struct Signals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
     hangup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
@@ -18,6 +19,7 @@ impl Signals {
             interrupt: signal(SignalKind::interrupt()).context("listen for SIGINT")?,
             terminate: signal(SignalKind::terminate()).context("listen for SIGTERM")?,
             hangup: signal(SignalKind::hangup()).context("listen for SIGHUP")?,
+            quit: signal(SignalKind::quit()).context("listen for SIGQUIT")?,
         })
     }
 
@@ -26,11 +28,12 @@ impl Signals {
             received = self.interrupt.recv() => ("SIGINT", received),
             received = self.terminate.recv() => ("SIGTERM", received),
             received = self.hangup.recv() => ("SIGHUP", received),
+            received = self.quit.recv() => ("SIGQUIT", received),
         };
         received.context("shutdown signal stream closed")?;
         tracing::info!("shutting down on {}", name);
-        if name == "SIGHUP" {
-            anyhow::bail!("SIGHUP requested daemon restart");
+        if matches!(name, "SIGHUP" | "SIGQUIT") {
+            anyhow::bail!("{name} requested daemon restart");
         }
         Ok(())
     }

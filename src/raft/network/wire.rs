@@ -4,6 +4,8 @@ use super::super::probe::{
     ClusterStatusRequest, ClusterStatusResponse, config_identity_compatible,
 };
 use super::super::types::FailoverSemantics;
+use super::authorization::ReplicaId;
+use super::request::{Operation, decode_payload, encode};
 use crate::config::{ClusterConfigFingerprint, Config};
 use crate::connection_admission::{FrameByteBudget, FrameBytePermit, connect_from_advertised};
 use anyhow::Context;
@@ -18,9 +20,6 @@ use tokio::sync::MutexGuard;
 
 /// Bound TCP connect, handshake write, and the config-status preflight as one operation.
 const OUTBOUND_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Length cap (bytes) on the cluster_secret field. Mirrors [`Config`] validation.
-const MAX_SECRET_BYTES: u32 = 256;
 
 /// Owns a peer stream slot for one request/response exchange.
 ///
@@ -44,6 +43,10 @@ impl<'a> InFlightRpcStream<'a> {
         self.slot.as_mut()
     }
 
+    pub(super) fn replace(&mut self, stream: Option<TcpStream>) {
+        *self.slot = stream;
+    }
+
     pub(super) fn retain(&mut self) {
         self.retain = true;
     }
@@ -62,12 +65,10 @@ pub(super) async fn read_framed_bounded<R: AsyncReadExt + Unpin>(
     stream: &mut R,
     max_frame_bytes: u32,
 ) -> std::io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let n = u32::from_be_bytes(len_buf);
-    let mut buf = bounded_frame_buffer(n, max_frame_bytes)?;
-    stream.read_exact(&mut buf).await?;
-    Ok(buf)
+    let (bytes, ()) = crate::frame::read(stream, max_frame_bytes, |_| Ok(()))
+        .await
+        .map_err(crate::frame::ReadError::into_io)?;
+    Ok(bytes)
 }
 
 #[derive(Debug)]
@@ -90,15 +91,10 @@ pub(super) async fn read_framed_bounded_with_timeout_and_budget<R: AsyncReadExt 
     budget: &FrameByteBudget,
 ) -> std::io::Result<BudgetedFrame> {
     tokio::time::timeout(frame_timeout, async {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let n = u32::from_be_bytes(len_buf);
-        if n > max_frame_bytes {
-            return Err(frame_size_error(n, max_frame_bytes));
-        }
-        let permit = budget.try_reserve(n)?;
-        let mut bytes = vec![0_u8; n as usize];
-        stream.read_exact(&mut bytes).await?;
+        let (bytes, permit) =
+            crate::frame::read(stream, max_frame_bytes, |length| budget.try_reserve(length))
+                .await
+                .map_err(crate::frame::ReadError::into_io)?;
         Ok(BudgetedFrame {
             bytes,
             _permit: permit,
@@ -106,20 +102,6 @@ pub(super) async fn read_framed_bounded_with_timeout_and_budget<R: AsyncReadExt 
     })
     .await
     .map_err(|_| frame_read_timeout_error(frame_timeout))?
-}
-
-fn bounded_frame_buffer(n: u32, max_frame_bytes: u32) -> std::io::Result<Vec<u8>> {
-    if n > max_frame_bytes {
-        return Err(frame_size_error(n, max_frame_bytes));
-    }
-    Ok(vec![0_u8; n as usize])
-}
-
-fn frame_size_error(n: u32, max_frame_bytes: u32) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!("frame size {n} exceeds max_frame_bytes {max_frame_bytes}; refusing to allocate"),
-    )
 }
 
 fn frame_read_timeout_error(frame_timeout: std::time::Duration) -> std::io::Error {
@@ -178,10 +160,18 @@ fn require_complete_frame_write(written: usize, expected: usize) -> std::io::Res
 /// frame length. This helper never continues a short write: it returns an error so the inbound task
 /// closes the stream. A short write may already have sent a prefix, but the connection close keeps
 /// it from being reused. `WouldBlock` is safe to retry because it writes no bytes.
-pub(super) async fn write_framed_tcp(stream: &TcpStream, payload: &[u8]) -> std::io::Result<()> {
+pub(super) async fn write_framed_tcp_checked<F>(
+    stream: &TcpStream,
+    payload: &[u8],
+    check: impl Fn() -> F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
     let frame = encode_frame(payload)?;
     loop {
         stream.writable().await?;
+        check().await?;
         match stream.try_write(&frame) {
             Ok(written) => return require_complete_frame_write(written, frame.len()),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -190,79 +180,65 @@ pub(super) async fn write_framed_tcp(stream: &TcpStream, payload: &[u8]) -> std:
     }
 }
 
-/// Write the handshake: node id, secret, then the semantics/incarnation flag.
-pub(super) async fn write_handshake<W: AsyncWriteExt + Unpin>(
-    stream: &mut W,
+/// Authenticate both peers before sending any status or Raft frame.
+pub(super) async fn write_handshake<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
     node_id: u64,
+    target_id: u64,
     secret: Option<&str>,
     epoch: Option<u128>,
     advertises_v2: bool,
-) -> std::io::Result<()> {
-    stream.write_all(&node_id.to_be_bytes()).await?;
-    let secret_bytes = secret.map(str::as_bytes).unwrap_or(&[]);
-    let len = secret_bytes.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    if !secret_bytes.is_empty() {
-        stream.write_all(secret_bytes).await?;
-    }
-    match (epoch, advertises_v2) {
-        (Some(e), false) => {
-            stream.write_all(&[1]).await?;
-            stream.write_all(&e.to_be_bytes()).await?;
-        }
-        (None, false) => stream.write_all(&[0]).await?,
-        (None, true) => stream.write_all(&[2]).await?,
-        (Some(e), true) => {
-            stream.write_all(&[3]).await?;
-            stream.write_all(&e.to_be_bytes()).await?;
-        }
-    }
-    Ok(())
+) -> std::io::Result<crate::auth::Peer> {
+    crate::auth::client(
+        stream,
+        crate::auth::Peer::new(node_id, epoch, advertises_v2),
+        target_id,
+        secret,
+        crate::auth::Listener::Raft,
+    )
+    .await
 }
 
-/// Read the inbound handshake and its V2-capability flag.
-pub(super) async fn read_handshake<R: AsyncReadExt + Unpin>(
-    stream: &mut R,
-) -> std::io::Result<(u64, Option<String>, Option<u128>, bool)> {
-    let mut hb = [0u8; 8];
-    stream.read_exact(&mut hb).await?;
-    let peer_id = u64::from_be_bytes(hb);
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let secret_len = u32::from_be_bytes(len_buf);
-    if secret_len > MAX_SECRET_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("handshake secret length {secret_len} too large"),
-        ));
-    }
-    let secret = if secret_len == 0 {
-        None
-    } else {
-        let mut buf = vec![0u8; secret_len as usize];
-        stream.read_exact(&mut buf).await?;
-        Some(String::from_utf8(buf).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("utf8: {e}"))
-        })?)
-    };
-    let mut flag = [0u8; 1];
-    stream.read_exact(&mut flag).await?;
-    let (epoch, advertises_v2) = match flag[0] {
-        0 => (None, false),
-        1 | 3 => {
-            let mut eb = [0u8; 16];
-            stream.read_exact(&mut eb).await?;
-            (Some(u128::from_be_bytes(eb)), flag[0] == 3)
-        }
-        2 => (None, true),
-        other => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("handshake incarnation flag {other} invalid"),
-            ));
-        }
-    };
-    Ok((peer_id, secret, epoch, advertises_v2))
+pub(super) async fn write_replica_handshake<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+>(
+    stream: &mut S,
+    local: ReplicaId,
+    target: u64,
+    secret: Option<&str>,
+    epoch: Option<u128>,
+    advertises_v2: bool,
+) -> std::io::Result<ReplicaId> {
+    let peer = crate::auth::client(
+        stream,
+        crate::auth::Peer::for_replica(local, epoch, advertises_v2),
+        target,
+        secret,
+        crate::auth::Listener::Raft,
+    )
+    .await?;
+    peer.replica().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Raft peer omitted its boot identity",
+        )
+    })
+}
+
+#[cfg(test)]
+pub(super) async fn read_handshake<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    node_id: u64,
+    secret: Option<&str>,
+) -> std::io::Result<(u64, Option<u128>, bool)> {
+    let peer = crate::auth::server(
+        stream,
+        crate::auth::Peer::for_replica(crate::raft::types::test_replica(node_id), None, true),
+        secret,
+        crate::auth::Listener::Raft,
+    )
+    .await?;
+    Ok((peer.id, peer.epoch, peer.supports_v2))
 }
 
 /// Allow blank peers to join, but fence two different concrete cluster incarnations.
@@ -288,18 +264,6 @@ pub(super) fn connection_requires_config_identity(
     enforcement_active && !advertised_identity
 }
 
-/// True when no secret is configured locally or the peer advertised the exact configured value.
-/// The comparison is constant-time in the secret contents (see [`crate::secret::secrets_equal`]).
-pub(super) fn secrets_match(local: Option<&str>, peer: Option<&str>) -> bool {
-    match (local, peer) {
-        (None, _) => true,
-        (Some(local), Some(peer)) => {
-            crate::secret::secrets_equal(local.as_bytes(), peer.as_bytes())
-        }
-        (Some(_), None) => false,
-    }
-}
-
 pub(super) async fn connect_with_handshake(
     address: &str,
     cfg: &Config,
@@ -307,14 +271,47 @@ pub(super) async fn connect_with_handshake(
     advertises_v2: bool,
     config_fingerprint: ClusterConfigFingerprint,
     config_identity_enforced: bool,
-) -> anyhow::Result<(TcpStream, bool)> {
+    local_replica: ReplicaId,
+) -> anyhow::Result<(TcpStream, bool, ReplicaId)> {
+    let (stream, response, remote_replica) = connect_with_preflight(
+        address,
+        cfg,
+        epoch,
+        advertises_v2,
+        config_fingerprint,
+        config_identity_enforced,
+        local_replica,
+    )
+    .await?;
+    Ok((
+        stream,
+        response.supports_config_identity_v1 && response.config_fingerprint.is_some(),
+        remote_replica,
+    ))
+}
+
+/// Negotiate capabilities on the authenticated stream that will carry the next RPC.
+pub(super) async fn connect_with_preflight(
+    address: &str,
+    cfg: &Config,
+    epoch: Option<u128>,
+    advertises_v2: bool,
+    config_fingerprint: ClusterConfigFingerprint,
+    config_identity_enforced: bool,
+    local_replica: ReplicaId,
+) -> anyhow::Result<(TcpStream, ClusterStatusResponse, ReplicaId)> {
     let io = async {
         let mut stream = connect_from_advertised(&cfg.raft_listen, address)
             .await
             .with_context(|| format!("raft connect {address}"))?;
-        write_handshake(
+        let remote_replica = write_replica_handshake(
             &mut stream,
-            cfg.node_id,
+            local_replica,
+            cfg.peers
+                .iter()
+                .find(|peer| peer.raft_address == address)
+                .ok_or_else(|| anyhow::anyhow!("Raft target is not configured"))?
+                .id,
             cfg.cluster_secret.as_deref(),
             epoch,
             advertises_v2,
@@ -322,21 +319,24 @@ pub(super) async fn connect_with_handshake(
         .await
         .context("raft handshake write")?;
 
-        // A framed status preflight is understood by both legacy and current receivers. Current
-        // peers exchange config identity before the first Raft frame; legacy responses omit it.
-        let request = serde_json::to_vec(&ClusterStatusRequest {
-            probe_from: cfg.node_id,
-            config_fingerprint: Some(config_fingerprint),
-            supports_cancellation_safe_rpc_v1: true,
-        })?;
+        // Preflight checks configuration identity before the connection can carry a Raft RPC.
+        let request = encode(
+            Operation::Status,
+            &ClusterStatusRequest {
+                probe_from: cfg.node_id,
+                config_fingerprint: Some(config_fingerprint),
+                supports_cancellation_safe_rpc_v1: true,
+            },
+        )?;
         anyhow::ensure!(
             request.len() as u64 <= u64::from(cfg.max_frame_bytes),
             "config preflight exceeds max_frame_bytes"
         );
         write_framed(&mut stream, &request).await?;
         let response = read_framed_bounded(&mut stream, STATUS_FRAME_MAX_BYTES).await?;
-        let response: ClusterStatusResponse =
-            serde_json::from_slice(&response).context("decode config preflight response")?;
+        let mut response: ClusterStatusResponse = decode_payload(&response, Operation::Status)
+            .context("decode config preflight response")?;
+        response.replica = Some(remote_replica);
         anyhow::ensure!(
             !response.reports_foreign_epoch(epoch),
             "cluster_epoch mismatch during config preflight"
@@ -353,42 +353,11 @@ pub(super) async fn connect_with_handshake(
                 .config_fingerprint
                 .map_or_else(|| "legacy/missing".to_owned(), |value| value.to_string())
         );
-        let advertises_config_identity =
-            response.supports_config_identity_v1 && response.config_fingerprint.is_some();
-        Ok((stream, advertises_config_identity))
+        Ok((stream, response, remote_replica))
     };
     tokio::time::timeout(OUTBOUND_PREFLIGHT_TIMEOUT, io)
         .await
         .map_err(|_| anyhow::anyhow!("raft config preflight to {address} timed out"))?
-}
-
-/// Reopen a peer that a completed status exchange already identified as legacy. This is allowed
-/// only while configuration identity enforcement is inactive; the caller re-checks that state
-/// after this bounded connect and before installing the stream.
-pub(super) async fn connect_with_legacy_handshake(
-    address: &str,
-    cfg: &Config,
-    epoch: Option<u128>,
-    advertises_v2: bool,
-) -> anyhow::Result<TcpStream> {
-    let io = async {
-        let mut stream = connect_from_advertised(&cfg.raft_listen, address)
-            .await
-            .with_context(|| format!("raft connect {address}"))?;
-        write_handshake(
-            &mut stream,
-            cfg.node_id,
-            cfg.cluster_secret.as_deref(),
-            epoch,
-            advertises_v2,
-        )
-        .await
-        .context("raft handshake write")?;
-        Ok::<_, anyhow::Error>(stream)
-    };
-    tokio::time::timeout(OUTBOUND_PREFLIGHT_TIMEOUT, io)
-        .await
-        .map_err(|_| anyhow::anyhow!("raft legacy reconnect to {address} timed out"))?
 }
 
 #[cfg(test)]
@@ -400,6 +369,25 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncWrite;
     use tokio::net::TcpListener;
+
+    #[tokio::test(start_paused = true)]
+    async fn handshake_capture_never_discloses_cluster_secret() {
+        let secret = "capture-regression-secret-0123456789";
+        let (mut capture, mut remote) = tokio::io::duplex(512);
+        let exchange = write_handshake(&mut capture, 42, 2, Some(secret), None, true);
+        let sniff = async {
+            let mut bytes = vec![0; 77];
+            remote.read_exact(&mut bytes).await.unwrap();
+            bytes
+        };
+        let (_, capture) = tokio::join!(exchange, sniff);
+        assert!(
+            !capture
+                .windows(secret.len())
+                .any(|bytes| bytes == secret.as_bytes()),
+            "captured handshake disclosed the configured cluster secret"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingWriter {
@@ -463,6 +451,7 @@ mod tests {
             },
             raft: RaftTuneConfig::default(),
             cluster_secret: Some("wire-test-secret".into()),
+            cluster_secret_file: None,
             max_frame_bytes: 64 * 1024,
             submit_timeout_ms: DEFAULT_SUBMIT_TIMEOUT_MS,
             address_protocol: crate::config::DEFAULT_VIP_ADDRESS_PROTOCOL,
@@ -485,15 +474,21 @@ mod tests {
         // Lifetime: answers exactly one handshake preflight and is joined before return.
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            read_handshake(&mut stream).await.unwrap();
+            read_handshake(&mut stream, 2, Some("wire-test-secret"))
+                .await
+                .unwrap();
             let request = read_framed_bounded(&mut stream, 64 * 1024).await.unwrap();
-            let request: ClusterStatusRequest = serde_json::from_slice(&request).unwrap();
+            let request: ClusterStatusRequest =
+                decode_payload(&request, Operation::Status).unwrap();
             assert_eq!(request.config_fingerprint, Some(local_fingerprint));
-            let response = serde_json::to_vec(&ClusterStatusResponse {
-                config_fingerprint: response_fingerprint,
-                supports_config_identity_v1: response_fingerprint.is_some(),
-                ..ClusterStatusResponse::default()
-            })
+            let response = encode(
+                Operation::Status,
+                &ClusterStatusResponse {
+                    config_fingerprint: response_fingerprint,
+                    supports_config_identity_v1: response_fingerprint.is_some(),
+                    ..ClusterStatusResponse::default()
+                },
+            )
             .unwrap();
             stream
                 .write_all(&(response.len() as u32).to_be_bytes())
@@ -509,24 +504,12 @@ mod tests {
             true,
             local_fingerprint,
             enforcement_active,
+            crate::raft::types::test_replica(1),
         )
         .await
-        .map(|(_, advertised)| advertised);
+        .map(|(_, advertised, _)| advertised);
         server.await.unwrap();
         result
-    }
-
-    #[test]
-    fn secrets_match_no_local_accepts_anything() {
-        assert!(secrets_match(None, None));
-        assert!(secrets_match(None, Some("anything")));
-    }
-
-    #[test]
-    fn secrets_match_requires_exact_match_when_set() {
-        assert!(secrets_match(Some("alpha"), Some("alpha")));
-        assert!(!secrets_match(Some("alpha"), Some("beta")));
-        assert!(!secrets_match(Some("alpha"), None));
     }
 
     #[test]
@@ -539,57 +522,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_roundtrips_id_secret_epoch_and_semantics() {
-        for (secret, epoch, advertises_v2) in [
-            (None, None, false),
-            (Some("s3cr3t"), None, true),
-            (
-                None,
-                Some(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10_u128),
-                false,
-            ),
-            (Some("s3cr3t"), Some(u128::MAX), true),
-        ] {
-            let mut buf = Vec::new();
-            write_handshake(&mut buf, 42, secret, epoch, advertises_v2)
-                .await
-                .unwrap();
-            let (id, got_secret, got_epoch, got_v2) =
-                read_handshake(&mut std::io::Cursor::new(buf))
-                    .await
-                    .unwrap();
-            assert_eq!(id, 42);
-            assert_eq!(got_secret.as_deref(), secret);
-            assert_eq!(got_epoch, epoch);
-            assert_eq!(got_v2, advertises_v2);
+    async fn handshake_roundtrips_id_epoch_and_semantics() {
+        for epoch in [None, Some(u128::MAX)] {
+            for supports in [false, true] {
+                let (mut a, mut b) = tokio::io::duplex(512);
+                let (sent, received) = tokio::join!(
+                    write_handshake(&mut a, 42, 2, Some("test-key"), epoch, supports),
+                    read_handshake(&mut b, 2, Some("test-key"))
+                );
+                sent.unwrap();
+                assert_eq!(received.unwrap(), (42, epoch, supports));
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn handshake_rejects_oversize_secret_invalid_utf8_and_unknown_flag() {
-        let mut oversize = 42_u64.to_be_bytes().to_vec();
-        oversize.extend_from_slice(&(MAX_SECRET_BYTES + 1).to_be_bytes());
-        let error = read_handshake(&mut std::io::Cursor::new(oversize))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-
-        let mut invalid_utf8 = 42_u64.to_be_bytes().to_vec();
-        invalid_utf8.extend_from_slice(&1_u32.to_be_bytes());
-        invalid_utf8.push(0xff);
-        invalid_utf8.push(0);
-        let error = read_handshake(&mut std::io::Cursor::new(invalid_utf8))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-
-        let mut unknown_flag = 42_u64.to_be_bytes().to_vec();
-        unknown_flag.extend_from_slice(&0_u32.to_be_bytes());
-        unknown_flag.push(4);
-        let error = read_handshake(&mut std::io::Cursor::new(unknown_flag))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
@@ -716,7 +660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_legacy_reconnect_needs_only_the_authenticated_handshake() {
+    async fn reconnect_rejects_a_peer_without_an_exact_boot() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let cfg = Config {
@@ -744,6 +688,7 @@ mod tests {
             },
             raft: RaftTuneConfig::default(),
             cluster_secret: Some("wire-test-secret".into()),
+            cluster_secret_file: None,
             max_frame_bytes: 64 * 1024,
             submit_timeout_ms: DEFAULT_SUBMIT_TIMEOUT_MS,
             address_protocol: crate::config::DEFAULT_VIP_ADDRESS_PROTOCOL,
@@ -756,18 +701,41 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let handshake = read_handshake(&mut stream).await.unwrap();
-            assert_eq!(handshake.0, 1);
+            let handshake = crate::auth::server(
+                &mut stream,
+                crate::auth::Peer::new(2, None, true),
+                Some("wire-test-secret"),
+                crate::auth::Listener::Raft,
+            )
+            .await
+            .unwrap();
+            assert_eq!(handshake.id, 1);
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
 
-        tokio::time::timeout(
+        let error = tokio::time::timeout(
             Duration::from_millis(250),
-            connect_with_legacy_handshake(&address.to_string(), &cfg, Some(7), false),
+            connect_with_handshake(
+                &address.to_string(),
+                &cfg,
+                Some(7),
+                false,
+                cfg.cluster_config_fingerprint().unwrap(),
+                false,
+                ReplicaId {
+                    physical_id: 1,
+                    boot_nonce: [1; 32],
+                },
+            ),
         )
         .await
-        .expect("known legacy reconnect must not wait for a status response")
-        .unwrap();
+        .expect("bootless peer must fail before the status exchange")
+        .unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("boot identity"))
+        );
         server.abort();
         let _ = server.await;
     }
@@ -812,11 +780,46 @@ mod tests {
         let (mut server, _) = listener.accept().await.unwrap();
         let client = client.await.unwrap();
 
-        write_framed_tcp(&client, b"\"Success\"").await.unwrap();
+        write_framed_tcp_checked(&client, b"\"Success\"", || async { Ok(()) })
+            .await
+            .unwrap();
 
         assert_eq!(
             read_framed_bounded(&mut server, 1024).await.unwrap(),
             b"\"Success\""
+        );
+    }
+
+    #[tokio::test]
+    async fn single_tcp_writer_rechecks_authorization_after_waiting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let allowed = tokio::sync::RwLock::new(true);
+        let mut writer = allowed.write().await;
+        let send = write_framed_tcp_checked(&client, b"response", || async {
+            if *allowed.read().await {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "revoked",
+                ))
+            }
+        });
+        tokio::pin!(send);
+        assert!(futures::poll!(&mut send).is_pending());
+        *writer = false;
+        drop(writer);
+        assert_eq!(
+            send.await.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            server.try_read(&mut [0; 16]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
         );
     }
 

@@ -7,8 +7,8 @@ It does not attempt to enumerate Debian or other OS packages pulled in by contai
 installation paths; its scope is the Rust/Cargo dependency graph for this repository.
 
 - Scope: `cargo metadata --format-version 1 --locked`
-- Non-root crates observed: `190`
-- Distinct third-party license expressions observed: `13`
+- Non-root crates observed: `192`
+- Distinct third-party license expressions observed: `14`
 
 Every third-party crate in the current lockfile is usable under a permissive license. The only
 crate carrying a copyleft option does so inside an OR expression (`MIT OR Apache-2.0 OR
@@ -22,6 +22,17 @@ The authoritative policy for future changes lives in `deny.toml` and is enforced
 The project itself is licensed separately under `AGPL-3.0-only` for open-source/community usage,
 with a commercial licensing path available from `croit.io`.
 
+## Bundled License Notices
+
+The BSD-3-Clause exception in `deny.toml` applies only to `subtle` version
+`2.6.1`. Its full, unmodified copyright notices, conditions and disclaimer
+are in [LICENSES/subtle-2.6.1.txt](LICENSES/subtle-2.6.1.txt), copied from
+that crate's `LICENSE` file. Public source exports retain this file;
+Debian and RPM packages and runtime Docker images install it at
+`/usr/share/doc/keepafloatd/licenses/subtle-2.6.1.txt`.
+Release downloads include the notice beside the standalone binaries:
+GitHub attaches the file, and GitLab links to the exact release commit.
+
 ## Observed License Expressions
 
 - `(MIT OR Apache-2.0) AND Unicode-3.0`
@@ -30,6 +41,7 @@ with a commercial licensing path available from `croit.io`.
 - `Apache-2.0 OR MIT`
 - `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`
 - `BSD-2-Clause OR Apache-2.0 OR MIT`
+- `BSD-3-Clause`
 - `MIT`
 - `MIT OR Apache-2.0`
 - `MIT OR Apache-2.0 OR LGPL-2.1-or-later`
@@ -73,6 +85,10 @@ with a commercial licensing path available from `croit.io`.
 
 - `zerocopy` `0.8.48`
 - `zerocopy-derive` `0.8.48`
+
+### `BSD-3-Clause`
+
+- `subtle` `2.6.1`
 
 ### `MIT`
 
@@ -172,6 +188,7 @@ with a commercial licensing path available from `croit.io`.
 - `hashbrown` `0.12.3`
 - `hashbrown` `0.17.0`
 - `heck` `0.5.0`
+- `hmac` `0.12.1`
 - `iana-time-zone` `0.1.65`
 - `iana-time-zone-haiku` `0.1.2`
 - `is_terminal_polyfill` `1.70.2`

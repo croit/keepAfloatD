@@ -1,0 +1,8 @@
+# Dual-stack bridge for the IPv6 announcement scenario only.
+networks:
+  test-net:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.50.0.0/24
+        - subnet: 2001:db8:50::/64

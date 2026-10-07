@@ -18,6 +18,8 @@ fi
 down="${NODE_IPS[2]}"
 evid "restarting majority: ${NODE_IPS[0]} ${NODE_IPS[1]} (keeping ${down} down)"
 kafd_start "${NODE_IPS[0]}"; kafd_start "${NODE_IPS[1]}"
+check "cold majority completes activation without overlapping VIPs" \
+  wait_for_startup_activation 30 "${NODE_IPS[0]}" "${NODE_IPS[1]}"
 
 check "majority reforms with a leader" wait_until 90 single_agreed_leader
 check "cold-start majority redistributes VIPs across both live voters" \

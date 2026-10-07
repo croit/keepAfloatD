@@ -5,7 +5,8 @@ SCENARIO_NAME=D6_leader_kill
 source "$(dirname "$0")/../scenario.sh"
 scenario_start "leader kill triggers re-election; VIPs remain correctly held"
 
-old_leader_id="$(leader_seen_by "${NODE_IPS[0]}")"
+old_leader_replica="$(leader_seen_by "${NODE_IPS[0]}")"
+old_leader_id="$(replica_physical_id "$old_leader_replica")"
 evid "current leader raft id: ${old_leader_id}"
 # Map raft id -> node ip.
 leader_ip=""
@@ -36,7 +37,8 @@ survivors_agree_on_new_leader() {
   local s lid agreed=""
   for s in $(nodes_except "${leader_ip}"); do
     lid="$(leader_seen_by_since "${s}" "${fault_since}")"
-    [[ -n "${lid}" && "${lid}" != "${old_leader_id}" ]] || return 1
+    replica_is_configured "$lid" || return 1
+    [[ "$lid" != "$old_leader_replica" && "$(replica_physical_id "$lid")" != "$old_leader_id" ]] || return 1
     [[ -z "${agreed}" || "${agreed}" == "${lid}" ]] || return 1
     agreed="${lid}"
   done
@@ -66,6 +68,8 @@ fi
 kafd_start "${leader_ip}"
 check "old leader remains active after restart" \
   wait_until 30 holds_for 5 node_active "${leader_ip}"
+check "old leader completes activation without overlapping VIPs" \
+  wait_for_startup_activation 30 "${leader_ip}"
 check "leader restart never double-binds a VIP" \
   holds_for 20 no_vip_is_duplicate
 check "rejoined cluster sustains daemon, leader, ownership, and reachability invariants" \

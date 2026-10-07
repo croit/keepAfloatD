@@ -10,7 +10,7 @@ export ROOT_DIR
 # All nodes run nopreempt. Nodes a/b configure failback_delay_secs=1 and stale_secs=10 while c
 # configures 99 and 11. The delay is ignored under nopreempt, and a three-second probe interval
 # converts both stale values to three missed rounds, so all effective identities must match.
-wait_for_steady_state
+wait_for_startup_state
 assert_unique_holders
 
 for node in "${NODES[@]}"; do

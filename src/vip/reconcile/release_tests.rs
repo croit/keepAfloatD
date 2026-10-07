@@ -1,6 +1,113 @@
 use super::*;
+use openraft::async_runtime::WatchReceiver;
+use std::sync::atomic::Ordering;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
+async fn failed_bind_closes_the_local_health_gate() {
+    for failure in ["exit", "spawn", "timeout", "marker", "reassert"] {
+        assert_bind_fault(failure).await;
+    }
+}
+
+async fn assert_bind_fault(failure: &str) {
+    use std::os::unix::process::ExitStatusExt;
+    let _lock = LOCK.lock().await;
+    let (cfg, raft, network, state, mut controls) = cluster().await;
+    let table = Arc::new(cfg.sorted_vips());
+    let addr = table[0].0.addr;
+    let (bound_vip, bound_iface) = table[0].clone();
+    publish_probe(&controls, &network, true).await;
+    let local = LocalVip::new(false);
+    if failure == "reassert" {
+        let (completed, announcement) = tokio::sync::oneshot::channel();
+        *local.next_announcement.lock().await = Some(announcement);
+        completed.send(()).unwrap();
+        local
+            .force_next_bind_result(
+                (&table[0].1, addr, table[0].0.prefix),
+                Ok(std::process::ExitStatus::from_raw(0)),
+            )
+            .await;
+        local
+            .bind(&table[0].1, addr, table[0].0.prefix)
+            .await
+            .unwrap();
+        local
+            .force_unbind_results(
+                (&table[0].1, addr, table[0].0.prefix),
+                vec![Ok(std::process::ExitStatus::from_raw(0))],
+            )
+            .await;
+    }
+    match failure {
+        "marker" => {
+            local
+                .force_bind_results(
+                    (&table[0].1, addr, table[0].0.prefix),
+                    vec![Ok(std::process::ExitStatus::from_raw(1 << 8))],
+                )
+                .await
+        }
+        "spawn" | "timeout" => {
+            let kind = if failure == "spawn" {
+                std::io::ErrorKind::NotFound
+            } else {
+                std::io::ErrorKind::TimedOut
+            };
+            local
+                .force_next_bind_result(
+                    (&table[0].1, addr, table[0].0.prefix),
+                    Err(std::io::Error::new(kind, "bind unavailable")),
+                )
+                .await;
+        }
+        _ => {
+            local
+                .force_next_bind_result(
+                    (&table[0].1, addr, table[0].0.prefix),
+                    Ok(std::process::ExitStatus::from_raw(1 << 8)),
+                )
+                .await
+        }
+    }
+    let healthy = Arc::new(LocalHealth::new(true));
+    let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
+    freshness.record_success(tokio::time::Instant::now());
+    let mut reconcile = Box::pin(run_reconcile_loop(
+        cfg,
+        raft.clone(),
+        state,
+        local.clone(),
+        table,
+        healthy.clone(),
+        freshness,
+        1,
+    ));
+    tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        loop {
+            assert!(futures::poll!(reconcile.as_mut()).is_pending());
+            if local.bind_starts.lock().await.contains_key(&addr)
+                && local.remaining_bind_results((&bound_iface, addr, bound_vip.prefix)) == 0
+            {
+                break;
+            }
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let faulted = !healthy.is_healthy();
+    drop(reconcile);
+    controls.shutdown().await.unwrap();
+    network.shutdown().await.unwrap();
+    raft.shutdown().await.unwrap();
+    assert!(
+        faulted,
+        "{failure}: failed VIP binding must make the holder unhealthy"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn failed_selective_cleanup_stays_tracked_until_global_fencing_retries_it() {
     use std::os::unix::process::ExitStatusExt;
     let _lock = LOCK.lock().await;
@@ -19,18 +126,21 @@ async fn failed_selective_cleanup_stays_tracked_until_global_fencing_retries_it(
     );
     let local = LocalVip::new(false);
     local
-        .force_next_bind_result(Ok(std::process::ExitStatus::from_raw(0)))
+        .force_next_bind_result(("lo", addr, 128), Ok(std::process::ExitStatus::from_raw(0)))
         .await;
     local
-        .force_unbind_results(vec![
-            Err(std::io::Error::other("delete unavailable")),
-            Err(std::io::Error::other("delete unavailable")),
-            Err(std::io::Error::other("delete unavailable")),
-            Ok(std::process::ExitStatus::from_raw(0)),
-        ])
+        .force_unbind_results(
+            ("lo", addr, 128),
+            vec![
+                Err(std::io::Error::other("delete unavailable")),
+                Err(std::io::Error::other("delete unavailable")),
+                Err(std::io::Error::other("delete unavailable")),
+                Ok(std::process::ExitStatus::from_raw(0)),
+            ],
+        )
         .await;
     local
-        .force_marker_delete_results(vec![Ok(std::process::ExitStatus::from_raw(0))])
+        .force_marker_delete_results(addr, vec![Ok(std::process::ExitStatus::from_raw(0))])
         .await;
     let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
     freshness.record_success(tokio::time::Instant::now());
@@ -40,14 +150,14 @@ async fn failed_selective_cleanup_stays_tracked_until_global_fencing_retries_it(
         state.clone(),
         local.clone(),
         table,
-        Arc::new(AtomicBool::new(true)),
+        Arc::new(LocalHealth::new(true)),
         freshness.clone(),
         1,
     ));
     tokio::time::timeout(std::time::Duration::from_millis(100), async {
         while !local.is_confirmed_bound(addr).await {
             assert!(futures::poll!(reconcile.as_mut()).is_pending());
-            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
@@ -79,7 +189,7 @@ async fn failed_selective_cleanup_stays_tracked_until_global_fencing_retries_it(
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn global_fencing_still_cleans_every_vip_after_selective_revocation() {
     let _lock = LOCK.lock().await;
     for fence in ["invalidated", "coalesced", "unhealthy", "expired"] {
@@ -106,7 +216,7 @@ async fn global_fencing_still_cleans_every_vip_after_selective_revocation() {
         let local = LocalVip::new(true);
         let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
         freshness.record_success(tokio::time::Instant::now());
-        let healthy = Arc::new(AtomicBool::new(true));
+        let healthy = Arc::new(LocalHealth::new(true));
         let mut reconcile = Box::pin(run_reconcile_loop(
             cfg,
             raft.clone(),
@@ -120,7 +230,7 @@ async fn global_fencing_still_cleans_every_vip_after_selective_revocation() {
         tokio::time::timeout(std::time::Duration::from_millis(100), async {
             while local.bound_addrs().await.len() != 2 {
                 assert!(futures::poll!(reconcile.as_mut()).is_pending());
-                tokio::task::yield_now().await;
+                tokio::time::advance(std::time::Duration::from_millis(1)).await;
             }
         })
         .await
@@ -139,11 +249,11 @@ async fn global_fencing_still_cleans_every_vip_after_selective_revocation() {
 
         match fence {
             "expired" => {
-                tokio::time::pause();
                 tokio::time::advance(std::time::Duration::from_secs(1)).await;
             }
             "unhealthy" => {
-                healthy.store(false, Ordering::SeqCst);
+                healthy.observe_probe(false);
+                tokio::time::advance(std::time::Duration::from_nanos(1)).await;
                 freshness.record_success(tokio::time::Instant::now());
             }
             _ => {
@@ -155,9 +265,6 @@ async fn global_fencing_still_cleans_every_vip_after_selective_revocation() {
         }
         assert!(futures::poll!(reconcile.as_mut()).is_pending());
         let fenced = local.bound_addrs().await.is_empty();
-        if fence == "expired" {
-            tokio::time::resume();
-        }
         drop(reconcile);
         drop(block_rebind);
         controls.shutdown().await.unwrap();
@@ -167,7 +274,7 @@ async fn global_fencing_still_cleans_every_vip_after_selective_revocation() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn new_revocations_during_cleanup_are_not_lost() {
     let _lock = LOCK.lock().await;
     let (cfg, raft, network, state, mut controls) = cluster().await;
@@ -205,14 +312,14 @@ async fn new_revocations_during_cleanup_are_not_lost() {
         state.clone(),
         local.clone(),
         Arc::new(table),
-        Arc::new(AtomicBool::new(true)),
+        Arc::new(LocalHealth::new(true)),
         freshness.clone(),
         1,
     ));
     tokio::time::timeout(std::time::Duration::from_millis(100), async {
         while local.bound_addrs().await.len() != 3 {
             assert!(futures::poll!(reconcile.as_mut()).is_pending());
-            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
@@ -235,6 +342,7 @@ async fn new_revocations_during_cleanup_are_not_lost() {
         .get_mut(&middle)
         .unwrap()
         .holder = 2;
+    tokio::time::advance(std::time::Duration::from_nanos(1)).await;
     freshness.record_success(tokio::time::Instant::now());
     assert!(futures::poll!(reconcile.as_mut()).is_pending());
     drop(block_cleanup);
@@ -254,7 +362,7 @@ async fn new_revocations_during_cleanup_are_not_lost() {
 
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
     use std::os::unix::process::ExitStatusExt;
     let _lock = LOCK.lock().await;
@@ -268,6 +376,7 @@ async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
         "lo".into(),
     ));
     let first = table[0].0.addr;
+    let (bound_vip, bound_iface) = table[0].clone();
     {
         let mut state = state.write().await;
         for (vip, _) in &table {
@@ -285,23 +394,28 @@ async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
     }
     let local = LocalVip::new(false);
     local
-        .force_next_bind_result(Err(std::io::Error::other(
-            "address result lost after syscall",
-        )))
+        .force_next_bind_result(
+            (&table[0].1, first, table[0].0.prefix),
+            Err(std::io::Error::other("address result lost after syscall")),
+        )
         .await;
     local
-        .force_next_bind_presence_result(Err(std::io::Error::other(
-            "absence cannot be established",
-        )))
+        .force_next_bind_presence_result(
+            first,
+            Err(std::io::Error::other("absence cannot be established")),
+        )
         .await;
     local
-        .force_unbind_results(vec![Ok(std::process::ExitStatus::from_raw(0))])
+        .force_unbind_results(
+            (&table[0].1, first, table[0].0.prefix),
+            vec![Ok(std::process::ExitStatus::from_raw(0))],
+        )
         .await;
     local
-        .force_marker_delete_results(vec![Ok(std::process::ExitStatus::from_raw(0))])
+        .force_marker_delete_results(first, vec![Ok(std::process::ExitStatus::from_raw(0))])
         .await;
     // Pause the first address result after bound/pending tracking and marker installation.
-    let first_result = local.next_bind_result.lock().await;
+    let first_result = local.pause_bind_result((&table[0].1, first, table[0].0.prefix));
     let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
     freshness.record_success(tokio::time::Instant::now());
     let mut reconcile = Box::pin(run_reconcile_loop(
@@ -310,7 +424,7 @@ async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
         state.clone(),
         local.clone(),
         Arc::new(table),
-        Arc::new(AtomicBool::new(true)),
+        Arc::new(LocalHealth::new(true)),
         freshness.clone(),
         1,
     ));
@@ -320,7 +434,7 @@ async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
             if local.bound_addrs().await.contains(&first) {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
@@ -330,7 +444,7 @@ async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
     drop(first_result);
     assert!(futures::poll!(reconcile.as_mut()).is_pending());
     assert!(
-        local.next_bind_result.lock().await.is_none(),
+        local.remaining_bind_results((&bound_iface, first, bound_vip.prefix)) == 0,
         "the first failed address result was consumed"
     );
     assert!(
@@ -360,7 +474,7 @@ async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn revoked_retained_tail_is_cleaned_during_an_unchanged_slow_prefix_effect() {
     let _lock = LOCK.lock().await;
     let (cfg, raft, network, state, mut controls) = cluster().await;
@@ -400,13 +514,13 @@ async fn revoked_retained_tail_is_cleaned_during_an_unchanged_slow_prefix_effect
         state.clone(),
         local.clone(),
         Arc::new(table),
-        Arc::new(AtomicBool::new(true)),
+        Arc::new(LocalHealth::new(true)),
         freshness.clone(),
         1,
     ));
     tokio::time::timeout(std::time::Duration::from_millis(100), async {
         while local.bind_completions.lock().await.len() < 3 {
-            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
@@ -431,7 +545,7 @@ async fn revoked_retained_tail_is_cleaned_during_an_unchanged_slow_prefix_effect
             if started > completed {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
@@ -446,7 +560,7 @@ async fn revoked_retained_tail_is_cleaned_during_an_unchanged_slow_prefix_effect
     freshness.record_success(tokio::time::Instant::now());
     let tail_cleaned = tokio::time::timeout(std::time::Duration::from_millis(100), async {
         while local.bound_addrs().await.contains(&tail) {
-            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
@@ -467,7 +581,7 @@ async fn revoked_retained_tail_is_cleaned_during_an_unchanged_slow_prefix_effect
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn revoked_in_flight_bind_is_cleaned_before_advancing_to_another_vip() {
     let _lock = LOCK.lock().await;
     let (cfg, raft, network, state, mut controls) = cluster().await;
@@ -508,13 +622,13 @@ async fn revoked_in_flight_bind_is_cleaned_before_advancing_to_another_vip() {
         state.clone(),
         local.clone(),
         Arc::new(table),
-        Arc::new(AtomicBool::new(true)),
+        Arc::new(LocalHealth::new(true)),
         freshness.clone(),
         1,
     ));
     tokio::time::timeout(std::time::Duration::from_millis(100), async {
         while !local.bound_addrs().await.contains(&first) {
-            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
         }
     })
     .await
@@ -551,12 +665,11 @@ async fn revoked_in_flight_bind_is_cleaned_before_advancing_to_another_vip() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stable_renewals_preserve_slow_effects_and_reach_every_vip() {
     let _lock = LOCK.lock().await;
     for delay_ms in [15, 40] {
-        let (cfg, raft, network, state, mut controls) = cluster().await;
-        let mut cfg = (*cfg).clone();
+        let mut cfg = (*cluster_config()).clone();
         cfg.vips = (1..=3)
             .map(|last| {
                 let mut vip = cfg.vips[0].clone();
@@ -567,7 +680,7 @@ async fn stable_renewals_preserve_slow_effects_and_reach_every_vip() {
                 vip
             })
             .collect();
-        let cfg = Arc::new(cfg);
+        let (cfg, raft, network, state, mut controls) = cluster_from_config(Arc::new(cfg)).await;
         let table = Arc::new(cfg.sorted_vips());
         {
             let mut state = state.write().await;
@@ -599,7 +712,7 @@ async fn stable_renewals_preserve_slow_effects_and_reach_every_vip() {
             state.clone(),
             local.clone(),
             table.clone(),
-            Arc::new(AtomicBool::new(true)),
+            Arc::new(LocalHealth::new(true)),
             freshness.clone(),
             1,
         ));
@@ -647,6 +760,7 @@ fn cluster_config() -> Arc<Config> {
          peers:\n  - id: 1\n    raft_address: '127.0.0.1:0'\n    client_submit_address: '127.0.0.1:0'\n\
          vips:\n  - address: 192.0.2.99\n    interface: lo\n\
          health:\n  command: [/bin/true]\n  interval_ms: 1000\n  timeout_ms: 500\n\
+         cluster_secret: release-fixture-key-0123456789abcdef\n\
          dry_run: true\n"
     ).unwrap();
     Arc::new(cfg)
@@ -662,6 +776,30 @@ async fn cluster() -> (
     cluster_from_config(cluster_config()).await
 }
 
+async fn publish_probe(
+    controls: &crate::raft::RaftControlTasks,
+    network: &crate::raft::RaftNetworkImpl,
+    healthy: bool,
+) -> openraft::alias::LogIdOf<crate::raft::types::TypeConfig> {
+    let runtime = controls.runtime();
+    let deadline = runtime.current().unwrap().check().unwrap();
+    // Renewal must start after the previous challenge even with a paused clock.
+    tokio::time::advance(std::time::Duration::from_nanos(1)).await;
+    let mut probe = Box::pin(runtime.submit_health(network, healthy));
+    loop {
+        if let std::task::Poll::Ready(result) = futures::poll!(probe.as_mut()) {
+            return result
+                .expect("real probe progress must commit and renew admission")
+                .1;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "probe outlived admission"
+        );
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+    }
+}
+
 async fn cluster_from_config(
     cfg: Arc<Config>,
 ) -> (
@@ -672,36 +810,77 @@ async fn cluster_from_config(
     crate::raft::RaftControlTasks,
 ) {
     let table = Arc::new(cfg.sorted_vips());
+    let timing = crate::runtime_permission::LeaseTiming::for_config(&cfg, table.len()).unwrap();
     let (raft, network, state, _, _, controls) =
-        crate::raft::start_raft(cfg.clone(), table).await.unwrap();
+        crate::raft::start_raft(cfg.clone(), table, Default::default())
+            .await
+            .unwrap();
+    let local_replica = raft.metrics().borrow_watched().id;
+    let runtime = controls.runtime();
+    assert_eq!(runtime.local_replica(), local_replica);
+    assert!(runtime.current().is_none());
+    assert!(!raft.is_initialized().await.unwrap());
+    tokio::time::advance(timing.restart_quarantine()).await;
+    raft.wait(Some(std::time::Duration::from_secs(2)))
+        .current_leader(local_replica, "single-node leader after quarantine")
+        .await
+        .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while raft.current_leader().await != Some(1) {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let mut metrics = raft.metrics();
+        loop {
+            let _ = metrics.borrow_watched();
+            if state.read().await.genesis.is_some() {
+                break;
+            }
+            metrics.changed().await.unwrap();
         }
     })
     .await
     .unwrap();
+    let activation_limit = timing
+        .vip_activation_deadline(tokio::time::Instant::now())
+        .unwrap();
+    while !runtime.vip_activation_ready().await {
+        assert!(tokio::time::Instant::now() < activation_limit);
+        publish_probe(&controls, &network, true).await;
+        tokio::time::advance(timing.consumer_use() / 4).await;
+    }
+    let applied = publish_probe(&controls, &network, true).await;
+    {
+        let session = runtime.current().expect("real admission remains active");
+        let state = state.read().await;
+        assert_eq!(state.genesis.as_ref(), Some(&session.context().genesis));
+        assert_eq!(
+            state
+                .last_membership
+                .membership()
+                .voter_ids()
+                .collect::<Vec<_>>(),
+            [local_replica]
+        );
+        assert!(state.last_applied_log.unwrap().index >= applied.index);
+        let progress = &state.applied_progress[&cfg.node_id];
+        assert_eq!(progress.log_id, applied);
+        assert_eq!(progress.request.replica, local_replica);
+        assert_eq!(progress.request.healthy, Some(true));
+        assert_eq!(state.node_health.get(&cfg.node_id), Some(&true));
+    }
     (cfg, raft, network, state, controls)
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cluster_starts_with_a_competing_listener() {
     let cfg = cluster_config();
     let competing_listener = std::net::TcpListener::bind(&cfg.raft_listen).unwrap();
     let (_, raft, network, _, mut controls) = cluster_from_config(cfg).await;
-    raft.client_write(KafRequest::HealthUpdate {
-        node_id: 1,
-        healthy: true,
-    })
-    .await
-    .unwrap();
+    publish_probe(&controls, &network, true).await;
     controls.shutdown().await.unwrap();
     network.shutdown().await.unwrap();
     raft.shutdown().await.unwrap();
     drop(competing_listener);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn successful_release_does_not_create_a_health_proof() {
     let _lock = LOCK.lock().await;
     let (cfg, raft, network, _, mut controls) = cluster().await;
@@ -731,25 +910,15 @@ async fn successful_release_does_not_create_a_health_proof() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn same_holder_recovery_cleans_up_acknowledges_and_rebinds() {
     let _lock = LOCK.lock().await;
     let (cfg, raft, network, state, mut controls) = cluster().await;
     for healthy in [true, false] {
-        raft.client_write(KafRequest::HealthUpdate {
-            node_id: 1,
-            healthy,
-        })
-        .await
-        .unwrap();
+        publish_probe(&controls, &network, healthy).await;
     }
     for _ in 0..cfg.effective_failback_delay_ticks() + 2 {
-        raft.client_write(KafRequest::HealthUpdate {
-            node_id: 1,
-            healthy: true,
-        })
-        .await
-        .unwrap();
+        publish_probe(&controls, &network, true).await;
     }
     let vip = cfg.sorted_vips()[0].0.addr;
     {
@@ -768,7 +937,7 @@ async fn same_holder_recovery_cleans_up_acknowledges_and_rebinds() {
         state.clone(),
         local.clone(),
         Arc::new(cfg.sorted_vips()),
-        Arc::new(AtomicBool::new(true)),
+        Arc::new(LocalHealth::new(true)),
         freshness,
         1,
     ));
@@ -779,7 +948,7 @@ async fn same_holder_recovery_cleans_up_acknowledges_and_rebinds() {
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
         }
     })
     .await;
@@ -798,7 +967,7 @@ async fn same_holder_recovery_cleans_up_acknowledges_and_rebinds() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn missing_health_proof_still_withdraws_and_commits_release_acknowledgements() {
     let _lock = LOCK.lock().await;
     let (cfg, raft, network, state, mut controls) = cluster().await;
@@ -822,7 +991,7 @@ async fn missing_health_proof_still_withdraws_and_commits_release_acknowledgemen
         state.clone(),
         local.clone(),
         Arc::new(cfg.sorted_vips()),
-        Arc::new(AtomicBool::new(false)),
+        Arc::new(LocalHealth::new(false)),
         freshness.clone(),
         1,
     ));
@@ -850,7 +1019,7 @@ async fn missing_health_proof_still_withdraws_and_commits_release_acknowledgemen
     assert!(!freshness.is_fresh());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn repeated_proof_renewals_do_not_restart_the_pending_takeover_delay() {
     let _lock = LOCK.lock().await;
     let (cfg, raft, network, state, mut controls) = cluster().await;
@@ -877,24 +1046,27 @@ async fn repeated_proof_renewals_do_not_restart_the_pending_takeover_delay() {
         300,
     )));
     freshness.record_success(tokio::time::Instant::now());
-    let task = tokio::spawn(run_reconcile_loop(
+    let deadline = tokio::time::Instant::now()
+        + takeover_lifetime(freshness.lifetime(), cfg.sorted_vips().len())
+        + RECONCILE_TICK * 2;
+    let mut reconcile = Box::pin(run_reconcile_loop(
         cfg.clone(),
         raft.clone(),
         state,
         local.clone(),
         Arc::new(cfg.sorted_vips()),
-        Arc::new(AtomicBool::new(true)),
+        Arc::new(LocalHealth::new(true)),
         freshness.clone(),
         1,
     ));
     let mut acquired = false;
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    while tokio::time::Instant::now() < deadline {
         freshness.record_success(tokio::time::Instant::now());
+        assert!(futures::poll!(reconcile.as_mut()).is_pending());
         acquired |= local.bound_addrs().await.contains(&vip);
+        tokio::time::advance(std::time::Duration::from_millis(80)).await;
     }
-    task.abort();
-    let _ = task.await;
+    drop(reconcile);
     local
         .unbind_all(&cfg.sorted_vips(), None, true, VipState::Backup)
         .await

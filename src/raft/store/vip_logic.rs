@@ -6,11 +6,34 @@
 //! [`super::state_machine`] feeds committed state through here on every applied entry.
 
 use super::super::types::TypeConfig;
-use super::state::{OWNERSHIP_ACTIVATION_HOLDOFF_TICKS, VipAssignment};
+use super::state::{KafStorageState, OWNERSHIP_ACTIVATION_HOLDOFF_TICKS, VipAssignment};
 use crate::config::VipAddr;
 use openraft::alias::StoredMembershipOf;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
+
+/// Borrowed committed inputs shared by legacy and V2 eligibility checks.
+pub(crate) struct EligibilityInputs<'a> {
+    pub node_health: &'a BTreeMap<u64, bool>,
+    pub node_probe_ticks: &'a BTreeMap<u64, u64>,
+    pub latest_probe_tick: u64,
+    pub stale_missed_probes: u64,
+    pub failback_delay_ticks: u64,
+    pub node_recovery_tick: &'a BTreeMap<u64, u64>,
+}
+
+impl<'a> From<&'a KafStorageState> for EligibilityInputs<'a> {
+    fn from(state: &'a KafStorageState) -> Self {
+        Self {
+            node_health: &state.node_health,
+            node_probe_ticks: &state.node_probe_ticks,
+            latest_probe_tick: state.latest_probe_tick,
+            stale_missed_probes: state.stale_missed_probes,
+            failback_delay_ticks: state.failback_delay_ticks,
+            node_recovery_tick: &state.node_recovery_tick,
+        }
+    }
+}
 
 /// Assign VIPs to holders in list order, round-robin over `eligible` (must be sorted by id).
 ///
@@ -21,7 +44,7 @@ use std::net::IpAddr;
 pub(crate) fn assign_vips_round_robin_eligible(
     eligible: &[u64],
     vip_addrs_in_order: &[IpAddr],
-    out: &mut HashMap<IpAddr, u64>,
+    out: &mut BTreeMap<IpAddr, u64>,
 ) {
     out.clear();
     if eligible.is_empty() {
@@ -86,8 +109,8 @@ fn most_loaded_node(load: &BTreeMap<u64, usize>) -> Option<(u64, usize)> {
 pub(crate) fn assign_vips_minimal_movement(
     eligible: &[u64],
     vip_addrs_in_order: &[IpAddr],
-    current_holders: &HashMap<IpAddr, u64>,
-    out: &mut HashMap<IpAddr, u64>,
+    current_holders: &BTreeMap<IpAddr, u64>,
+    out: &mut BTreeMap<IpAddr, u64>,
 ) {
     assign_vips_minimal_movement_with_receivers(
         eligible,
@@ -106,8 +129,8 @@ fn assign_vips_minimal_movement_with_receivers(
     eligible: &[u64],
     rebalance_receivers: &[u64],
     vip_addrs_in_order: &[IpAddr],
-    current_holders: &HashMap<IpAddr, u64>,
-    out: &mut HashMap<IpAddr, u64>,
+    current_holders: &BTreeMap<IpAddr, u64>,
+    out: &mut BTreeMap<IpAddr, u64>,
 ) {
     out.clear();
     if eligible.is_empty() {
@@ -183,8 +206,8 @@ fn assign_vips_minimal_movement_with_receivers(
 #[must_use]
 pub(crate) fn is_node_base_eligible(
     node_id: u64,
-    node_health: &HashMap<u64, bool>,
-    node_probe_ticks: &HashMap<u64, u64>,
+    node_health: &BTreeMap<u64, bool>,
+    node_probe_ticks: &BTreeMap<u64, u64>,
     latest_probe_tick: u64,
     stale_missed_probes: u64,
 ) -> bool {
@@ -205,7 +228,7 @@ pub(crate) fn is_node_base_eligible(
 #[must_use]
 pub fn is_node_probe_fresh(
     node_id: u64,
-    node_probe_ticks: &HashMap<u64, u64>,
+    node_probe_ticks: &BTreeMap<u64, u64>,
     latest_probe_tick: u64,
     stale_missed_probes: u64,
 ) -> bool {
@@ -225,16 +248,10 @@ pub fn is_node_probe_fresh(
 ///    least `failback_delay_ticks` probe rounds must have passed since recovery started.
 ///    A node that was never unhealthy has no recovery tick and is immediately eligible.
 #[must_use]
-#[allow(clippy::too_many_arguments)]
 pub fn is_node_eligible(
     node_id: u64,
-    node_health: &HashMap<u64, bool>,
-    node_probe_ticks: &HashMap<u64, u64>,
-    latest_probe_tick: u64,
-    stale_missed_probes: u64,
-    failback_delay_ticks: u64,
-    node_recovery_tick: &HashMap<u64, u64>,
-    node_failback_blocked: &HashSet<u64>,
+    inputs: &EligibilityInputs<'_>,
+    node_failback_blocked: &BTreeSet<u64>,
 ) -> bool {
     // Permanent block retained only for legacy failback:false compatibility.
     if node_failback_blocked.contains(&node_id) {
@@ -242,16 +259,16 @@ pub fn is_node_eligible(
     }
     if !is_node_base_eligible(
         node_id,
-        node_health,
-        node_probe_ticks,
-        latest_probe_tick,
-        stale_missed_probes,
+        inputs.node_health,
+        inputs.node_probe_ticks,
+        inputs.latest_probe_tick,
+        inputs.stale_missed_probes,
     ) {
         return false;
     }
     // Failback delay: if the node is in recovery, it must have been healthy for enough rounds.
-    if let Some(&recovery_tick) = node_recovery_tick.get(&node_id)
-        && latest_probe_tick.saturating_sub(recovery_tick) < failback_delay_ticks
+    if let Some(&recovery_tick) = inputs.node_recovery_tick.get(&node_id)
+        && inputs.latest_probe_tick.saturating_sub(recovery_tick) < inputs.failback_delay_ticks
     {
         return false;
     }
@@ -271,33 +288,18 @@ pub fn next_probe_tick(prev: Option<u64>, latest_probe_tick: u64) -> u64 {
     prev.unwrap_or(0).saturating_add(1).max(latest_probe_tick)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn eligible_nodes(
     membership: &StoredMembershipOf<TypeConfig>,
-    node_health: &HashMap<u64, bool>,
-    node_probe_ticks: &HashMap<u64, u64>,
-    latest_probe_tick: u64,
-    stale_missed_probes: u64,
-    failback_delay_ticks: u64,
-    node_recovery_tick: &HashMap<u64, u64>,
-    node_failback_blocked: &HashSet<u64>,
+    inputs: &EligibilityInputs<'_>,
+    node_failback_blocked: &BTreeSet<u64>,
 ) -> Vec<u64> {
-    let mut members: Vec<u64> = membership.membership().nodes().map(|(id, _)| *id).collect();
+    let mut members: Vec<u64> = super::membership::unique_voters(membership.membership())
+        .into_keys()
+        .collect();
     members.sort_unstable();
     members
         .into_iter()
-        .filter(|id| {
-            is_node_eligible(
-                *id,
-                node_health,
-                node_probe_ticks,
-                latest_probe_tick,
-                stale_missed_probes,
-                failback_delay_ticks,
-                node_recovery_tick,
-                node_failback_blocked,
-            )
-        })
+        .filter(|id| is_node_eligible(*id, inputs, node_failback_blocked))
         .collect()
 }
 
@@ -307,60 +309,30 @@ fn eligible_nodes(
 /// only orphaned/imbalanced VIPs move, via [`assign_vips_minimal_movement`] (minimal-movement
 /// multi-VIP rebalance). `current_holders` must come from the committed `vip_assignments` so the
 /// recompute stays deterministic across nodes and replays.
-#[allow(clippy::too_many_arguments)]
 pub fn recompute_vip_holder(
     membership: &StoredMembershipOf<TypeConfig>,
-    node_health: &HashMap<u64, bool>,
-    node_probe_ticks: &HashMap<u64, u64>,
-    latest_probe_tick: u64,
-    stale_missed_probes: u64,
-    failback_delay_ticks: u64,
-    node_recovery_tick: &HashMap<u64, u64>,
-    node_failback_blocked: &HashSet<u64>,
+    inputs: &EligibilityInputs<'_>,
+    node_failback_blocked: &BTreeSet<u64>,
     vip_list: &[(VipAddr, String)],
-    current_holders: &HashMap<IpAddr, u64>,
-    out: &mut HashMap<IpAddr, u64>,
+    current_holders: &BTreeMap<IpAddr, u64>,
+    out: &mut BTreeMap<IpAddr, u64>,
 ) {
-    let eligible = eligible_nodes(
-        membership,
-        node_health,
-        node_probe_ticks,
-        latest_probe_tick,
-        stale_missed_probes,
-        failback_delay_ticks,
-        node_recovery_tick,
-        node_failback_blocked,
-    );
+    let eligible = eligible_nodes(membership, inputs, node_failback_blocked);
     let vips: Vec<IpAddr> = vip_list.iter().map(|(v, _)| v.addr).collect();
     assign_vips_minimal_movement(&eligible, &vips, current_holders, out);
 }
 
 /// Recompute V2 ownership: failed nopreempt nodes may receive orphans but not proactive moves.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn recompute_vip_holder_v2(
     membership: &StoredMembershipOf<TypeConfig>,
-    node_health: &HashMap<u64, bool>,
-    node_probe_ticks: &HashMap<u64, u64>,
-    latest_probe_tick: u64,
-    stale_missed_probes: u64,
-    failback_delay_ticks: u64,
-    node_recovery_tick: &HashMap<u64, u64>,
-    node_nopreempt: &HashSet<u64>,
+    inputs: &EligibilityInputs<'_>,
+    node_nopreempt: &BTreeSet<u64>,
     vip_list: &[(VipAddr, String)],
-    current_holders: &HashMap<IpAddr, u64>,
-    out: &mut HashMap<IpAddr, u64>,
+    current_holders: &BTreeMap<IpAddr, u64>,
+    out: &mut BTreeMap<IpAddr, u64>,
 ) {
-    let no_legacy_blocks = HashSet::new();
-    let eligible = eligible_nodes(
-        membership,
-        node_health,
-        node_probe_ticks,
-        latest_probe_tick,
-        stale_missed_probes,
-        failback_delay_ticks,
-        node_recovery_tick,
-        &no_legacy_blocks,
-    );
+    let no_legacy_blocks = BTreeSet::new();
+    let eligible = eligible_nodes(membership, inputs, &no_legacy_blocks);
     let rebalance_receivers: Vec<u64> = eligible
         .iter()
         .copied()
@@ -381,14 +353,14 @@ pub(crate) fn recompute_vip_holder_v2(
 /// Every holder change bumps the per-VIP generation and records the previous holder that has to
 /// release before a healthy replacement may activate.
 pub fn reconcile_vip_assignments(
-    new_holders: &HashMap<IpAddr, u64>,
+    new_holders: &BTreeMap<IpAddr, u64>,
     latest_probe_tick: u64,
     vip_list: &[(VipAddr, String)],
-    out_assignments: &mut HashMap<IpAddr, VipAssignment>,
-    vip_generation: &mut HashMap<IpAddr, u64>,
-    vip_last_holder: &mut HashMap<IpAddr, u64>,
+    out_assignments: &mut BTreeMap<IpAddr, VipAssignment>,
+    vip_generation: &mut BTreeMap<IpAddr, u64>,
+    vip_last_holder: &mut BTreeMap<IpAddr, u64>,
 ) {
-    let mut next = HashMap::new();
+    let mut next = BTreeMap::new();
 
     for (v, _) in vip_list {
         let vip = &v.addr;
@@ -455,13 +427,13 @@ mod tests {
         FailoverSemantics, KafSnapshot, OWNERSHIP_ACTIVATION_HOLDOFF_TICKS, VipAssignment,
     };
     use super::{
-        assign_vips_minimal_movement, assign_vips_round_robin_eligible, is_node_eligible,
-        next_probe_tick, recompute_vip_holder, reconcile_vip_assignments,
+        EligibilityInputs, assign_vips_minimal_movement, assign_vips_round_robin_eligible,
+        is_node_eligible, next_probe_tick, recompute_vip_holder, reconcile_vip_assignments,
     };
     use crate::config::VipAddr;
     use openraft::alias::StoredMembershipOf;
     use openraft::{BasicNode, Membership};
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::{IpAddr, Ipv4Addr};
     use std::str::FromStr;
 
@@ -471,14 +443,14 @@ mod tests {
 
     #[test]
     fn round_robin_empty_eligible_clears_map() {
-        let mut out = HashMap::from([(ip4(10, 0, 0, 1), 99_u64)]);
+        let mut out = BTreeMap::from([(ip4(10, 0, 0, 1), 99_u64)]);
         assign_vips_round_robin_eligible(&[], &[ip4(10, 0, 0, 1)], &mut out);
         assert!(out.is_empty());
     }
 
     #[test]
     fn round_robin_single_holder_all_vips() {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         let vips = [
             ip4(10, 0, 0, 1),
             ip4(10, 0, 0, 2),
@@ -493,7 +465,7 @@ mod tests {
 
     #[test]
     fn round_robin_two_holders_distributes() {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         let vips = [
             ip4(192, 168, 1, 1),
             ip4(192, 168, 1, 2),
@@ -507,7 +479,7 @@ mod tests {
 
     #[test]
     fn round_robin_three_holders_wraps() {
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         let vips = [
             ip4(1, 1, 1, 1),
             ip4(2, 2, 2, 2),
@@ -523,23 +495,59 @@ mod tests {
 
     #[test]
     fn eligibility_requires_healthy_and_fresh_probe_round() {
-        let nh = HashMap::from([(1_u64, true), (2, true), (3, false)]);
-        let ticks = HashMap::from([(1_u64, 10_u64), (2, 4), (3, 10)]);
+        let nh = BTreeMap::from([(1_u64, true), (2, true), (3, false)]);
+        let ticks = BTreeMap::from([(1_u64, 10_u64), (2, 4), (3, 10)]);
         let latest = 10_u64;
         let stale = 3_u64;
-        let empty_rt = HashMap::new();
-        let empty_fb = HashSet::new();
+        let empty_rt = BTreeMap::new();
+        let empty_fb = BTreeSet::new();
         assert!(is_node_eligible(
-            1, &nh, &ticks, latest, stale, 0, &empty_rt, &empty_fb
+            1,
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: latest,
+                stale_missed_probes: stale,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &empty_rt,
+            },
+            &empty_fb,
         ));
         assert!(!is_node_eligible(
-            2, &nh, &ticks, latest, stale, 0, &empty_rt, &empty_fb
+            2,
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: latest,
+                stale_missed_probes: stale,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &empty_rt,
+            },
+            &empty_fb,
         ));
         assert!(!is_node_eligible(
-            3, &nh, &ticks, latest, stale, 0, &empty_rt, &empty_fb
+            3,
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: latest,
+                stale_missed_probes: stale,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &empty_rt,
+            },
+            &empty_fb,
         ));
         assert!(!is_node_eligible(
-            4, &nh, &ticks, latest, stale, 0, &empty_rt, &empty_fb
+            4,
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: latest,
+                stale_missed_probes: stale,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &empty_rt,
+            },
+            &empty_fb,
         ));
     }
 
@@ -559,59 +567,124 @@ mod tests {
 
     #[test]
     fn returning_node_regains_eligibility_after_one_update() {
-        let nh = HashMap::from([(1_u64, true)]);
+        let nh = BTreeMap::from([(1_u64, true)]);
         let latest = 20_u64;
         let stale = 3_u64;
         // Stale after a long downtime: tick far behind the frontier.
-        let before = HashMap::from([(1_u64, 1_u64)]);
-        let empty_rt = HashMap::new();
-        let empty_fb = HashSet::new();
+        let before = BTreeMap::from([(1_u64, 1_u64)]);
+        let empty_rt = BTreeMap::new();
+        let empty_fb = BTreeSet::new();
         assert!(!is_node_eligible(
-            1, &nh, &before, latest, stale, 0, &empty_rt, &empty_fb
+            1,
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &before,
+                latest_probe_tick: latest,
+                stale_missed_probes: stale,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &empty_rt,
+            },
+            &empty_fb,
         ));
         // One published HealthUpdate catches the node up to the frontier...
         let caught_up = next_probe_tick(before.get(&1).copied(), latest);
-        let after = HashMap::from([(1_u64, caught_up)]);
+        let after = BTreeMap::from([(1_u64, caught_up)]);
         // ...so it is fresh (eligible) again.
         assert!(is_node_eligible(
-            1, &nh, &after, latest, stale, 0, &empty_rt, &empty_fb
+            1,
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &after,
+                latest_probe_tick: latest,
+                stale_missed_probes: stale,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &empty_rt,
+            },
+            &empty_fb,
         ));
     }
 
     #[test]
     fn eligibility_saturates_on_missing_latest_progress() {
-        let nh = HashMap::from([(1_u64, true)]);
-        let ticks = HashMap::from([(1_u64, 20_u64)]);
+        let nh = BTreeMap::from([(1_u64, true)]);
+        let ticks = BTreeMap::from([(1_u64, 20_u64)]);
         assert!(is_node_eligible(
             1,
-            &nh,
-            &ticks,
-            10,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new()
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &BTreeSet::new(),
         ));
+    }
+
+    #[test]
+    fn eligibility_inputs_preserve_all_health_freshness_and_recovery_gates() {
+        for health in [None, Some(false), Some(true)] {
+            for tick in [None, Some(6), Some(7), Some(10), Some(12)] {
+                for recovery in [None, Some(7), Some(8), Some(12)] {
+                    for delay in [0, 3] {
+                        for blocked in [false, true] {
+                            let health_map = health.map(|value| (1, value)).into_iter().collect();
+                            let ticks = tick.map(|value| (1, value)).into_iter().collect();
+                            let recovery_ticks =
+                                recovery.map(|value| (1, value)).into_iter().collect();
+                            let blocks = if blocked {
+                                BTreeSet::from([1])
+                            } else {
+                                BTreeSet::new()
+                            };
+                            let expected = health == Some(true)
+                                && tick.is_some_and(|tick| tick >= 7)
+                                && !blocked
+                                && (delay == 0 || recovery.is_none_or(|tick| tick <= 7));
+                            assert_eq!(
+                                is_node_eligible(
+                                    1,
+                                    &EligibilityInputs {
+                                        node_health: &health_map,
+                                        node_probe_ticks: &ticks,
+                                        latest_probe_tick: 10,
+                                        stale_missed_probes: 3,
+                                        failback_delay_ticks: delay,
+                                        node_recovery_tick: &recovery_ticks,
+                                    },
+                                    &blocks,
+                                ),
+                                expected,
+                                "health={health:?} tick={tick:?} recovery={recovery:?} delay={delay} blocked={blocked}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
     fn recompute_no_raft_members_clears_holders_even_if_health_present() {
         let membership = StoredMembershipOf::<TypeConfig>::default();
-        let node_health = HashMap::from([(1_u64, true)]);
-        let ticks = HashMap::from([(1_u64, 10_u64)]);
+        let node_health = BTreeMap::from([(1_u64, true)]);
+        let ticks = BTreeMap::from([(1_u64, 10_u64)]);
         let vips = vec![(VipAddr::host(ip4(10, 0, 0, 99)), "lo".into())];
-        let mut out = HashMap::from([(ip4(1, 1, 1, 1), 999_u64)]);
+        let mut out = BTreeMap::from([(ip4(1, 1, 1, 1), 999_u64)]);
         recompute_vip_holder(
             &membership,
-            &node_health,
-            &ticks,
-            10,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            &EligibilityInputs {
+                node_health: &node_health,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &BTreeSet::new(),
             &vips,
-            &HashMap::new(),
+            &BTreeMap::new(),
             &mut out,
         );
         assert!(out.is_empty());
@@ -619,44 +692,48 @@ mod tests {
 
     #[test]
     fn recompute_unhealthy_members_only_leaves_empty() {
-        let m = Membership::<u64, BasicNode>::new(
-            vec![BTreeSet::from([1_u64])],
-            BTreeMap::from([(1_u64, BasicNode::default())]),
+        let m = Membership::<crate::raft::admission::ReplicaId, BasicNode>::new(
+            vec![[1_u64].map(crate::raft::types::test_replica).into()],
+            BTreeMap::from([(crate::raft::types::test_replica(1), BasicNode::default())]),
         )
         .unwrap();
         let membership = StoredMembershipOf::<TypeConfig>::new(None, m);
-        let node_health = HashMap::from([(1_u64, false)]);
-        let ticks = HashMap::from([(1_u64, 5_u64)]);
+        let node_health = BTreeMap::from([(1_u64, false)]);
+        let ticks = BTreeMap::from([(1_u64, 5_u64)]);
         let vips = vec![(VipAddr::host(ip4(10, 0, 0, 1)), "eth0".into())];
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         recompute_vip_holder(
             &membership,
-            &node_health,
-            &ticks,
-            5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            &EligibilityInputs {
+                node_health: &node_health,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 5,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &BTreeSet::new(),
             &vips,
-            &HashMap::new(),
+            &BTreeMap::new(),
             &mut out,
         );
         assert!(out.is_empty());
 
-        let healthy = HashMap::from([(1_u64, true)]);
-        let mut out2 = HashMap::new();
+        let healthy = BTreeMap::from([(1_u64, true)]);
+        let mut out2 = BTreeMap::new();
         recompute_vip_holder(
             &membership,
-            &healthy,
-            &ticks,
-            5,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            &EligibilityInputs {
+                node_health: &healthy,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 5,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &BTreeSet::new(),
             &vips,
-            &HashMap::new(),
+            &BTreeMap::new(),
             &mut out2,
         );
         assert_eq!(out2.len(), 1);
@@ -665,27 +742,32 @@ mod tests {
 
     #[test]
     fn recompute_stale_holder_loses_vip_to_fresh_peer() {
-        let m = Membership::<u64, BasicNode>::new(
-            vec![BTreeSet::from([1_u64, 2])],
-            BTreeMap::from([(1_u64, BasicNode::default()), (2, BasicNode::default())]),
+        let m = Membership::<crate::raft::admission::ReplicaId, BasicNode>::new(
+            vec![[1_u64, 2].map(crate::raft::types::test_replica).into()],
+            BTreeMap::from([
+                (crate::raft::types::test_replica(1), BasicNode::default()),
+                (crate::raft::types::test_replica(2), BasicNode::default()),
+            ]),
         )
         .unwrap();
         let membership = StoredMembershipOf::<TypeConfig>::new(None, m);
-        let nh = HashMap::from([(1_u64, true), (2, true)]);
-        let ticks = HashMap::from([(1_u64, 1_u64), (2, 7)]);
+        let nh = BTreeMap::from([(1_u64, true), (2, true)]);
+        let ticks = BTreeMap::from([(1_u64, 1_u64), (2, 7)]);
         let vips = vec![(VipAddr::host(ip4(10, 0, 0, 1)), "eth0".into())];
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         recompute_vip_holder(
             &membership,
-            &nh,
-            &ticks,
-            7,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 7,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &BTreeSet::new(),
             &vips,
-            &HashMap::new(),
+            &BTreeMap::new(),
             &mut out,
         );
         assert_eq!(out.len(), 1);
@@ -694,31 +776,36 @@ mod tests {
 
     #[test]
     fn recompute_each_vip_maps_to_exactly_one_eligible_holder() {
-        let m = Membership::<u64, BasicNode>::new(
-            vec![BTreeSet::from([10_u64, 20])],
-            BTreeMap::from([(10_u64, BasicNode::default()), (20, BasicNode::default())]),
+        let m = Membership::<crate::raft::admission::ReplicaId, BasicNode>::new(
+            vec![[10_u64, 20].map(crate::raft::types::test_replica).into()],
+            BTreeMap::from([
+                (crate::raft::types::test_replica(10), BasicNode::default()),
+                (crate::raft::types::test_replica(20), BasicNode::default()),
+            ]),
         )
         .unwrap();
         let membership = StoredMembershipOf::<TypeConfig>::new(None, m);
-        let nh = HashMap::from([(10_u64, true), (20, true)]);
-        let ticks = HashMap::from([(10_u64, 4_u64), (20, 4)]);
+        let nh = BTreeMap::from([(10_u64, true), (20, true)]);
+        let ticks = BTreeMap::from([(10_u64, 4_u64), (20, 4)]);
         let vips = vec![
             (VipAddr::host(ip4(10, 0, 0, 1)), "eth0".into()),
             (VipAddr::host(ip4(10, 0, 0, 2)), "eth0".into()),
             (VipAddr::host(ip4(10, 0, 0, 3)), "eth0".into()),
         ];
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         recompute_vip_holder(
             &membership,
-            &nh,
-            &ticks,
-            4,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 4,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &BTreeSet::new(),
             &vips,
-            &HashMap::new(),
+            &BTreeMap::new(),
             &mut out,
         );
         assert_eq!(out.len(), 3);
@@ -731,7 +818,7 @@ mod tests {
     fn reconcile_assignments_records_previous_holder_and_generation() {
         let vip = ip4(10, 0, 0, 50);
         let vip_list = vec![(VipAddr::host(vip), "eth0".into())];
-        let mut assignments = HashMap::from([(
+        let mut assignments = BTreeMap::from([(
             vip,
             VipAssignment {
                 holder: 1,
@@ -741,8 +828,8 @@ mod tests {
                 activation_tick: 2,
             },
         )]);
-        let mut generations = HashMap::from([(vip, 4_u64)]);
-        let new_holders = HashMap::from([(vip, 2_u64)]);
+        let mut generations = BTreeMap::from([(vip, 4_u64)]);
+        let new_holders = BTreeMap::from([(vip, 2_u64)]);
 
         reconcile_vip_assignments(
             &new_holders,
@@ -750,7 +837,7 @@ mod tests {
             &vip_list,
             &mut assignments,
             &mut generations,
-            &mut HashMap::new(),
+            &mut BTreeMap::new(),
         );
 
         let a = assignments.get(&vip).unwrap();
@@ -772,9 +859,9 @@ mod tests {
             previous_holder_released: true,
             activation_tick: 12,
         };
-        let mut assignments = HashMap::from([(vip, existing.clone())]);
-        let mut generations = HashMap::from([(vip, 6_u64)]);
-        let new_holders = HashMap::from([(vip, 2_u64)]);
+        let mut assignments = BTreeMap::from([(vip, existing.clone())]);
+        let mut generations = BTreeMap::from([(vip, 6_u64)]);
+        let new_holders = BTreeMap::from([(vip, 2_u64)]);
 
         reconcile_vip_assignments(
             &new_holders,
@@ -782,7 +869,7 @@ mod tests {
             &vip_list,
             &mut assignments,
             &mut generations,
-            &mut HashMap::new(),
+            &mut BTreeMap::new(),
         );
 
         assert_eq!(assignments.get(&vip), Some(&existing));
@@ -793,7 +880,7 @@ mod tests {
     fn reassignment_after_an_ownerless_gap_keeps_the_activation_holdoff() {
         let vip = ip4(10, 0, 0, 52);
         let vip_list = vec![(VipAddr::host(vip), "eth0".into())];
-        let mut assignments = HashMap::from([(
+        let mut assignments = BTreeMap::from([(
             vip,
             VipAssignment {
                 holder: 1,
@@ -803,11 +890,11 @@ mod tests {
                 activation_tick: 2,
             },
         )]);
-        let mut generations = HashMap::from([(vip, 4_u64)]);
-        let mut last_holder = HashMap::new();
+        let mut generations = BTreeMap::from([(vip, 4_u64)]);
+        let mut last_holder = BTreeMap::new();
 
         reconcile_vip_assignments(
-            &HashMap::new(),
+            &BTreeMap::new(),
             9,
             &vip_list,
             &mut assignments,
@@ -817,7 +904,7 @@ mod tests {
         assert!(assignments.is_empty());
 
         reconcile_vip_assignments(
-            &HashMap::from([(vip, 2_u64)]),
+            &BTreeMap::from([(vip, 2_u64)]),
             10,
             &vip_list,
             &mut assignments,
@@ -841,16 +928,16 @@ mod tests {
     fn first_assignment_without_generation_history_activates_immediately() {
         let vip = ip4(10, 0, 0, 53);
         let vip_list = vec![(VipAddr::host(vip), "eth0".into())];
-        let mut assignments = HashMap::new();
-        let mut generations = HashMap::new();
+        let mut assignments = BTreeMap::new();
+        let mut generations = BTreeMap::new();
 
         reconcile_vip_assignments(
-            &HashMap::from([(vip, 2_u64)]),
+            &BTreeMap::from([(vip, 2_u64)]),
             10,
             &vip_list,
             &mut assignments,
             &mut generations,
-            &mut HashMap::new(),
+            &mut BTreeMap::new(),
         );
 
         let assignment = assignments.get(&vip).unwrap();
@@ -886,9 +973,9 @@ mod tests {
             (&[7], vec![ipa(), ipb(), ipc()]),
         ];
         for (eligible, vips) in cases {
-            let mut min_move = HashMap::new();
-            assign_vips_minimal_movement(eligible, vips, &HashMap::new(), &mut min_move);
-            let mut round_robin = HashMap::new();
+            let mut min_move = BTreeMap::new();
+            assign_vips_minimal_movement(eligible, vips, &BTreeMap::new(), &mut min_move);
+            let mut round_robin = BTreeMap::new();
             assign_vips_round_robin_eligible(eligible, vips, &mut round_robin);
             assert_eq!(min_move, round_robin, "eligible {eligible:?}");
         }
@@ -896,8 +983,8 @@ mod tests {
 
     #[test]
     fn minmove_empty_eligible_clears() {
-        let mut out = HashMap::from([(ipa(), 99_u64)]);
-        let prior = HashMap::from([(ipa(), 1_u64)]);
+        let mut out = BTreeMap::from([(ipa(), 99_u64)]);
+        let prior = BTreeMap::from([(ipa(), 1_u64)]);
         assign_vips_minimal_movement(&[], &[ipa()], &prior, &mut out);
         assert!(out.is_empty());
     }
@@ -906,23 +993,23 @@ mod tests {
     fn minmove_keeps_eligible_holder_stable() {
         // Both holders stay eligible and the spread is only 1, so nothing moves and the spare node
         // stays empty (we do not rebalance below a spread of 1).
-        let prior = HashMap::from([(ipa(), 1_u64), (ipb(), 2_u64)]);
-        let mut out = HashMap::new();
+        let prior = BTreeMap::from([(ipa(), 1_u64), (ipb(), 2_u64)]);
+        let mut out = BTreeMap::new();
         assign_vips_minimal_movement(&[1, 2, 3], &[ipa(), ipb()], &prior, &mut out);
-        assert_eq!(out, HashMap::from([(ipa(), 1_u64), (ipb(), 2_u64)]));
+        assert_eq!(out, BTreeMap::from([(ipa(), 1_u64), (ipb(), 2_u64)]));
     }
 
     #[test]
     fn minmove_orphan_goes_to_least_loaded_lowest_id() {
         // Holder of ipb became ineligible: ipb is re-placed on the empty eligible node, ipa stays.
-        let prior = HashMap::from([(ipa(), 1_u64), (ipb(), 2_u64)]);
-        let mut out = HashMap::new();
+        let prior = BTreeMap::from([(ipa(), 1_u64), (ipb(), 2_u64)]);
+        let mut out = BTreeMap::new();
         assign_vips_minimal_movement(&[1, 3], &[ipa(), ipb()], &prior, &mut out);
-        assert_eq!(out, HashMap::from([(ipa(), 1_u64), (ipb(), 3_u64)]));
+        assert_eq!(out, BTreeMap::from([(ipa(), 1_u64), (ipb(), 3_u64)]));
 
         // A never-assigned VIP (ipd) lands on the only empty node; the rest keep their holders.
-        let prior = HashMap::from([(ipa(), 1_u64), (ipb(), 1_u64), (ipc(), 2_u64)]);
-        let mut out = HashMap::new();
+        let prior = BTreeMap::from([(ipa(), 1_u64), (ipb(), 1_u64), (ipc(), 2_u64)]);
+        let mut out = BTreeMap::new();
         assign_vips_minimal_movement(&[1, 2, 3], &[ipa(), ipb(), ipc(), ipd()], &prior, &mut out);
         assert_eq!(out[&ipa()], 1);
         assert_eq!(out[&ipb()], 1);
@@ -933,14 +1020,14 @@ mod tests {
     #[test]
     fn minmove_rebalance_donates_highest_ip_vip() {
         // Donor node 1 holds two VIPs while node 2 is empty: the donor's HIGHEST-IP VIP (ipc) moves.
-        let prior = HashMap::from([(ipa(), 1_u64), (ipc(), 1_u64)]);
-        let mut out = HashMap::new();
+        let prior = BTreeMap::from([(ipa(), 1_u64), (ipc(), 1_u64)]);
+        let mut out = BTreeMap::new();
         assign_vips_minimal_movement(&[1, 2], &[ipa(), ipc()], &prior, &mut out);
-        assert_eq!(out, HashMap::from([(ipa(), 1_u64), (ipc(), 2_u64)]));
+        assert_eq!(out, BTreeMap::from([(ipa(), 1_u64), (ipc(), 2_u64)]));
 
         // With three VIPs on the donor only ONE moves (highest IP), leaving a spread of 1.
-        let prior = HashMap::from([(ipa(), 1_u64), (ipb(), 1_u64), (ipc(), 1_u64)]);
-        let mut out = HashMap::new();
+        let prior = BTreeMap::from([(ipa(), 1_u64), (ipb(), 1_u64), (ipc(), 1_u64)]);
+        let mut out = BTreeMap::new();
         assign_vips_minimal_movement(&[1, 2], &[ipa(), ipb(), ipc()], &prior, &mut out);
         assert_eq!(out[&ipc()], 2, "highest-IP VIP is the one donated");
         assert_eq!(out[&ipa()], 1);
@@ -955,8 +1042,8 @@ mod tests {
         let vips = [ipa(), ipb(), ipc(), ipd()];
 
         // Start: all five eligible, cold start -> A,B,C,D each take one, E stays empty.
-        let mut start = HashMap::new();
-        assign_vips_minimal_movement(&[1, 2, 3, 4, 5], &vips, &HashMap::new(), &mut start);
+        let mut start = BTreeMap::new();
+        assign_vips_minimal_movement(&[1, 2, 3, 4, 5], &vips, &BTreeMap::new(), &mut start);
         assert_eq!(start[&ipa()], 1);
         assert_eq!(start[&ipb()], 2);
         assert_eq!(start[&ipc()], 3);
@@ -964,7 +1051,7 @@ mod tests {
         assert!(!start.values().any(|&h| h == 5), "node E starts empty");
 
         // B (id 2) down: only IPB is orphaned and it goes to the empty node E (id 5).
-        let mut b_down = HashMap::new();
+        let mut b_down = BTreeMap::new();
         assign_vips_minimal_movement(&[1, 3, 4, 5], &vips, &start, &mut b_down);
         assert_eq!(b_down[&ipa()], 1, "IPA stays on A");
         assert_eq!(b_down[&ipc()], 3, "IPC stays on C");
@@ -973,7 +1060,7 @@ mod tests {
 
         // C (id 3) down: IPC is orphaned and goes to the least-loaded lowest-id node, A (id 1),
         // so A now holds IPA + IPC.
-        let mut c_down = HashMap::new();
+        let mut c_down = BTreeMap::new();
         assign_vips_minimal_movement(&[1, 4, 5], &vips, &b_down, &mut c_down);
         assert_eq!(c_down[&ipa()], 1);
         assert_eq!(c_down[&ipc()], 1, "IPC fails over to A");
@@ -982,7 +1069,7 @@ mod tests {
 
         // B (id 2) returns while C stays down: A is overloaded (2) and B is empty (0), so the
         // rebalance moves A's highest-IP VIP (IPC) to B; A drops back to a single VIP.
-        let mut b_up = HashMap::new();
+        let mut b_up = BTreeMap::new();
         assign_vips_minimal_movement(&[1, 2, 4, 5], &vips, &c_down, &mut b_up);
         assert_eq!(b_up[&ipa()], 1, "IPA stays on A");
         assert_eq!(b_up[&ipc()], 2, "IPC rebalances to B");
@@ -999,7 +1086,7 @@ mod tests {
         // A balanced assignment must be a fixed point: recomputing with the same eligible set
         // moves nothing, so there are no spurious holder changes (and thus no generation churn).
         let vips = [ipa(), ipb(), ipc(), ipd()];
-        let balanced = HashMap::from([
+        let balanced = BTreeMap::from([
             (ipa(), 1_u64),
             (ipc(), 2_u64),
             (ipd(), 4_u64),
@@ -1007,7 +1094,7 @@ mod tests {
         ]);
         let mut current = balanced.clone();
         for _ in 0..3 {
-            let mut next = HashMap::new();
+            let mut next = BTreeMap::new();
             assign_vips_minimal_movement(&[1, 2, 4, 5], &vips, &current, &mut next);
             assert_eq!(next, balanced);
             current = next;
@@ -1047,8 +1134,8 @@ mod tests {
             assert!(eligible.len() >= vips.len(), "case {i} must have N >= V");
 
             // Adversarial prior: every VIP hoarded on the lowest-id eligible node.
-            let hoarded: HashMap<IpAddr, u64> = vips.iter().map(|&v| (v, eligible[0])).collect();
-            let mut out = HashMap::new();
+            let hoarded: BTreeMap<IpAddr, u64> = vips.iter().map(|&v| (v, eligible[0])).collect();
+            let mut out = BTreeMap::new();
             assign_vips_minimal_movement(eligible, &vips, &hoarded, &mut out);
 
             // Every VIP placed, on an eligible node...
@@ -1058,7 +1145,7 @@ mod tests {
                 "holders within eligible for {eligible:?}"
             );
             // ...and no node holds more than one (equivalently: all holders distinct).
-            let mut counts: HashMap<u64, usize> = HashMap::new();
+            let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
             for &h in out.values() {
                 *counts.entry(h).or_insert(0) += 1;
             }
@@ -1079,42 +1166,48 @@ mod tests {
     fn recompute_minimal_movement_keeps_stable_holders_through_membership() {
         // End-to-end through recompute_vip_holder with a 5-voter membership: node 2 is unhealthy,
         // so only its VIP moves (to the empty node 5) and the others keep their holders.
-        let m = Membership::<u64, BasicNode>::new(
-            vec![BTreeSet::from([1_u64, 2, 3, 4, 5])],
+        let m = Membership::<crate::raft::admission::ReplicaId, BasicNode>::new(
+            vec![
+                [1_u64, 2, 3, 4, 5]
+                    .map(crate::raft::types::test_replica)
+                    .into(),
+            ],
             BTreeMap::from([
-                (1_u64, BasicNode::default()),
-                (2, BasicNode::default()),
-                (3, BasicNode::default()),
-                (4, BasicNode::default()),
-                (5, BasicNode::default()),
+                (crate::raft::types::test_replica(1), BasicNode::default()),
+                (crate::raft::types::test_replica(2), BasicNode::default()),
+                (crate::raft::types::test_replica(3), BasicNode::default()),
+                (crate::raft::types::test_replica(4), BasicNode::default()),
+                (crate::raft::types::test_replica(5), BasicNode::default()),
             ]),
         )
         .unwrap();
         let membership = StoredMembershipOf::<TypeConfig>::new(None, m);
-        let nh = HashMap::from([(1_u64, true), (2, false), (3, true), (4, true), (5, true)]);
-        let ticks = HashMap::from([(1_u64, 4_u64), (2, 4), (3, 4), (4, 4), (5, 4)]);
+        let nh = BTreeMap::from([(1_u64, true), (2, false), (3, true), (4, true), (5, true)]);
+        let ticks = BTreeMap::from([(1_u64, 4_u64), (2, 4), (3, 4), (4, 4), (5, 4)]);
         let vip_list = vec![
             (VipAddr::host(ipa()), "eth0".into()),
             (VipAddr::host(ipb()), "eth0".into()),
             (VipAddr::host(ipc()), "eth0".into()),
             (VipAddr::host(ipd()), "eth0".into()),
         ];
-        let prior = HashMap::from([
+        let prior = BTreeMap::from([
             (ipa(), 1_u64),
             (ipb(), 2_u64),
             (ipc(), 3_u64),
             (ipd(), 4_u64),
         ]);
-        let mut out = HashMap::new();
+        let mut out = BTreeMap::new();
         recompute_vip_holder(
             &membership,
-            &nh,
-            &ticks,
-            4,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new(),
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 4,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &BTreeSet::new(),
             &vip_list,
             &prior,
             &mut out,
@@ -1161,47 +1254,78 @@ mod tests {
 
     #[test]
     fn is_node_eligible_exact_staleness_boundary() {
-        let nh = HashMap::from([(1_u64, true)]);
+        let nh = BTreeMap::from([(1_u64, true)]);
         // At latest - last == stale, the node remains eligible.
-        let at = HashMap::from([(1_u64, 7_u64)]);
+        let at = BTreeMap::from([(1_u64, 7_u64)]);
         assert!(is_node_eligible(
             1,
-            &nh,
-            &at,
-            10,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new()
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &at,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &BTreeSet::new(),
         ));
         // At latest - last == stale + 1, the node is fenced off.
-        let past = HashMap::from([(1_u64, 6_u64)]);
+        let past = BTreeMap::from([(1_u64, 6_u64)]);
         assert!(!is_node_eligible(
             1,
-            &nh,
-            &past,
-            10,
-            3,
-            0,
-            &HashMap::new(),
-            &HashSet::new()
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &past,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &BTreeSet::new(),
         ));
     }
 
     #[test]
     fn is_node_eligible_unhealthy_or_missing_tick_is_ineligible() {
-        let nh = HashMap::from([(1_u64, false), (2, true)]);
-        let ticks = HashMap::from([(1_u64, 10_u64)]); // node 2 has never reported a tick
-        let empty_rt = HashMap::new();
-        let empty_fb = HashSet::new();
+        let nh = BTreeMap::from([(1_u64, false), (2, true)]);
+        let ticks = BTreeMap::from([(1_u64, 10_u64)]); // node 2 has never reported a tick
+        let empty_rt = BTreeMap::new();
+        let empty_fb = BTreeSet::new();
         assert!(!is_node_eligible(
-            1, &nh, &ticks, 10, 3, 0, &empty_rt, &empty_fb
+            1,
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &empty_rt,
+            },
+            &empty_fb,
         )); // unhealthy flag
         assert!(!is_node_eligible(
-            2, &nh, &ticks, 10, 3, 0, &empty_rt, &empty_fb
+            2,
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &empty_rt,
+            },
+            &empty_fb,
         )); // missing probe tick
         assert!(!is_node_eligible(
-            3, &nh, &ticks, 10, 3, 0, &empty_rt, &empty_fb
+            3,
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &empty_rt,
+            },
+            &empty_fb,
         )); // unknown node
     }
 
@@ -1214,68 +1338,76 @@ mod tests {
     #[test]
     fn failback_false_blocks_node_after_going_unhealthy() {
         // A node in the failback_blocked set is never eligible regardless of health/ticks.
-        let nh = HashMap::from([(1_u64, true)]);
-        let ticks = HashMap::from([(1_u64, 10_u64)]);
-        let mut blocked = HashSet::new();
+        let nh = BTreeMap::from([(1_u64, true)]);
+        let ticks = BTreeMap::from([(1_u64, 10_u64)]);
+        let mut blocked = BTreeSet::new();
         blocked.insert(1_u64);
         assert!(!is_node_eligible(
             1,
-            &nh,
-            &ticks,
-            10,
-            3,
-            0,
-            &HashMap::new(),
-            &blocked
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &BTreeMap::new(),
+            },
+            &blocked,
         ));
     }
 
     #[test]
     fn failback_enabled_zero_delay_is_eligible_immediately_after_recovery() {
         // Recovery tick set, delay == 0: node is immediately eligible.
-        let nh = HashMap::from([(1_u64, true)]);
-        let ticks = HashMap::from([(1_u64, 10_u64)]);
-        let recovery = HashMap::from([(1_u64, 10_u64)]);
+        let nh = BTreeMap::from([(1_u64, true)]);
+        let ticks = BTreeMap::from([(1_u64, 10_u64)]);
+        let recovery = BTreeMap::from([(1_u64, 10_u64)]);
         assert!(is_node_eligible(
             1,
-            &nh,
-            &ticks,
-            10,
-            3,
-            0,
-            &recovery,
-            &HashSet::new()
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 0,
+                node_recovery_tick: &recovery,
+            },
+            &BTreeSet::new(),
         ));
     }
 
     #[test]
     fn failback_enabled_with_delay_waits_n_ticks() {
-        let nh = HashMap::from([(1_u64, true)]);
-        let ticks = HashMap::from([(1_u64, 10_u64)]);
+        let nh = BTreeMap::from([(1_u64, true)]);
+        let ticks = BTreeMap::from([(1_u64, 10_u64)]);
         // Recovery tick = 8, delay = 3: need latest - recovery >= 3, i.e. latest >= 11.
-        let recovery = HashMap::from([(1_u64, 8_u64)]);
+        let recovery = BTreeMap::from([(1_u64, 8_u64)]);
         // At tick 10, 10 - 8 = 2 < 3, so the node is not eligible yet.
         assert!(!is_node_eligible(
             1,
-            &nh,
-            &ticks,
-            10,
-            3,
-            3,
-            &recovery,
-            &HashSet::new()
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 3,
+                node_recovery_tick: &recovery,
+            },
+            &BTreeSet::new(),
         ));
         // At tick 11, 11 - 8 = 3 >= 3, so the node is eligible.
-        let ticks11 = HashMap::from([(1_u64, 11_u64)]);
+        let ticks11 = BTreeMap::from([(1_u64, 11_u64)]);
         assert!(is_node_eligible(
             1,
-            &nh,
-            &ticks11,
-            11,
-            3,
-            3,
-            &recovery,
-            &HashSet::new()
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks11,
+                latest_probe_tick: 11,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 3,
+                node_recovery_tick: &recovery,
+            },
+            &BTreeSet::new(),
         ));
     }
 
@@ -1285,32 +1417,36 @@ mod tests {
         // At tick 7 it's not yet eligible (7 - 5 = 2 < 3).
         // If it goes unhealthy again, recovery_tick is cleared; once it recovers again the
         // new recovery_tick resets the timer.
-        let nh = HashMap::from([(1_u64, true)]);
-        let ticks = HashMap::from([(1_u64, 7_u64)]);
-        let recovery_at_5 = HashMap::from([(1_u64, 5_u64)]);
+        let nh = BTreeMap::from([(1_u64, true)]);
+        let ticks = BTreeMap::from([(1_u64, 7_u64)]);
+        let recovery_at_5 = BTreeMap::from([(1_u64, 5_u64)]);
         assert!(!is_node_eligible(
             1,
-            &nh,
-            &ticks,
-            7,
-            3,
-            3,
-            &recovery_at_5,
-            &HashSet::new()
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks,
+                latest_probe_tick: 7,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 3,
+                node_recovery_tick: &recovery_at_5,
+            },
+            &BTreeSet::new(),
         ));
         // After another unhealthy-to-healthy transition, recovery_tick resets to 7.
-        let recovery_at_7 = HashMap::from([(1_u64, 7_u64)]);
-        let ticks10 = HashMap::from([(1_u64, 10_u64)]);
+        let recovery_at_7 = BTreeMap::from([(1_u64, 7_u64)]);
+        let ticks10 = BTreeMap::from([(1_u64, 10_u64)]);
         // 10 - 7 = 3 >= 3, so the node is eligible.
         assert!(is_node_eligible(
             1,
-            &nh,
-            &ticks10,
-            10,
-            3,
-            3,
-            &recovery_at_7,
-            &HashSet::new()
+            &EligibilityInputs {
+                node_health: &nh,
+                node_probe_ticks: &ticks10,
+                latest_probe_tick: 10,
+                stale_missed_probes: 3,
+                failback_delay_ticks: 3,
+                node_recovery_tick: &recovery_at_7,
+            },
+            &BTreeSet::new(),
         ));
     }
 }

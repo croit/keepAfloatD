@@ -25,15 +25,19 @@ marker_table_for_protocol() {
 }
 
 cleanup_aux() {
-  docker rm -f "${aux_name}" >/dev/null 2>&1 || true
+  fixture_watchdog_stop
+  timeout -k 2s 15s docker rm -f "${aux_name}" >/dev/null 2>&1 || true
 }
 trap cleanup_aux EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 docker run -d --name "${aux_name}" --user 0 --cap-add NET_ADMIN \
   --entrypoint /bin/sleep \
   -v "${before_config}:/tmp/before.yaml:ro" \
   -v "${after_config}:/tmp/after.yaml:ro" \
-  "${aux_image}" 300 >/dev/null
+  "${aux_image}" infinity >/dev/null
+fixture_watchdog_start "${aux_name}" 300
 
 docker exec "${aux_name}" ip addr add "${admin_address}/32" dev lo
 docker exec "${aux_name}" ip -4 route replace table "$(marker_table_for_protocol 245)" \
@@ -122,7 +126,10 @@ kill_aux_daemon() {
 
 start_aux_daemon /tmp/before.yaml
 wait_until 10 aux_daemon_running
-wait_until 15 address_is_marked "${removed_vip}"
+wait_until 5 docker exec "${aux_name}" grep -q 'runtime admission timing' /tmp/keepafloatd.log
+startup_budget="$(docker exec "${aux_name}" cat /tmp/keepafloatd.log | startup_budget_from_log 15)"
+fixture_watchdog_add_startup <<<"$(docker exec "${aux_name}" cat /tmp/keepafloatd.log)"
+wait_until "${startup_budget}" address_is_marked "${removed_vip}"
 wait_until 15 address_is_marked "${stable_vip}"
 wait_until 15 address_is_marked "${removed_vip6}"
 wait_until 15 address_is_marked "${stable_vip6}"
@@ -139,9 +146,13 @@ address_is_marked "${removed_vip}"
 aux_address_present "${removed_vip6}"
 address_is_marked "${removed_vip6}"
 
+docker exec "${aux_name}" mv /tmp/keepafloatd.log /tmp/keepafloatd-before.log
 start_aux_daemon /tmp/after.yaml
 wait_until 10 aux_daemon_running
-wait_until 15 address_is_marked "${stable_vip}"
+wait_until 5 docker exec "${aux_name}" grep -q 'runtime admission timing' /tmp/keepafloatd.log
+startup_budget="$(docker exec "${aux_name}" cat /tmp/keepafloatd.log | startup_budget_from_log 15)"
+fixture_watchdog_add_startup <<<"$(docker exec "${aux_name}" cat /tmp/keepafloatd.log)"
+wait_until "${startup_budget}" address_is_marked "${stable_vip}"
 wait_until 15 address_has_prefix "${stable_vip}" 24
 wait_until 15 address_is_marked "${stable_vip6}"
 wait_until 15 address_has_prefix "${stable_vip6}" 64

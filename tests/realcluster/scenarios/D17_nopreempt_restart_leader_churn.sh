@@ -91,11 +91,16 @@ check "pre-restart ownership is unique" capture_assignments before_restart
 evid "restarting recovered nopreempt node ${victim}"
 kafd_kill "${victim}"
 kafd_start "${victim}"
+check "startup cleanup leaves no orphan before restart observation" \
+  wait_until 30 no_vip_is_duplicate
+check "restarted node reaches activation before checking nopreempt" \
+  wait_for_startup_activation 30 "${victim}"
 check "restarted recovered node stays live, unique, and nopreempt for eight seconds" \
   wait_until 30 holds_for 8 recovered_restart_stable
 
 check "capture ownership before leader fault" capture_assignments before_leader
-old_leader_id="$(cluster_leader_id)"
+old_leader_replica="$(cluster_leader_replica)"
+old_leader_id="$(replica_physical_id "$old_leader_replica")"
 old_leader_ip=""
 for i in "${!NODE_RAFT_IDS[@]}"; do
   [[ "${NODE_RAFT_IDS[$i]}" == "${old_leader_id}" ]] && old_leader_ip="${NODE_IPS[$i]}"
@@ -110,19 +115,24 @@ survivors_agree_on_new_leader() {
   local ip leader agreed=""
   for ip in $(nodes_except "${old_leader_ip}"); do
     leader="$(leader_seen_by_since "${ip}" "${fault_since}")"
-    [[ -n "${leader}" && "${leader}" != "${old_leader_id}" ]] || return 1
+    replica_is_configured "$leader" || return 1
+    [[ "$leader" != "$old_leader_replica" && "$(replica_physical_id "$leader")" != "$old_leader_id" ]] || return 1
     [[ -z "${agreed}" || "${agreed}" == "${leader}" ]] || return 1
     agreed="${leader}"
   done
 }
 
 check "survivors elect a different leader" wait_until 60 survivors_agree_on_new_leader
-check "every VIP gains exactly one live survivor" wait_until 30 \
+check "every VIP gains exactly one live survivor" wait_until "$(cleanup_budget_seconds 30)" \
   capture_live_assignments "${old_leader_ip}" after_failover
 check "VIPs on live incumbents do not move during leader failover" \
   live_incumbents_unchanged "${old_leader_ip}"
 
 kafd_start "${old_leader_ip}"
+check "startup cleanup removes the old leader's crash orphan" \
+  wait_until 30 no_vip_is_duplicate
+check "old leader reaches activation before checking nopreempt" \
+  wait_for_startup_activation 30 "${old_leader_ip}"
 check "old leader stays live without preempting survivor ownership for eight seconds" \
   wait_until 30 holds_for 8 leader_restart_stable
 check "final ownership has no duplicates" assert_unique_holders

@@ -1,0 +1,24 @@
+node_id: 1
+address_protocol: 246
+raft_listen: "127.0.0.1:27100"
+client_submit_listen: "127.0.0.1:27101"
+cluster_secret: "missing-interface-regression-fixture"
+peers:
+  - id: 1
+    raft_address: "127.0.0.1:27100"
+    client_submit_address: "127.0.0.1:27101"
+vips:
+  - address: 192.0.2.30/24
+    interface: vip-test0
+  - address: 2001:db8::30/64
+    interface: vip-test0
+health:
+  command: ["/bin/sh", "-c", "test -f /tmp/healthy"]
+  interval_ms: 200
+  timeout_ms: 100
+  stale_secs: 3
+raft:
+  election_timeout_min_ms: 400
+  election_timeout_max_ms: 800
+  heartbeat_interval_ms: 250
+failback_delay_secs: 0

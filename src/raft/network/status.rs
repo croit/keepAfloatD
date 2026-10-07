@@ -1,7 +1,8 @@
-//! Authenticated, legacy-compatible cluster status probing.
+//! Authenticated discovery only; status never creates admission authority.
 
 use super::super::KafRaft;
 use super::super::probe::{ClusterStatusRequest, ClusterStatusResponse};
+use super::request::{Operation, decode_payload, encode};
 use super::wire::{STATUS_FRAME_MAX_BYTES, read_framed_bounded, write_framed, write_handshake};
 use crate::config::ClusterConfigFingerprint;
 use crate::connection_admission::connect_from_advertised;
@@ -26,6 +27,8 @@ pub(super) async fn answer_cluster_status(
         (m.current_leader, m.membership_config.nodes().count())
     };
     Ok(ClusterStatusResponse {
+        replica: None,
+        supports_pre_vote: true,
         initialized,
         current_leader,
         member_count,
@@ -39,26 +42,38 @@ pub(super) async fn answer_cluster_status(
 
 /// Probe one peer over a short-lived connection without disturbing long-lived replication links.
 pub(in crate::raft) async fn probe_peer_status(
-    local_address: &str,
+    cfg: &crate::config::Config,
     address: &str,
-    node_id: u64,
-    secret: Option<&str>,
+    target_id: u64,
     epoch: Option<u128>,
     config_fingerprint: ClusterConfigFingerprint,
     budget: Duration,
 ) -> anyhow::Result<ClusterStatusResponse> {
     let io = async {
-        let mut stream = connect_from_advertised(local_address, address).await?;
-        // Legacy handshake lets upgraded nodes discover old peers before V2 activation.
-        write_handshake(&mut stream, node_id, secret, epoch, false).await?;
-        let body = serde_json::to_vec(&ClusterStatusRequest {
-            probe_from: node_id,
-            config_fingerprint: Some(config_fingerprint),
-            supports_cancellation_safe_rpc_v1: true,
-        })?;
+        let mut stream = connect_from_advertised(&cfg.raft_listen, address).await?;
+        // Discovery authenticates independently of configuration and epoch compatibility.
+        let authenticated = write_handshake(
+            &mut stream,
+            cfg.node_id,
+            target_id,
+            cfg.cluster_secret.as_deref(),
+            epoch,
+            false,
+        )
+        .await?;
+        let body = encode(
+            Operation::Status,
+            &ClusterStatusRequest {
+                probe_from: cfg.node_id,
+                config_fingerprint: Some(config_fingerprint),
+                supports_cancellation_safe_rpc_v1: true,
+            },
+        )?;
         write_framed(&mut stream, &body).await?;
         let resp_buf = read_framed_bounded(&mut stream, STATUS_FRAME_MAX_BYTES).await?;
-        Ok::<_, anyhow::Error>(serde_json::from_slice(&resp_buf)?)
+        let mut response: ClusterStatusResponse = decode_payload(&resp_buf, Operation::Status)?;
+        response.replica = authenticated.replica();
+        Ok(response)
     };
     tokio::time::timeout(budget, io)
         .await

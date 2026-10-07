@@ -25,12 +25,11 @@ signal_keepafloatd node-a INT
 # exit budget well clear of the worst case rather than tight to the happy path.
 wait_for_service_exit node-a 30
 assert_service_exit_code node-a 0
-# Graceful shutdown leaves the departed node's last health update fresh for the
-# stale_secs window (6s in the e2e configs), so the surviving pair only rebalances
-# after it ages out. Allow generous slack on top for reconcile + Raft commit on a
-# contended runner; wait_until returns as soon as the assignments settle.
+# The ordinary suite permits scheduling slack; the dedicated handoff scenario
+# uses a long stale window to prove shutdown does not depend on its expiry.
 wait_for_even_over_nodes 45 node-b node-c
 assert_log_contains node-a 'shutting down on SIGINT'
+assert_log_contains node-a 'shutdown unhealthy report committed and applied'
 for vip in "${held_by_a[@]}"; do
   assert_log_contains node-a "unbound ${vip//./\\.}/32 on eth0"
 done

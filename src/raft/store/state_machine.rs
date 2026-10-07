@@ -6,20 +6,25 @@
 //! (apply now consumes a stream of `EntryResponder` and answers per entry via the responder).
 
 use super::super::types::{KafRequest, KafResponse, KafSnapshotData, TypeConfig};
+use super::authority::check_mutation;
 use super::state::{FailoverSemantics, KafSnapshot, KafStorageState};
 use super::vip_logic::{
-    is_node_base_eligible, next_probe_tick, recompute_vip_holder, recompute_vip_holder_v2,
-    reconcile_vip_assignments,
+    EligibilityInputs, is_node_base_eligible, next_probe_tick, recompute_vip_holder,
+    recompute_vip_holder_v2, reconcile_vip_assignments,
 };
 use futures::{Stream, TryStreamExt};
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine};
-use openraft::{EntryPayload, OptionalSend, StoredMembership};
-use std::collections::{BTreeSet, HashMap};
+use openraft::{EntryPayload, OptionalSend};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+#[cfg(test)]
+#[path = "authority_tests.rs"]
+mod authority_tests;
 
 /// State-machine handle over the shared in-memory Raft state.
 ///
@@ -30,6 +35,9 @@ pub struct KafStateMachine {
 }
 
 impl KafStateMachine {
+    pub(crate) fn shared_state(&self) -> Arc<RwLock<KafStorageState>> {
+        self.state.clone()
+    }
     pub(super) fn new(state: Arc<RwLock<KafStorageState>>) -> Self {
         Self { state }
     }
@@ -54,18 +62,13 @@ impl KafStateMachine {
 
     /// Update V2 recovery history from actual failed VIP owners, including silently stale ones.
     fn update_v2_failback_tracking(state: &mut KafStorageState) {
-        let members: BTreeSet<u64> = state
-            .last_membership
-            .membership()
-            .nodes()
-            .map(|(node_id, _)| *node_id)
-            .collect();
+        let members = super::membership::unique_voters(state.last_membership.membership());
         let failed_owners: BTreeSet<u64> = state
             .vip_assignments
             .values()
             .map(|assignment| assignment.holder)
             .filter(|node_id| {
-                !members.contains(node_id)
+                !members.contains_key(node_id)
                     || !is_node_base_eligible(
                         *node_id,
                         &state.node_health,
@@ -92,7 +95,7 @@ impl KafStateMachine {
         let pending: Vec<u64> = state.node_recovery_pending.iter().copied().collect();
         let mut completed = Vec::new();
         for node_id in pending {
-            if !members.contains(&node_id)
+            if !members.contains_key(&node_id)
                 || !is_node_base_eligible(
                     node_id,
                     &state.node_health,
@@ -130,30 +133,70 @@ impl KafStateMachine {
         let resp = match &entry.payload {
             EntryPayload::Blank => KafResponse::Ok,
             EntryPayload::Normal(req) => match req {
-                KafRequest::HealthUpdate { node_id, healthy } => {
-                    let previous_health = state.node_health.insert(*node_id, *healthy);
-                    let next_tick = next_probe_tick(
-                        state.node_probe_ticks.get(node_id).copied(),
-                        state.latest_probe_tick,
-                    );
-                    state.node_probe_ticks.insert(*node_id, next_tick);
-                    // `next_probe_tick` never trails the frontier, so assignment is equivalent to
-                    // taking the maximum without an unobservable equality branch.
-                    state.latest_probe_tick = next_tick;
-                    if state.failover_semantics == FailoverSemantics::Legacy && *healthy {
-                        // A recovery delay only applies when recovered nodes may fail back.
-                        if state.failback && previous_health == Some(false) {
-                            state.node_recovery_tick.insert(*node_id, next_tick);
+                KafRequest::AdmissionMembership(command) => {
+                    state.apply_admission_membership(command, entry.log_id)
+                }
+                KafRequest::AdmissionGenesis(genesis) => {
+                    if state
+                        .genesis
+                        .as_ref()
+                        .is_some_and(|current| current != genesis)
+                        || state
+                            .cluster_epoch
+                            .is_some_and(|epoch| epoch != genesis.epoch)
+                    {
+                        KafResponse::Rejected("immutable genesis mismatch".into())
+                    } else {
+                        if state.genesis.is_none() {
+                            state.node_health.clear();
+                            state.node_probe_ticks.clear();
+                            state.node_recovery_tick.clear();
+                            state.applied_progress.clear();
+                            Self::activate_v2(state);
+                            state.config_identity_enforced = true;
+                            should_recompute = true;
                         }
-                        // A first healthy report, or recovery without failback, has no timer.
-                    } else if state.failover_semantics == FailoverSemantics::Legacy {
-                        // Becoming unhealthy: reset any recovery timer.
-                        state.node_recovery_tick.remove(node_id);
-                        // A startup failure has no prior ownership to protect from failback.
-                        if !state.failback && previous_health == Some(true) {
-                            state.node_failback_blocked.insert(*node_id);
-                        }
+                        state.genesis = Some(genesis.clone());
+                        state.cluster_epoch = Some(genesis.epoch);
+                        KafResponse::Ok
                     }
+                }
+                KafRequest::HealthProgress(progress) => {
+                    if progress.validate().is_err()
+                        || state.genesis.as_ref() != Some(&progress.genesis)
+                        || !state
+                            .last_membership
+                            .membership()
+                            .nodes()
+                            .any(|(replica, _)| *replica == progress.replica)
+                    {
+                        return KafResponse::Rejected(
+                            "progress context differs from committed genesis".into(),
+                        );
+                    }
+                    let voters =
+                        super::membership::unique_voters(state.last_membership.membership());
+                    state.applied_progress.insert(
+                        progress.node_id,
+                        super::super::admission::AppliedHealthProgress {
+                            request: progress.clone(),
+                            log_id: entry.log_id,
+                        },
+                    );
+                    if let Some(healthy) = progress.healthy {
+                        let eligible = voters.get(&progress.node_id) == Some(&progress.replica);
+                        Self::apply_health(state, progress.node_id, healthy && eligible);
+                        should_recompute = true;
+                    }
+                    KafResponse::Ok
+                }
+                KafRequest::HealthUpdate { node_id, healthy } => {
+                    if state.genesis.is_some() {
+                        return KafResponse::Rejected(
+                            "physical-only health has no boot authority".into(),
+                        );
+                    }
+                    Self::apply_health(state, *node_id, *healthy);
                     should_recompute = true;
                     KafResponse::Ok
                 }
@@ -199,7 +242,7 @@ impl KafStateMachine {
                 }
             },
             EntryPayload::Membership(mem) => {
-                state.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
+                state.apply_membership(mem.clone(), entry.log_id);
                 should_recompute = true;
                 KafResponse::Ok
             }
@@ -209,68 +252,65 @@ impl KafStateMachine {
             if state.failover_semantics == FailoverSemantics::V2 {
                 Self::update_v2_failback_tracking(state);
             }
-            let membership = state.last_membership.clone();
-            let health = state.node_health.clone();
-            let ticks = state.node_probe_ticks.clone();
             let latest = state.latest_probe_tick;
-            let stale = state.stale_missed_probes;
-            let failback_delay = state.failback_delay_ticks;
-            let recovery_ticks = state.node_recovery_tick.clone();
-            let failback_blocked = state.node_failback_blocked.clone();
-            let node_nopreempt = state.node_nopreempt.clone();
-            let vips = Arc::clone(&state.vip_list);
-            // Prior committed holders feed the minimal-movement recompute. Read before the
-            // `mem::take` below so it reflects the assignment state as of this entry; it is
-            // deterministic because `vip_assignments` is itself replicated committed state.
-            let current_holders: HashMap<IpAddr, u64> = state
+            let eligibility = EligibilityInputs::from(&*state);
+            // Prior committed holders keep recomputation stable across topology changes.
+            let current_holders: BTreeMap<IpAddr, u64> = state
                 .vip_assignments
                 .iter()
                 .map(|(ip, a)| (*ip, a.holder))
                 .collect();
-            let mut vip_holder = HashMap::new();
+            let mut vip_holder = BTreeMap::new();
             match state.failover_semantics {
                 FailoverSemantics::Legacy => recompute_vip_holder(
-                    &membership,
-                    &health,
-                    &ticks,
-                    latest,
-                    stale,
-                    failback_delay,
-                    &recovery_ticks,
-                    &failback_blocked,
-                    vips.as_ref(),
+                    &state.last_membership,
+                    &eligibility,
+                    &state.node_failback_blocked,
+                    &state.vip_list,
                     &current_holders,
                     &mut vip_holder,
                 ),
                 FailoverSemantics::V2 => recompute_vip_holder_v2(
-                    &membership,
-                    &health,
-                    &ticks,
-                    latest,
-                    stale,
-                    failback_delay,
-                    &recovery_ticks,
-                    &node_nopreempt,
-                    vips.as_ref(),
+                    &state.last_membership,
+                    &eligibility,
+                    &state.node_nopreempt,
+                    &state.vip_list,
                     &current_holders,
                     &mut vip_holder,
                 ),
             }
-            let mut assignments = std::mem::take(&mut state.vip_assignments);
-            let mut generations = std::mem::take(&mut state.vip_generation);
             reconcile_vip_assignments(
                 &vip_holder,
                 latest,
-                vips.as_ref(),
-                &mut assignments,
-                &mut generations,
+                &state.vip_list,
+                &mut state.vip_assignments,
+                &mut state.vip_generation,
                 &mut state.vip_last_holder,
             );
-            state.vip_assignments = assignments;
-            state.vip_generation = generations;
         }
 
         resp
+    }
+
+    fn apply_health(state: &mut KafStorageState, node_id: u64, healthy: bool) {
+        let previous_health = state.node_health.insert(node_id, healthy);
+        let next_tick = next_probe_tick(
+            state.node_probe_ticks.get(&node_id).copied(),
+            state.latest_probe_tick,
+        );
+        state.node_probe_ticks.insert(node_id, next_tick);
+        // `next_probe_tick` never trails the frontier.
+        state.latest_probe_tick = next_tick;
+        if state.failover_semantics == FailoverSemantics::Legacy && healthy {
+            if state.failback && previous_health == Some(false) {
+                state.node_recovery_tick.insert(node_id, next_tick);
+            }
+        } else if state.failover_semantics == FailoverSemantics::Legacy {
+            state.node_recovery_tick.remove(&node_id);
+            if !state.failback && previous_health == Some(true) {
+                state.node_failback_blocked.insert(node_id);
+            }
+        }
     }
 }
 
@@ -303,9 +343,12 @@ impl RaftStateMachine<TypeConfig> for KafStateMachine {
     where
         Strm: Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + OptionalSend,
     {
-        let mut state = self.state.write().await;
         while let Some((entry, responder)) = entries.try_next().await? {
-            let resp = Self::apply_one(&mut state, &entry);
+            let resp = {
+                let mut state = self.state.write().await;
+                check_mutation(&state)?;
+                Self::apply_one(&mut state, &entry)
+            };
             if let Some(responder) = responder {
                 responder.send(resp);
             }
@@ -331,46 +374,22 @@ impl RaftStateMachine<TypeConfig> for KafStateMachine {
         })?;
 
         let mut state = self.state.write().await;
-        state.last_applied_log = snap.last_applied;
-        state.last_membership = snap.last_membership.clone();
-        state.node_health = snap.node_health.clone();
-        state.node_probe_ticks = snap.node_probe_ticks.clone();
-        state.latest_probe_tick = snap.latest_probe_tick;
-        state.vip_assignments = snap.vip_assignments.clone();
-        state.vip_generation = snap.vip_generation.clone();
-        state.vip_last_holder = snap.vip_last_holder.clone();
-        // Adopt the incarnation carried by the snapshot. A node catching up via InstallSnapshot
-        // thereby takes on the sender's cluster identity (set-once already held when the snapshot
-        // was built).
-        state.cluster_epoch = snap.cluster_epoch;
-        // Restore failback tracking from snapshot.
-        state.node_recovery_tick = snap.node_recovery_tick.clone();
-        state.failover_semantics = snap.failover_semantics;
-        state.config_identity_enforced = snap.config_identity_enforced;
-        state.node_nopreempt = snap.node_nopreempt.clone();
-        state.node_recovery_pending = snap.node_recovery_pending.clone();
-        // `node_failback_blocked` is only ever populated under `failback: false`
-        // (apply path). `failback` is config-derived and not replicated, and must be identical on
-        // every member (see the KafStorageState doc). Reconcile against the local config rather than
-        // copying verbatim, so a `failback: true` node never adopts a blocked set its own config
-        // could not produce; a `failback: false` node keeps the set.
-        match state.failover_semantics {
-            FailoverSemantics::Legacy if state.failback => {
-                state.node_failback_blocked.clear();
-            }
-            FailoverSemantics::Legacy => {
-                state.node_failback_blocked = snap.node_failback_blocked.clone();
-            }
-            FailoverSemantics::V2 if state.failback => {
-                state.node_failback_blocked.clear();
-                state.node_nopreempt.clear();
-            }
-            FailoverSemantics::V2 => {
-                state.node_failback_blocked.clear();
-                state.node_recovery_pending.clear();
-                state.node_recovery_tick.clear();
-            }
+        if state
+            .genesis
+            .as_ref()
+            .is_some_and(|genesis| snap.genesis.as_ref() != Some(genesis))
+            || state
+                .admission
+                .as_ref()
+                .is_some_and(|session| snap.genesis.as_ref() != Some(&session.context().genesis))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "snapshot admission genesis mismatch",
+            ));
         }
+        check_mutation(&state)?;
+        snap.restore_into(&mut state);
 
         // Keep the local log view consistent with the installed snapshot. After a snapshot covers
         // indices up to N the core advances last-applied to N and reads ranges starting at N+1; any

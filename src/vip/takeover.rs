@@ -1,6 +1,6 @@
 //! Process-local delay for takeover without a previous holder's explicit release (#26).
 use crate::raft::store::{VipAssignment, is_node_probe_fresh};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -24,7 +24,7 @@ impl TakeoverDelay {
         vip: IpAddr,
         node_id: u64,
         assignment: Option<&VipAssignment>,
-        ticks: &HashMap<u64, u64>,
+        ticks: &BTreeMap<u64, u64>,
         frontier: u64,
         stale: u64,
         activated_generation: Option<u64>,
@@ -50,12 +50,16 @@ impl TakeoverDelay {
         let previous_tick = assignment
             .previous_holder
             .and_then(|node| ticks.get(&node).copied());
-        let pending = self
-            .waiting
-            .entry(vip)
-            .or_insert_with(|| (assignment.generation, previous_tick, Instant::now()));
+        let pending = self.waiting.entry(vip).or_insert_with(|| {
+            tracing::debug!(%vip, node_id, generation = assignment.generation,
+                    ?previous_tick, frontier, wait_ms = self.lifetime.as_millis(),
+                    "waiting for previous VIP holder lease expiry");
+            (assignment.generation, previous_tick, Instant::now())
+        });
         // #26: a renewed holder can become stale again between local samples after bursty commits.
         if pending.0 != assignment.generation || pending.1 != previous_tick {
+            tracing::debug!(%vip, node_id, generation = assignment.generation,
+                ?previous_tick, frontier, "restarting previous VIP holder lease wait");
             *pending = (assignment.generation, previous_tick, Instant::now());
         }
         pending.2.elapsed() >= self.lifetime
@@ -79,7 +83,7 @@ mod tests {
     fn ready(
         delay: &mut TakeoverDelay,
         assignment: Option<&VipAssignment>,
-        ticks: &HashMap<u64, u64>,
+        ticks: &BTreeMap<u64, u64>,
         activated: Option<u64>,
     ) -> bool {
         delay.ready(
@@ -106,13 +110,13 @@ mod tests {
             },
             "lo".into(),
         )];
-        let mut assignments = HashMap::new();
-        let mut generations = HashMap::new();
-        let mut last_holders = HashMap::new();
+        let mut assignments = BTreeMap::new();
+        let mut generations = BTreeMap::new();
+        let mut last_holders = BTreeMap::new();
         for holders in [
-            HashMap::from([(vip, 1)]),
-            HashMap::new(),
-            HashMap::from([(vip, 2)]),
+            BTreeMap::from([(vip, 1)]),
+            BTreeMap::new(),
+            BTreeMap::from([(vip, 2)]),
         ] {
             reconcile_vip_assignments(
                 &holders,
@@ -125,12 +129,12 @@ mod tests {
         }
         let assignment = assignments.get(&vip).unwrap();
         let mut delay = TakeoverDelay::new(Duration::from_secs(1));
-        let fresh = HashMap::from([(1, 10)]);
+        let fresh = BTreeMap::from([(1, 10)]);
         assert!(!ready(&mut delay, Some(assignment), &fresh, None));
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(!ready(&mut delay, Some(assignment), &fresh, None));
 
-        let stale = HashMap::from([(1, 1)]);
+        let stale = BTreeMap::from([(1, 1)]);
         assert!(!ready(&mut delay, Some(assignment), &stale, None));
         tokio::time::advance(Duration::from_millis(999)).await;
         assert!(!ready(&mut delay, Some(assignment), &stale, None));
@@ -142,7 +146,7 @@ mod tests {
     async fn stale_takeover_waits_a_full_proof_lifetime_even_after_bursty_commits() {
         let mut delay = TakeoverDelay::new(Duration::from_secs(1));
         let assignment = assignment();
-        let stale = HashMap::from([(1, 1)]);
+        let stale = BTreeMap::from([(1, 1)]);
         assert!(!ready(&mut delay, Some(&assignment), &stale, None));
         tokio::time::advance(Duration::from_millis(999)).await;
         assert!(!ready(&mut delay, Some(&assignment), &stale, None));
@@ -157,7 +161,7 @@ mod tests {
         assert!(!ready(
             &mut delay,
             Some(&assignment),
-            &HashMap::from([(1, 1)]),
+            &BTreeMap::from([(1, 1)]),
             None
         ));
         tokio::time::advance(Duration::from_millis(900)).await;
@@ -165,7 +169,7 @@ mod tests {
         assert!(!ready(
             &mut delay,
             Some(&assignment),
-            &HashMap::from([(1, 3)]),
+            &BTreeMap::from([(1, 3)]),
             None
         ));
         tokio::time::advance(Duration::from_millis(100)).await;
@@ -173,7 +177,7 @@ mod tests {
             !ready(
                 &mut delay,
                 Some(&assignment),
-                &HashMap::from([(1, 3)]),
+                &BTreeMap::from([(1, 3)]),
                 None
             ),
             "an already-stale renewed holder still needs a complete new lease wait"
@@ -182,7 +186,7 @@ mod tests {
         assert!(ready(
             &mut delay,
             Some(&assignment),
-            &HashMap::from([(1, 3)]),
+            &BTreeMap::from([(1, 3)]),
             None
         ));
     }
@@ -191,13 +195,13 @@ mod tests {
     async fn fresh_previous_holder_resets_the_wait() {
         let mut delay = TakeoverDelay::new(Duration::from_secs(1));
         let assignment = assignment();
-        let stale = HashMap::from([(1, 1)]);
+        let stale = BTreeMap::from([(1, 1)]);
         assert!(!ready(&mut delay, Some(&assignment), &stale, None));
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(!ready(
             &mut delay,
             Some(&assignment),
-            &HashMap::from([(1, 10)]),
+            &BTreeMap::from([(1, 10)]),
             None
         ));
         assert!(!ready(&mut delay, Some(&assignment), &stale, None));
@@ -209,7 +213,7 @@ mod tests {
     async fn missing_changed_or_foreign_assignment_cannot_reuse_a_wait() {
         let mut delay = TakeoverDelay::new(Duration::from_secs(1));
         let mut assignment = assignment();
-        let ticks = HashMap::new();
+        let ticks = BTreeMap::new();
         assert!(!ready(&mut delay, Some(&assignment), &ticks, None));
         tokio::time::advance(Duration::from_secs(1)).await;
         assignment.generation += 1;
@@ -225,7 +229,7 @@ mod tests {
     async fn explicit_release_cold_start_and_prior_activation_do_not_wait() {
         let mut delay = TakeoverDelay::new(Duration::from_secs(1));
         let mut assignment = assignment();
-        let ticks = HashMap::new();
+        let ticks = BTreeMap::new();
         assert!(ready(&mut delay, Some(&assignment), &ticks, Some(2)));
         assignment.previous_holder_released = true;
         assert!(ready(&mut delay, Some(&assignment), &ticks, None));

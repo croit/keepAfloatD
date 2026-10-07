@@ -34,7 +34,7 @@ kill_service node-a KILL
 wait_for_service_exit node-a 10
 
 # node-a's VIP fails over; node-b and node-c keep serving, balanced and uniquely held.
-wait_for_even_over_nodes 30 node-b node-c
+wait_for_even_over_nodes "$(cleanup_budget_seconds 30)" node-b node-c
 
 # Stickiness: every VIP that was NOT on node-a must still be on the SAME node it started on -- a
 # healthy survivor never gives up a VIP just because node-a left.
@@ -53,7 +53,8 @@ done
 restart_checkpoint="$(log_checkpoint)"
 start_service node-a
 wait_for_service_running node-a 10
-wait_for_log_any_after "${restart_checkpoint}" 30 'reports a compatible existing cluster'
-wait_for_even_over_nodes 45 "${NODES[@]}"
+startup_budget="$(startup_budget_seconds 30 node-a)"
+wait_for_log_any_after "${restart_checkpoint}" "${startup_budget}" 'committed learner promotion'
+wait_for_startup_over_nodes 45 "${NODES[@]}"
 assert_unique_holders
 wait_for_single_agreed_leader 15

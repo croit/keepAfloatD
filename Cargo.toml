@@ -14,7 +14,7 @@ path = "src/main.rs"
 [package.metadata.deb]
 maintainer = "croit GmbH <support@croit.io>"
 copyright = "2026, croit GmbH. GNU AGPL v3 for community usage; commercial licensing available from croit.io."
-depends = "$auto, iproute2, iputils-arping, ca-certificates"
+depends = "$auto, iproute2, iputils-arping, libndp-tools (>= 1.8), ca-certificates"
 section = "net"
 priority = "optional"
 maintainer-scripts = "deploy/debian/"
@@ -24,6 +24,7 @@ assets = [
   ["LICENSE", "usr/share/doc/keepafloatd/LICENSE", "644"],
   ["LICENSES/AGPL-3.0.txt", "usr/share/doc/keepafloatd/licenses/AGPL-3.0.txt", "644"],
   ["LICENSES/COMMERCIAL.md", "usr/share/doc/keepafloatd/licenses/COMMERCIAL.md", "644"],
+  ["LICENSES/subtle-2.6.1.txt", "usr/share/doc/keepafloatd/licenses/subtle-2.6.1.txt", "644"],
   ["THIRD_PARTY_LICENSES.md", "usr/share/doc/keepafloatd/THIRD_PARTY_LICENSES.md", "644"],
   ["config.example.yaml", "etc/keepafloatd/config.yaml", "600"],
   ["deploy/default/keepafloatd", "etc/default/keepafloatd", "644"],
@@ -40,6 +41,7 @@ assets = [
   { source = "LICENSE", dest = "/usr/share/doc/keepafloatd/LICENSE", mode = "644" },
   { source = "LICENSES/AGPL-3.0.txt", dest = "/usr/share/doc/keepafloatd/licenses/AGPL-3.0.txt", mode = "644" },
   { source = "LICENSES/COMMERCIAL.md", dest = "/usr/share/doc/keepafloatd/licenses/COMMERCIAL.md", mode = "644" },
+  { source = "LICENSES/subtle-2.6.1.txt", dest = "/usr/share/doc/keepafloatd/licenses/subtle-2.6.1.txt", mode = "644" },
   { source = "THIRD_PARTY_LICENSES.md", dest = "/usr/share/doc/keepafloatd/THIRD_PARTY_LICENSES.md", mode = "644" },
   { source = "config.example.yaml", dest = "/etc/keepafloatd/config.yaml", mode = "600", config = "noreplace", user = "root", group = "root" },
   { source = "deploy/default/keepafloatd", dest = "/etc/default/keepafloatd", mode = "644", config = true },
@@ -49,6 +51,7 @@ assets = [
 # el9/Fedora name the package "iproute" (iproute2 is the Debian name).
 iproute = "*"
 iputils = "*"
+libndp = ">= 1.8"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -65,8 +68,23 @@ openraft = { version = "=0.10.0-alpha.32", features = ["serde", "type-alias"] }
 futures = "0.3"
 # Collision-resistant, versioned identity for cluster-wide configuration invariants.
 sha2 = "0.10"
+# Reviewed HMAC and constant-time tag verification; never implement our own MAC.
+hmac = "0.12"
+# Reuse the locked OS-entropy API instead of adding a userspace RNG.
+getrandom = "0.4.3"
 # Linux process-group termination for cancellation-safe health probes.
 libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

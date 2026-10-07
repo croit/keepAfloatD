@@ -1,22 +1,16 @@
 //! Diskless kernel ownership markers for crash-time VIP discovery.
 
+use super::command::CommandRunner;
 use crate::config::VipAddr;
+use anyhow::Context;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::VecDeque;
 use std::net::IpAddr;
-#[cfg(test)]
-use std::os::unix::process::ExitStatusExt;
-#[cfg(test)]
-use std::process::ExitStatus;
 use std::process::Output;
+use std::sync::Arc;
 use tokio::process::Command;
-#[cfg(test)]
-use tokio::sync::Mutex;
 
-#[cfg(not(test))]
 use super::effects::{IP_COMMAND_TIMEOUT, presence_probe_command};
 use super::effects::{
     VIP_MARKER_ROUTE_TABLE_BASE, marker_route_delete_arguments, marker_route_probe_arguments,
@@ -25,29 +19,12 @@ use super::effects::{
 
 pub(super) struct OwnershipMarker {
     protocol: u8,
-    #[cfg(test)]
-    next_replace_result: Mutex<Option<std::io::Result<ExitStatus>>>,
-    #[cfg(test)]
-    next_bind_presence_result: Mutex<Option<std::io::Result<Output>>>,
-    #[cfg(test)]
-    delete_results: Mutex<VecDeque<std::io::Result<ExitStatus>>>,
-    #[cfg(test)]
-    delete_probe_results: Mutex<VecDeque<std::io::Result<Output>>>,
+    runner: Arc<dyn CommandRunner>,
 }
 
 impl OwnershipMarker {
-    pub(super) fn new(protocol: u8) -> Self {
-        Self {
-            protocol,
-            #[cfg(test)]
-            next_replace_result: Mutex::new(None),
-            #[cfg(test)]
-            next_bind_presence_result: Mutex::new(None),
-            #[cfg(test)]
-            delete_results: Mutex::new(VecDeque::new()),
-            #[cfg(test)]
-            delete_probe_results: Mutex::new(VecDeque::new()),
-        }
+    pub(super) fn new(protocol: u8, runner: Arc<dyn CommandRunner>) -> Self {
+        Self { protocol, runner }
     }
 
     pub(super) const fn protocol(&self) -> u8 {
@@ -59,15 +36,11 @@ impl OwnershipMarker {
         command
             .args(marker_route_replace_arguments(address, self.protocol))
             .kill_on_drop(true);
-        #[cfg(test)]
         let status = self
-            .next_replace_result
-            .lock()
+            .runner
+            .status(&mut command, IP_COMMAND_TIMEOUT)
             .await
-            .take()
-            .unwrap_or_else(|| Err(std::io::Error::other("no forced marker replace result")))?;
-        #[cfg(not(test))]
-        let status = crate::process::run_status(&mut command, IP_COMMAND_TIMEOUT).await?;
+            .context("VIP operation=marker_replace")?;
         anyhow::ensure!(status.success(), "ip route marker replace failed: {status}");
         Ok(())
     }
@@ -77,15 +50,7 @@ impl OwnershipMarker {
         command
             .args(marker_route_delete_arguments(address, self.protocol))
             .kill_on_drop(true);
-        #[cfg(test)]
-        let status = self
-            .delete_results
-            .lock()
-            .await
-            .pop_front()
-            .unwrap_or_else(|| Ok(ExitStatus::from_raw(0)))?;
-        #[cfg(not(test))]
-        let status = crate::process::run_status(&mut command, IP_COMMAND_TIMEOUT).await?;
+        let status = self.runner.status(&mut command, IP_COMMAND_TIMEOUT).await?;
         if status.success() {
             return Ok(());
         }
@@ -95,19 +60,10 @@ impl OwnershipMarker {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        #[cfg(test)]
         let probe = self
-            .delete_probe_results
-            .lock()
-            .await
-            .pop_front()
-            .unwrap_or_else(|| {
-                Err(std::io::Error::other(
-                    "no forced marker delete presence result",
-                ))
-            })?;
-        #[cfg(not(test))]
-        let probe = crate::process::run_output(&mut probe_command, IP_COMMAND_TIMEOUT).await?;
+            .runner
+            .output(&mut probe_command, IP_COMMAND_TIMEOUT)
+            .await?;
         let absent = failed_marker_delete_is_absent(probe, address, self.protocol).map_err(|error| {
             anyhow::anyhow!(
                 "ip route marker del failed ({status}) and presence verification failed: {error}"
@@ -123,20 +79,13 @@ impl OwnershipMarker {
     pub(super) async fn remove_after_failed_first_bind(
         &self,
         address: IpAddr,
-        _interface: &str,
-        _prefix: u8,
+        prefix: u8,
     ) -> anyhow::Result<()> {
-        #[cfg(not(test))]
-        let mut probe_command = presence_probe_command(_interface, address, _prefix);
-        #[cfg(test)]
+        let mut probe_command = presence_probe_command(address, prefix);
         let probe = self
-            .next_bind_presence_result
-            .lock()
-            .await
-            .take()
-            .unwrap_or_else(|| Err(std::io::Error::other("no forced bind presence result")));
-        #[cfg(not(test))]
-        let probe = crate::process::run_output(&mut probe_command, IP_COMMAND_TIMEOUT).await;
+            .runner
+            .output(&mut probe_command, IP_COMMAND_TIMEOUT)
+            .await;
         let address_absent = matches!(
             probe,
             Ok(ref output) if output.status.success() && output.stdout.is_empty()
@@ -148,31 +97,6 @@ impl OwnershipMarker {
         self.delete(address).await.map_err(|error| {
             anyhow::anyhow!("address is absent but ownership marker cleanup failed: {error}")
         })
-    }
-
-    #[cfg(test)]
-    pub(super) async fn force_next_replace_result(&self, result: std::io::Result<ExitStatus>) {
-        *self.next_replace_result.lock().await = Some(result);
-    }
-
-    #[cfg(test)]
-    pub(super) async fn force_next_bind_presence_result(&self, result: std::io::Result<Output>) {
-        *self.next_bind_presence_result.lock().await = Some(result);
-    }
-
-    #[cfg(test)]
-    pub(super) async fn force_delete_results(&self, results: Vec<std::io::Result<ExitStatus>>) {
-        *self.delete_results.lock().await = results.into();
-    }
-
-    #[cfg(test)]
-    pub(super) async fn force_delete_probe_results(&self, results: Vec<std::io::Result<Output>>) {
-        *self.delete_probe_results.lock().await = results.into();
-    }
-
-    #[cfg(test)]
-    pub(super) async fn remaining_delete_results(&self) -> usize {
-        self.delete_results.lock().await.len()
     }
 }
 
@@ -438,30 +362,34 @@ fn marker_discovery_command_arguments(ipv6: bool) -> [String; 7] {
     ]
 }
 
-#[cfg(not(test))]
 pub(super) async fn discover_owned_addresses(
+    runner: &dyn CommandRunner,
     address_protocol: u8,
 ) -> anyhow::Result<OwnershipDiscovery> {
     let address_arguments = discovery_command_arguments();
     let ipv4_arguments = marker_discovery_command_arguments(false);
     let ipv6_arguments = marker_discovery_command_arguments(true);
     let (addresses, ipv4_routes, ipv6_routes) = tokio::try_join!(
-        run_discovery_command(&address_arguments, "addresses"),
-        run_discovery_command(&ipv4_arguments, "IPv4 marker routes"),
-        run_discovery_command(&ipv6_arguments, "IPv6 marker routes"),
+        run_discovery_command(runner, &address_arguments, "addresses"),
+        run_discovery_command(runner, &ipv4_arguments, "IPv4 marker routes"),
+        run_discovery_command(runner, &ipv6_arguments, "IPv6 marker routes"),
     )?;
     parse_discovery_outputs(addresses, ipv4_routes, ipv6_routes, address_protocol)
 }
 
-#[cfg(not(test))]
-async fn run_discovery_command(arguments: &[String], subject: &str) -> anyhow::Result<Output> {
+async fn run_discovery_command(
+    runner: &dyn CommandRunner,
+    arguments: &[String],
+    subject: &str,
+) -> anyhow::Result<Output> {
     let mut command = Command::new("ip");
     command
         .args(arguments)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    crate::process::run_output(&mut command, IP_COMMAND_TIMEOUT)
+    runner
+        .output(&mut command, IP_COMMAND_TIMEOUT)
         .await
         .map_err(|error| anyhow::anyhow!("discover keepafloatd-owned {subject}: {error}"))
 }

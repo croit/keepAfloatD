@@ -19,6 +19,8 @@ services:
     build:
       context: ./tests/e2e
       dockerfile: fixtures/Dockerfile
+      args:
+        DOCKER_HUB_MIRROR: ${DOCKER_HUB_MIRROR:-docker.io}
     init: true
     restart: "no"
     command: ["sh", "-ec", "mkdir -p /fixtures-out && cp -a /opt/keepafloatd-tests/. /fixtures-out/"]
@@ -64,6 +66,8 @@ services:
   e2e-runner:
     build:
       context: ./tests/e2e/runner
+      args:
+        DOCKER_HUB_MIRROR: ${DOCKER_HUB_MIRROR:-docker.io}
     init: true
     restart: "no"
     cap_add:

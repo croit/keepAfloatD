@@ -16,14 +16,15 @@ kill_service node-a KILL
 wait_for_service_exit node-a 10
 
 # Survivors keep serving and collapse VIPs evenly onto the remaining pair (leader id not asserted).
-wait_for_even_over_nodes 30 node-b node-c
+wait_for_even_over_nodes "$(cleanup_budget_seconds 30)" node-b node-c
 
 # Bring node-a back blank; it must discover the existing cluster and join, not re-form.
 restart_checkpoint="$(log_checkpoint)"
 start_service node-a
 wait_for_service_running node-a 10
-wait_for_log_any_after "${restart_checkpoint}" 30 'reports a compatible existing cluster'
+startup_budget="$(startup_budget_seconds 30 node-a)"
+wait_for_log_any_after "${restart_checkpoint}" "${startup_budget}" 'committed learner promotion'
 
 # Cluster stays consistent (no split brain): unique holders, back to an even 3-node spread.
-wait_for_even_over_nodes 45 "${NODES[@]}"
+wait_for_startup_over_nodes 45 "${NODES[@]}"
 assert_unique_holders

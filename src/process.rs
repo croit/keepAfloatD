@@ -4,6 +4,7 @@
 //! group, so timeout and async-task cancellation cannot leave shell descendants behind (#24).
 
 use std::io;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitStatus, Output, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -11,12 +12,12 @@ use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
 /// Bound reaping after a timed-out process group has received SIGKILL.
-const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const PROCESS_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 /// Grace period for draining a child's stdout/stderr after it has exited (or been killed). A
 /// child that forks a background descendant inheriting the pipe (`curl ... &`, `nc -l &`) keeps
 /// the write end open, so the reader never sees EOF; without this bound callers would never
 /// return.
-const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// Capture bound for strict `wait_output` callers.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -89,6 +90,7 @@ impl ProcessGroupGuard {
         }
         // SAFETY: `pgid` is a validated positive child PID created as a new process group. Its
         // negation signals only that child group, never keepafloatd's own process group.
+        #[allow(unsafe_code)]
         let result = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
         if result == 0 {
             self.armed = false;
@@ -131,8 +133,13 @@ impl GroupedChild {
     }
 
     pub(crate) async fn wait_status(mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let pid = self.group.pgid;
+        let started = std::time::Instant::now();
         let wait_result = tokio::time::timeout(timeout, self.child.wait()).await;
+        let wait_elapsed = started.elapsed();
+        let cleanup_started = std::time::Instant::now();
         let cleanup_result = self.group.terminate();
+        let cleanup_elapsed = cleanup_started.elapsed();
         match wait_result {
             Ok(Ok(status)) => {
                 cleanup_result?;
@@ -144,10 +151,26 @@ impl GroupedChild {
             }
             Err(_) => {
                 cleanup_result?;
+                let reap_started = std::time::Instant::now();
                 let reap = tokio::time::timeout(PROCESS_REAP_TIMEOUT, self.child.wait())
                     .await
                     .ok();
-                Err(timed_out_error(timeout, reap))
+                let reap_elapsed = reap_started.elapsed();
+                let status = reap.as_ref().and_then(|result| result.as_ref().ok());
+                let exit_code = status.and_then(ExitStatus::code);
+                let signal = status.and_then(ExitStatusExt::signal);
+                let error = timed_out_error(timeout, reap);
+                Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; pid={pid} budget_ms={} wait_ms={} overrun_ms={} cleanup_ms={} reap_ms={} exit_code={exit_code:?} signal={signal:?}",
+                        timeout.as_millis(),
+                        wait_elapsed.as_millis(),
+                        wait_elapsed.saturating_sub(timeout).as_millis(),
+                        cleanup_elapsed.as_millis(),
+                        reap_elapsed.as_millis(),
+                    ),
+                ))
             }
         }
     }
@@ -213,9 +236,12 @@ fn timed_out_error(timeout: Duration, reap: Option<io::Result<ExitStatus>>) -> i
     }
 }
 
-/// Spawn `command` in a dedicated Linux process group with direct-child kill-on-drop enabled.
+/// Spawn a noninteractive command with null stdin in an owned Linux process group.
 pub(crate) fn spawn_grouped(command: &mut Command) -> io::Result<GroupedChild> {
-    command.process_group(0).kill_on_drop(true);
+    command
+        .stdin(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true);
     let child = command.spawn()?;
     let pid = child.id().ok_or_else(|| {
         io::Error::other("spawned child did not expose a process-group identifier")
@@ -296,6 +322,110 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", script]);
         command
+    }
+
+    async fn assert_stdin_isolated(mode: &str, test_name: &str) {
+        use std::io::BufRead;
+        use tokio::io::AsyncWriteExt;
+
+        const INPUT: &str = "parent input must remain unread\n";
+        if std::env::var("KEEPAFLOATD_STDIN_TEST").as_deref() != Ok(test_name) {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture", "--color=never"])
+                .env("KEEPAFLOATD_STDIN_TEST", test_name)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            input.write_all(INPUT.as_bytes()).await.unwrap();
+            let output = tokio::time::timeout(Duration::from_secs(3), child.wait_with_output())
+                .await
+                .expect("isolated stdin test timed out")
+                .unwrap();
+            drop(input);
+            assert!(
+                output.status.success(),
+                "{test_name}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains(&format!("test {test_name} ... ok")),
+                "isolated child did not execute {test_name}"
+            );
+            return;
+        }
+
+        let mut command =
+            shell("if IFS= read -r input; then exit 7; fi; printf stdout; printf stderr >&2");
+        let timeout = Duration::from_secs(1);
+        match mode {
+            "status" => {
+                null_stdio(&mut command);
+                let status = run_status(&mut command, timeout).await.unwrap();
+                assert_eq!(
+                    status.code(),
+                    Some(0),
+                    "child must see EOF, not parent input"
+                );
+            }
+            "output" => {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                let output = run_output(&mut command, timeout).await.unwrap();
+                assert_eq!(output.status.code(), Some(0), "child must see EOF");
+                assert_eq!(output.stdout, b"stdout");
+                assert_eq!(output.stderr, b"stderr");
+            }
+            "captured" => {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                let run = spawn_grouped(&mut command)
+                    .unwrap()
+                    .wait_captured(timeout, 64)
+                    .await;
+                let Completion::Exited(status) = run.completion else {
+                    panic!("child did not exit: {:?}", run.completion);
+                };
+                assert_eq!(status.code(), Some(0), "child must see EOF");
+                assert!(run.cleanup_error.is_none());
+                assert_eq!(run.stdout.preview(), "stdout");
+                assert_eq!(run.stderr.preview(), "stderr");
+            }
+            _ => panic!("unknown runner mode: {mode}"),
+        }
+        let mut remaining = String::new();
+        std::io::stdin().lock().read_line(&mut remaining).unwrap();
+        assert_eq!(remaining, INPUT, "parent input must stay unread");
+    }
+
+    #[tokio::test]
+    async fn run_status_does_not_inherit_stdin() {
+        assert_stdin_isolated(
+            "status",
+            "process::tests::run_status_does_not_inherit_stdin",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn run_output_does_not_inherit_stdin() {
+        assert_stdin_isolated(
+            "output",
+            "process::tests::run_output_does_not_inherit_stdin",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn wait_captured_does_not_inherit_stdin() {
+        assert_stdin_isolated(
+            "captured",
+            "process::tests::wait_captured_does_not_inherit_stdin",
+        )
+        .await;
     }
 
     fn unique_pid_file(label: &str) -> PathBuf {
@@ -416,15 +546,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeout_diagnostics_identify_wait_and_reap_without_command_secrets() {
+        let mut command = shell("sleep 30 # secret-argument-sentinel");
+        command.env("SECRET_TEST_VALUE", "secret-environment-sentinel");
+        null_stdio(&mut command);
+        let error = run_status(&mut command, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let diagnostic = error.to_string();
+        for field in [
+            "pid=",
+            "budget_ms=20",
+            "wait_ms=",
+            "overrun_ms=",
+            "cleanup_ms=",
+            "reap_ms=",
+            "exit_code=",
+            "signal=",
+        ] {
+            assert!(diagnostic.contains(field), "missing {field}: {diagnostic}");
+        }
+        assert!(!diagnostic.contains("secret-argument-sentinel"));
+        assert!(!diagnostic.contains("secret-environment-sentinel"));
+        assert!(!diagnostic.contains("sleep"));
+    }
+
+    async fn without_clock_advance<F: std::future::Future>(future: F) -> F::Output {
+        let watchdog = std::time::Instant::now();
+        tokio::pin!(future);
+        // Process creation and SIGCHLD delivery use the OS, not Tokio's paused clock.
+        loop {
+            assert!(
+                watchdog.elapsed() < Duration::from_secs(5),
+                "paused-clock process fixture exceeded its wall-clock watchdog"
+            );
+            tokio::select! {
+                biased;
+                result = &mut future => return result,
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn run_status_timeout_kills_and_reaps_the_child_and_descendant() {
         let parent_file = unique_pid_file("timeout-parent");
         let child_file = unique_pid_file("timeout-child");
         let mut command = shell(&pid_script(&parent_file, &child_file));
         null_stdio(&mut command);
 
-        let result = run_status(&mut command, Duration::from_millis(100)).await;
-        let parent = read_pid(&parent_file).await;
-        let child = read_pid(&child_file).await;
+        let started = tokio::time::Instant::now();
+        let run = run_status(&mut command, Duration::from_millis(100));
+        tokio::pin!(run);
+        let (parent, child) = without_clock_advance(async {
+            tokio::select! {
+                result = &mut run => panic!("command finished before process readiness: {result:?}"),
+                pids = async { (read_pid(&parent_file).await, read_pid(&child_file).await) } => pids,
+            }
+        })
+        .await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        tokio::time::advance(Duration::from_millis(99)).await;
+        assert!(futures::poll!(&mut run).is_pending());
+        assert!(process_exists(parent) && process_exists(child));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let result = without_clock_advance(run).await;
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        tokio::time::resume();
         let exited = wait_until_gone(&[parent, child]).await;
         force_cleanup(&[parent, child], &[parent_file, child_file]).await;
 

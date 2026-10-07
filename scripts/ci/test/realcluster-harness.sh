@@ -11,7 +11,8 @@ command -v python3 >/dev/null || {
 
 for required in README.md env.example.sh lib.sh scenario.sh run-all.sh \
   run-all-guard.sh self-test.sh safety-self-test.sh final-audit.sh soak.sh raft-deadline-probe.py \
-  evidence.sh evidence-self-test.sh journal-evidence.py journal-evidence-test.py; do
+  evidence.sh evidence-self-test.sh journal-evidence.py journal-evidence-test.py \
+  probe-compatibility-test.py; do
   if [[ ! -f "${HARNESS}/${required}" ]]; then
     echo "Missing real-cluster harness dependency: ${required}" >&2
     exit 1
@@ -30,9 +31,18 @@ if [[ ! -s "${scratch}/actual" ]] || ! diff -u "${scratch}/documented" "${scratc
   exit 1
 fi
 
-for helper in isolated-health-proof.sh isolated-health-proof.py; do
+for helper in isolated-health-proof.sh isolated-health-proof.py auth_wire.py auth_wire_test.py; do
   test -f "${ROOT}/tests/e2e/scripts/${helper}"
 done
+
+python3 -B "${ROOT}/tests/e2e/scripts/auth_wire_test.py"
+python3 -B "${ROOT}/tests/e2e/scripts/formation-peer-test.py"
+python3 -B "${HARNESS}/probe-compatibility-test.py"
+bash "${ROOT}/tests/e2e/scripts/cleanup-budget-test.sh"
+bash "${ROOT}/tests/e2e/scripts/startup-budget-test.sh"
+bash "${ROOT}/tests/e2e/scripts/nopreempt-restart-test.sh"
+bash "${ROOT}/tests/e2e/scripts/log-checkpoint-test.sh"
+bash "${ROOT}/tests/e2e/scripts/scenario-runner-test.sh"
 
 mapfile -t shell_files < <(find "${HARNESS}" -type f -name '*.sh' \
   ! -name 'env.sh' ! -path '*/results/*' | sort)
@@ -53,6 +63,8 @@ fi
 
 mkdir "${scratch}/harness"
 cp -a "${HARNESS}/." "${scratch}/harness/"
+mkdir -p "${scratch}/e2e/scripts"
+cp "${ROOT}/tests/e2e/scripts/isolated-health-proof.py" "${scratch}/e2e/scripts/"
 cp "${scratch}/harness/env.example.sh" "${scratch}/harness/env.sh"
 export SSH_CTL_DIR="${scratch}/ssh"
 bash "${scratch}/harness/self-test.sh"

@@ -5,40 +5,47 @@
 //! 1. Parse CLI / load + validate the YAML configuration.
 //! 2. Reclaim any VIPs left on the configured interfaces by a previous instance
 //!    ([`vip::LocalVip::startup_cleanup`]).
+//!    With `--cleanup-only`, exit here without starting the daemon or health checks.
 //! 3. Build the Raft runtime, start the peer transport and submit listener.
 //! 4. Spawn the health-publishing task and the VIP reconciliation loop.
-//! 5. Block on `SIGINT`, `SIGTERM` or `SIGHUP`. On signal: stop the reconcile loop, run
-//!    [`vip::LocalVip::unbind_all`] to remove every VIP this process bound, then shut down the
-//!    submit server, the Raft network and Raft itself before exiting. `SIGHUP` requests
+//! 5. Block on `SIGINT`, `SIGTERM`, `SIGHUP` or `SIGQUIT`. On signal: stop the reconcile loop, run
+//!    [`vip::LocalVip::unbind_all`] to remove every VIP this process bound, publish a bounded
+//!    ownership handoff, then shut down submit and Raft. `SIGHUP` and `SIGQUIT` request
 //!    a restart by returning a failure status after cleanup.
 //!
 //! See module `bind_policy`, `vip` and `README.md` for the binding rules and failure-handling
 //! semantics.
-
 mod admission;
+mod auth;
 mod bind_policy;
 mod config;
 mod connection_admission;
 mod consensus_freshness;
+mod frame;
+mod handoff;
 mod health;
+mod health_publication;
+mod listener;
 mod process;
 mod raft;
-mod secret;
+mod runtime_permission;
 #[cfg(not(test))]
 mod shutdown;
+mod stop_budget;
 mod submit;
 mod vip;
+mod warning_limit;
 
 #[cfg(test)]
 mod cluster_test;
 
 use crate::config::{Config, VipAddr};
+use crate::health::LocalHealth;
 use crate::raft::{FatalReason, start_raft};
 // `WatchReceiver` provides `borrow_watched()`/`changed()` on the 0.10 metrics watch handle.
 use openraft::async_runtime::WatchReceiver;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 #[cfg(not(test))]
@@ -137,6 +144,12 @@ struct Cli {
     /// Path to the YAML configuration file.
     #[arg(short, long, default_value = "config.yaml")]
     config: String,
+    /// Reclaim configured VIPs and this instance's marked orphans, then exit.
+    ///
+    /// Run only after the instance has stopped. Honors dry_run and starts no
+    /// Raft, listeners, health checks or notify hooks.
+    #[arg(long)]
+    cleanup_only: bool,
 }
 
 #[cfg(not(test))]
@@ -155,10 +168,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let signals = shutdown::Signals::install().context("install shutdown signals")?;
+    let signals = if cli.cleanup_only {
+        None
+    } else {
+        Some(shutdown::Signals::install().context("install shutdown signals")?)
+    };
     let cfg = Config::load_path(&cli.config).context("load config")?;
     let vip_table: Arc<Vec<_>> = Arc::new(cfg.sorted_vips());
     let vip_local = vip::LocalVip::new_with_address_protocol(cfg.dry_run, cfg.address_protocol);
+
+    let Some(signals) = signals else {
+        vip::warn_ipv4_secondary_removal(vip_table.as_ref(), cfg.dry_run).await;
+        vip_local
+            .startup_cleanup(vip_table.as_ref())
+            .await
+            .context("cleanup-only VIP cleanup")?;
+        tracing::info!("cleanup-only VIP cleanup complete");
+        return Ok(());
+    };
 
     let mut signal_result = Ok(());
     let fatal_reason = run(cfg, vip_table, vip_local, async {
@@ -185,7 +212,50 @@ async fn run(
     vip_local: Arc<vip::LocalVip>,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<Option<FatalReason>> {
+    run_with_listeners(
+        cfg,
+        vip_table,
+        vip_local,
+        shutdown,
+        listener::ListenerSource::Configured,
+        listener::ListenerSource::Configured,
+    )
+    .await
+}
+
+async fn run_with_listeners(
+    cfg: Arc<Config>,
+    vip_table: Arc<Vec<(VipAddr, String)>>,
+    vip_local: Arc<vip::LocalVip>,
+    shutdown: impl Future<Output = ()>,
+    raft_listener: listener::ListenerSource,
+    submit_listener: listener::ListenerSource,
+) -> anyhow::Result<Option<FatalReason>> {
+    let probe = health_publication::CommandProbe::new(cfg.health.clone());
+    run_with_probe(
+        cfg,
+        vip_table,
+        vip_local,
+        shutdown,
+        raft_listener,
+        submit_listener,
+        probe,
+    )
+    .await
+}
+
+async fn run_with_probe(
+    cfg: Arc<Config>,
+    vip_table: Arc<Vec<(VipAddr, String)>>,
+    vip_local: Arc<vip::LocalVip>,
+    shutdown: impl Future<Output = ()>,
+    raft_listener: listener::ListenerSource,
+    submit_listener: listener::ListenerSource,
+    probe: impl health_publication::Probe,
+) -> anyhow::Result<Option<FatalReason>> {
     let node_id = cfg.node_id;
+
+    vip::warn_ipv4_secondary_removal(vip_table.as_ref(), cfg.dry_run).await;
 
     // Reclaim any orphan VIPs from a previous instance before joining Raft. Doing this before
     // start_raft ensures peers cannot observe us as a holder while we still have a stale address
@@ -196,7 +266,7 @@ async fn run(
         .context("startup vip cleanup")?;
 
     let (raft, net, sm, mut fatal_rx, mut network_failure_rx, mut control_tasks) =
-        start_raft(cfg.clone(), vip_table.clone())
+        start_raft(cfg.clone(), vip_table.clone(), raft_listener)
             .await
             .context("start raft")?;
 
@@ -222,60 +292,22 @@ async fn run(
     let mut submit_task = {
         let cfg = cfg.clone();
         let raft = raft.clone();
-        tokio::spawn(async move { submit::run_submit_server(cfg, raft).await })
+        tokio::spawn(async move { submit::run_submit_server(cfg, raft, submit_listener).await })
     };
 
-    let local_healthy = Arc::new(AtomicBool::new(false));
+    let local_healthy = Arc::new(LocalHealth::new(false));
     let consensus_fresh = Arc::new(consensus_freshness::ConsensusFreshness::for_probe_cadence(
         cfg.health.interval_ms,
         cfg.health.effective_stale_missed_probes(),
     ));
 
-    let mut health_task: tokio::task::JoinHandle<()> = {
-        let cfg = cfg.clone();
-        let raft = raft.clone();
-        let local_healthy = local_healthy.clone();
-        let consensus_fresh = consensus_fresh.clone();
-        tokio::spawn(async move {
-            let failover_delay_ticks = cfg.effective_failover_delay_ticks();
-            let mut failure_dampener = health::FailureDampener::new(failover_delay_ticks);
-            let mut tick =
-                tokio::time::interval(tokio::time::Duration::from_millis(cfg.health.interval_ms));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tick.tick().await;
-                let raw_ok = health::run_health_check(&cfg.health).await;
-                let ok = failure_dampener.observe(raw_ok);
-                let previous_ok = local_healthy.swap(ok, Ordering::SeqCst);
-                if !raw_ok && ok && failure_dampener.failure_ticks() == 1 {
-                    tracing::warn!(
-                        failover_delay_secs = cfg.failover_delay_secs,
-                        "health probe failed; delaying failover"
-                    );
-                } else if previous_ok && !ok {
-                    tracing::warn!("effective local health became unhealthy");
-                } else if !previous_ok && ok {
-                    tracing::info!("effective local health became healthy");
-                }
-                let proof_started = tokio::time::Instant::now();
-                match submit::submit_health(&cfg, &raft, ok, || {
-                    fence_unavailable_health_proof(&consensus_fresh);
-                })
-                .await
-                {
-                    Ok(Some(_)) => consensus_fresh.record_success(proof_started),
-                    Ok(None) => {
-                        // #26: legacy leaders see only unhealthy reports from a proof-only follower.
-                        fence_unavailable_health_proof(&consensus_fresh);
-                    }
-                    Err(e) => {
-                        consensus_fresh.invalidate();
-                        tracing::warn!("health raft submit: {}", e);
-                    }
-                }
-            }
-        })
-    };
+    let mut health_task = tokio::spawn(health_publication::run_with_probe(
+        cfg.clone(),
+        local_healthy.clone(),
+        consensus_fresh.clone(),
+        health_publication::RuntimePublisher::new(control_tasks.runtime(), net.clone()),
+        probe,
+    ));
 
     let mut vip_task = tokio::spawn(vip::run_reconcile_loop(
         cfg.clone(),
@@ -310,6 +342,10 @@ async fn run(
             StopReason::Failed(supervision_channel_failure("Raft control task", failure)),
             FinishedTask::None,
         ),
+        failure = vip_local.notification_failure() => (
+            StopReason::Failed(anyhow::anyhow!(failure)),
+            FinishedTask::None,
+        ),
         result = &mut health_task => (
             StopReason::Failed(unexpected_task_failure("health", result)),
             FinishedTask::Health,
@@ -324,6 +360,7 @@ async fn run(
         ),
     };
 
+    stop_budget::stopping();
     let mut lifecycle_failures = Vec::new();
     if finished_task != FinishedTask::Vip {
         let result = stop_daemon_task("VIP reconciliation", &mut vip_task).await;
@@ -333,16 +370,33 @@ async fn run(
         let result = stop_daemon_task("health", &mut health_task).await;
         record_optional_failure(&mut lifecycle_failures, result);
     }
-    let shutdown_state = crate::vip::release_notify_state(local_healthy.load(Ordering::SeqCst));
+    let shutdown_state = crate::vip::release_notify_state(local_healthy.is_healthy());
     let vip_cleanup = vip_local
-        .unbind_all(
+        .unbind_all_with_progress(
             vip_table.as_ref(),
             cfg.notify.as_deref(),
             cfg.dry_run,
             shutdown_state,
+            || stop_budget::checkpoint(vip::SHUTDOWN_VIP_BUDGET),
         )
         .await;
+    if vip_cleanup.is_ok()
+        && lifecycle_failures.is_empty()
+        && matches!(stop_reason, StopReason::Complete(None))
+    {
+        stop_budget::checkpoint(std::time::Duration::from_millis(cfg.submit_timeout_ms));
+        if let Err(error) = handoff::publish(&cfg, &raft, &sm, &control_tasks.runtime(), &net).await
+        {
+            tracing::warn!(%error, "graceful handoff incomplete; peers retain the stale-holder fallback");
+        }
+    }
     record_lifecycle_result(&mut lifecycle_failures, "graceful VIP cleanup", vip_cleanup);
+    stop_budget::checkpoint(std::time::Duration::ZERO);
+    record_lifecycle_result(
+        &mut lifecycle_failures,
+        "notification shutdown",
+        vip_local.shutdown_notifications().await,
+    );
 
     if finished_task != FinishedTask::Submit {
         let result = stop_daemon_task("submit server", &mut submit_task).await;
@@ -352,24 +406,22 @@ async fn run(
         let result = stop_daemon_task("leader watcher", &mut leader_watch_task).await;
         record_optional_failure(&mut lifecycle_failures, result);
     }
+    stop_budget::checkpoint(std::time::Duration::ZERO);
     record_lifecycle_result(
         &mut lifecycle_failures,
         "Raft control task shutdown",
         control_tasks.shutdown().await,
     );
+    stop_budget::checkpoint(std::time::Duration::ZERO);
     record_lifecycle_result(
         &mut lifecycle_failures,
         "network shutdown",
         net.shutdown().await,
     );
+    stop_budget::checkpoint(std::time::Duration::ZERO);
     if let Err(error) = raft.shutdown().await {
         lifecycle_failures.push(format!("Raft shutdown: {error:?}"));
     }
 
     finish_daemon_run(stop_reason, lifecycle_failures)
-}
-
-fn fence_unavailable_health_proof(consensus_fresh: &consensus_freshness::ConsensusFreshness) {
-    // #26: protocol availability fences consensus eligibility, not the local probe result.
-    consensus_fresh.invalidate();
 }

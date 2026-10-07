@@ -1,12 +1,18 @@
 //! Bounded Linux `ip` command construction and result verification.
 
-#[cfg(test)]
 use std::future::Future;
 use std::net::IpAddr;
 use tokio::process::Command;
 
 pub(super) const IP_COMMAND_TIMEOUT: tokio::time::Duration =
     tokio::time::Duration::from_millis(250);
+pub(super) const IP_OUTPUT_BUDGET: tokio::time::Duration = IP_COMMAND_TIMEOUT
+    .saturating_add(crate::process::PROCESS_REAP_TIMEOUT)
+    .saturating_add(crate::process::OUTPUT_DRAIN_TIMEOUT);
+/// A delete followed by a failed-delete presence query, including child cleanup.
+pub(super) const DELETE_BUDGET: tokio::time::Duration = IP_COMMAND_TIMEOUT
+    .saturating_add(crate::process::PROCESS_REAP_TIMEOUT)
+    .saturating_add(IP_OUTPUT_BUDGET);
 pub(super) const VIP_MARKER_ROUTE_TABLE_BASE: u16 = 10_000;
 
 pub(super) fn marker_route_table(address_protocol: u8) -> String {
@@ -48,10 +54,42 @@ pub(super) fn bind_command_arguments(ip: IpAddr, prefix: u8, interface: &str) ->
         interface.into(),
     ];
     if ip.is_ipv6() {
+        // Ownership fencing handles duplicates; DAD would delay a ready-to-serve VIP.
+        arguments.push("nodad".into());
         arguments.push("preferred_lft".into());
         arguments.push("0".into());
     }
     arguments
+}
+
+pub(super) fn delete_command(ip: IpAddr, prefix: u8, interface: &str) -> Command {
+    let mut command = Command::new("ip");
+    command.args([
+        ip_family(ip),
+        "addr",
+        "del",
+        &format!("{ip}/{prefix}"),
+        "dev",
+        interface,
+    ]);
+    command
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DeleteOutcome {
+    Deleted,
+    AlreadyAbsent,
+}
+
+pub(super) async fn verify_delete_result(
+    status: std::process::ExitStatus,
+    probe: impl Future<Output = std::io::Result<std::process::Output>>,
+) -> anyhow::Result<DeleteOutcome> {
+    if status.success() {
+        return Ok(DeleteOutcome::Deleted);
+    }
+    ensure_failed_delete_is_absent(status, probe.await)?;
+    Ok(DeleteOutcome::AlreadyAbsent)
 }
 
 fn marker_route_arguments(operation: &str, ip: IpAddr, address_protocol: u8) -> [String; 9] {
@@ -110,56 +148,16 @@ pub(super) fn ensure_failed_delete_is_absent(
     Ok(())
 }
 
-pub(super) fn presence_probe_command(iface: &str, ip: IpAddr, configured_prefix: u8) -> Command {
+pub(super) fn presence_probe_command(ip: IpAddr, configured_prefix: u8) -> Command {
     let probe_target = presence_probe_target(ip, configured_prefix);
     let mut command = Command::new("ip");
+    // A device may disappear or be renamed while its VIP must still be proven absent.
     command
-        .args([
-            ip_family(ip),
-            "-o",
-            "addr",
-            "show",
-            "dev",
-            iface,
-            "to",
-            &probe_target,
-        ])
+        .args([ip_family(ip), "-o", "addr", "show", "to", &probe_target])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
     command
-}
-
-#[cfg(test)]
-pub(super) async fn command_status_with_timeout<F>(
-    status: F,
-    timeout: tokio::time::Duration,
-) -> std::io::Result<std::process::ExitStatus>
-where
-    F: Future<Output = std::io::Result<std::process::ExitStatus>>,
-{
-    tokio::time::timeout(timeout, status).await.map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("ip command exceeded {}ms", timeout.as_millis()),
-        )
-    })?
-}
-
-#[cfg(test)]
-pub(super) async fn command_output_with_timeout<F>(
-    output: F,
-    timeout: tokio::time::Duration,
-) -> std::io::Result<std::process::Output>
-where
-    F: Future<Output = std::io::Result<std::process::Output>>,
-{
-    tokio::time::timeout(timeout, output).await.map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("ip command exceeded {}ms", timeout.as_millis()),
-        )
-    })?
 }
 
 /// `ip addr show to` interprets a CIDR as a subnet filter. Presence verification must therefore
@@ -171,10 +169,74 @@ pub(super) fn presence_probe_target(ip: IpAddr, _configured_prefix: u8) -> Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        VIP_MARKER_ROUTE_TABLE_BASE, bind_command_arguments, marker_route_delete_arguments,
-        marker_route_probe_arguments, marker_route_replace_arguments,
+        DeleteOutcome, VIP_MARKER_ROUTE_TABLE_BASE, bind_command_arguments, delete_command,
+        marker_route_delete_arguments, marker_route_probe_arguments,
+        marker_route_replace_arguments, presence_probe_command, verify_delete_result,
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    #[test]
+    fn delete_command_preserves_family_prefix_and_interface() {
+        for (address, prefix, family) in [("192.0.2.30", 24, "-4"), ("2001:db8::30", 64, "-6")] {
+            let command = delete_command(address.parse().unwrap(), prefix, "test0.200");
+            assert_eq!(command.as_std().get_program(), "ip");
+            let arguments: Vec<_> = command.as_std().get_args().collect();
+            assert_eq!(
+                arguments,
+                [
+                    family,
+                    "addr",
+                    "del",
+                    &format!("{address}/{prefix}"),
+                    "dev",
+                    "test0.200"
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_result_success_does_not_poll_the_probe() {
+        let outcome = verify_delete_result(ExitStatus::from_raw(0), async {
+            panic!("successful deletion must not poll the probe");
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome, DeleteOutcome::Deleted);
+    }
+
+    #[tokio::test]
+    async fn delete_result_distinguishes_verified_absence() {
+        let outcome = verify_delete_result(ExitStatus::from_raw(2 << 8), async {
+            Ok(Output {
+                status: ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome, DeleteOutcome::AlreadyAbsent);
+    }
+
+    #[test]
+    fn ipv4_presence_probe_checks_the_exact_host_without_requiring_an_interface() {
+        let command = presence_probe_command("192.0.2.30".parse().unwrap(), 24);
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(arguments, ["-4", "-o", "addr", "show", "to", "192.0.2.30"]);
+    }
+
+    #[test]
+    fn ipv6_presence_probe_checks_the_exact_host_without_requiring_an_interface() {
+        let command = presence_probe_command("2001:db8::30".parse().unwrap(), 64);
+        let arguments: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(
+            arguments,
+            ["-6", "-o", "addr", "show", "to", "2001:db8::30"]
+        );
+    }
 
     /// #34: the IPv4 arguments are exactly what they were before the IPv6 flag existed, so
     /// the v6 flag is an addition and not a change to the family that already worked.
@@ -203,6 +265,7 @@ mod tests {
                 "fd00:5290::100/128",
                 "dev",
                 "eth0",
+                "nodad",
                 "preferred_lft",
                 "0"
             ]

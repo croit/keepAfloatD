@@ -32,9 +32,10 @@ wait_for_service_running node-b 10
 wait_for_service_running node-c 10
 
 # A majority (2 of 3) is enough: the pair forms a cluster and elects a leader among {2,3}.
-wait_for_log_any_after "${checkpoint}" 40 'raft current leader is now Some\((2|3)\)'
+startup_budget="$(startup_budget_seconds 40 node-b node-c)"
+wait_for_log_any_after "${checkpoint}" "${startup_budget}" 'raft current leader is now Some\(ReplicaId \{ physical_id: (2|3),'
 
 # VIPs come up on the surviving pair, uniquely and evenly; node-a is still down and holds nothing.
-wait_for_even_over_nodes 40 node-b node-c
+wait_for_startup_over_nodes 40 node-b node-c
 assert_unique_holders
 service_is_not_running node-a || fail "node-a was expected to remain down"

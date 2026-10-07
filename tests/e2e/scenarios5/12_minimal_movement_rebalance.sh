@@ -136,7 +136,7 @@ log "victims: victim1=${victim1} (holds IPA) victim2=${victim2} (holds IPB)"
 # --- 1) Kill victim1: only IPA relocates, and it goes to the idle node E0. --------------------
 kill_service "${victim1}" KILL
 wait_for_service_exit "${victim1}" 10
-wait_until 45 expect_holders \
+wait_until "$(cleanup_budget_seconds 45)" expect_holders \
   "${IPA}" "${E0}" \
   "${IPB}" "${H0[${IPB}]}" \
   "${IPC}" "${H0[${IPC}]}" \
@@ -164,7 +164,7 @@ post_c_down() {
   # IPB must land on a still-running holder (making it hold two), never on a downed victim.
   [[ "${hb}" != "${victim1}" && "${hb}" != "${victim2}" ]]
 }
-wait_until 45 post_c_down || {
+wait_until "$(cleanup_budget_seconds 45)" post_c_down || {
   dump_cluster_diagnostics
   fail "after killing ${victim2}: expected IPB to fail over onto a surviving holder; IPA/IPC/IPD unchanged"
   exit 1
@@ -197,7 +197,8 @@ log "victim2 down: IPB landed on ${overloaded} (now holds ${over_vips[*]}); high
 restart_checkpoint="$(log_checkpoint)"
 start_services_no_deps "${victim1}"
 wait_for_service_running "${victim1}" 10
-wait_for_log_any_after "${restart_checkpoint}" 40 'reports a compatible existing cluster'
+startup_budget="$(startup_budget_seconds 40 "${victim1}")"
+wait_for_log_any_after "${restart_checkpoint}" "${startup_budget}" 'committed learner promotion'
 
 # Expected: the higher-IP VIP moves from ${overloaded} to the rejoined ${victim1}; the lower-IP VIP
 # stays on ${overloaded}; the other two VIPs keep their holders from H2.
@@ -217,7 +218,7 @@ rebalanced_and_reachable() {
 }
 
 wait_for_single_agreed_leader 20
-wait_until 50 rebalanced_and_reachable || {
+wait_until "${startup_budget}" rebalanced_and_reachable || {
   dump_cluster_diagnostics
   fail "after restarting ${victim1}: expected reachable VIPs with ${hi} on ${victim1}, ${lo} on ${overloaded}, others unchanged"
   exit 1

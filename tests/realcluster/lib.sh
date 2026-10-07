@@ -20,6 +20,12 @@ declare -ag REALCLUSTER_CAMPAIGN_BACKUP_TAGS=(
   c2 b3-notify d5 d11 d12 d13 d14 d16 d17 d18 d19 d20 d21 d22 d23 d24 soak
 )
 
+# Extend only known-predecessor fallback waits by the configured cleanup budget.
+cleanup_budget_seconds() {
+  local base_seconds="${1:?base seconds required}"
+  printf '%s\n' "$(((base_seconds * 1000 + 11500 * ${#VIPS[@]} + 999) / 1000))"
+}
+
 # ---------------------------------------------------------------------------
 # Logging / failures
 # ---------------------------------------------------------------------------
@@ -150,14 +156,14 @@ prepare_cluster_secret() {
       fi
       [[ -n "${candidate}" || -z "${current}" ]] || candidate="${current}"
     done
-    if [[ "${candidate}" =~ ^[A-Za-z0-9._-]{16,256}$ ]]; then
+    if [[ "${candidate}" =~ ^[A-Za-z0-9._-]{32,256}$ ]]; then
       REALCLUSTER_SECRET="${candidate}"
     else
       REALCLUSTER_SECRET="$(openssl rand -hex 32)"
     fi
     export REALCLUSTER_SECRET
   fi
-  [[ "${REALCLUSTER_SECRET}" =~ ^[A-Za-z0-9._-]{16,256}$ ]] || return 1
+  [[ "${REALCLUSTER_SECRET}" =~ ^[A-Za-z0-9._-]{32,256}$ ]] || return 1
   for ip in "${NODE_IPS[@]}"; do ensure_cluster_secret_on_node "${ip}" || return 1; done
   export REALCLUSTER_SECRET
 }
@@ -169,7 +175,7 @@ assert_cluster_secret_consistent() {
   for ip in "${NODE_IPS[@]}"; do
     current="$(node_sh "${ip}" "sed -n 's/^cluster_secret:[[:space:]]*\"\\(.*\\)\"/\\1/p' /etc/keepafloatd/config-$(instance_for_ip "${ip}").yaml")" \
       || return 1
-    [[ "${current}" =~ ^[A-Za-z0-9._-]{16,256}$ ]] || return 1
+    [[ "${current}" =~ ^[A-Za-z0-9._-]{32,256}$ ]] || return 1
     if [[ -z "${expected}" ]]; then
       expected="${current}"
     elif [[ "${current}" != "${expected}" ]]; then
@@ -551,10 +557,7 @@ leader_seen_by() {
       --grep='raft current leader is now' -o cat \
       2>/dev/null | sed -E 's/\\x1b\\[[0-9;]*m//g'
   ")" || return 1
-  transition="$(printf '%s\n' "${log}" | sed -nE \
-    -e 's/.*raft current leader is now Some\(([0-9]+)\).*/\1/p' \
-    -e 's/.*raft current leader is now None.*/none/p' | tail -1)"
-  [[ "${transition}" == "none" || "${transition}" =~ ^[0-9]+$ ]] || return 1
+  transition="$(printf '%s\n' "${log}" | python3 "${HERE}/journal-evidence.py" leader-text)" || return 1
   printf '%s\n' "${transition}"
 }
 
@@ -570,15 +573,24 @@ leader_seen_by_since() {
     journalctl -u \"\$unit\" _SYSTEMD_INVOCATION_ID=\"\$invocation\" --since '${since}' \
       -o cat 2>/dev/null | sed -E 's/\\x1b\\[[0-9;]*m//g'
   ")" || return 1
-  transition="$(printf '%s\n' "${log}" | sed -nE \
-    -e 's/.*raft current leader is now Some\(([0-9]+)\).*/\1/p' \
-    -e 's/.*raft current leader is now None.*/none/p' | tail -1)"
-  [[ "${transition}" == "none" || "${transition}" =~ ^[0-9]+$ ]] || return 1
+  transition="$(printf '%s\n' "${log}" | python3 "${HERE}/journal-evidence.py" leader-text)" || return 1
   printf '%s\n' "${transition}"
 }
 
-# Return the leader reported by a majority of nodes.
-cluster_leader_id() {
+# Physical identity is only for addressing a host, never for consensus agreement.
+replica_physical_id() {
+  python3 "${HERE}/journal-evidence.py" physical-id "${1:?replica required}"
+}
+
+replica_is_configured() {
+  local physical id
+  physical="$(replica_physical_id "${1:?}")" || return 1
+  for id in "${NODE_RAFT_IDS[@]}"; do [[ "$id" != "$physical" ]] || return 0; done
+  return 1
+}
+
+# Return the exact boot identity reported by a majority of nodes.
+cluster_leader_replica() {
   local ip pid pids=() td failed=0 value id majority best_id="" best_count=0
   declare -A counts=()
   td="$(mktemp -d)"
@@ -597,12 +609,8 @@ cluster_leader_id() {
   if [[ "${failed}" -ne 0 ]]; then rm -rf "${td}"; return 1; fi
   for ip in "${NODE_IPS[@]}"; do
     value="$(<"${td}/${ip}")"
-    [[ "${value}" == "inactive" || "${value}" == "none" || "${value}" =~ ^[0-9]+$ ]] \
-      || { rm -rf "${td}"; return 1; }
     if [[ "${value}" != "inactive" && "${value}" != "none" ]]; then
-      local configured=0
-      for id in "${NODE_RAFT_IDS[@]}"; do [[ "${id}" == "${value}" ]] && configured=1; done
-      [[ "${configured}" -eq 1 ]] || { rm -rf "${td}"; return 1; }
+      replica_is_configured "$value" || { rm -rf "${td}"; return 1; }
       counts["${value}"]=$(( ${counts["${value}"]:-0} + 1 ))
     fi
   done
@@ -617,6 +625,12 @@ cluster_leader_id() {
   printf '%s\n' "${best_id}"
 }
 
+cluster_leader_id() {
+  local replica
+  replica="$(cluster_leader_replica)" || return 1
+  replica_physical_id "$replica"
+}
+
 single_agreed_leader() {
   cluster_leader_id >/dev/null
 }
@@ -625,17 +639,12 @@ single_agreed_leader() {
 # systemd invocation. This prevents a restarted but isolated process from satisfying a recovery
 # oracle with leader evidence left by its previous process.
 all_nodes_agree_on_leader() {
-  local ip status leader agreed="" id configured
+  local ip status leader agreed=""
   for ip in "${NODE_IPS[@]}"; do
     status="$(kafd_active "${ip}")" || return 1
     [[ "${status}" == "active" ]] || return 1
     leader="$(leader_seen_by "${ip}")" || return 1
-    [[ "${leader}" =~ ^[0-9]+$ ]] || return 1
-    configured=0
-    for id in "${NODE_RAFT_IDS[@]}"; do
-      [[ "${id}" == "${leader}" ]] && configured=1
-    done
-    [[ "${configured}" -eq 1 ]] || return 1
+    replica_is_configured "$leader" || return 1
     [[ -z "${agreed}" || "${agreed}" == "${leader}" ]] || return 1
     agreed="${leader}"
   done
@@ -736,6 +745,7 @@ available_cluster_ready() {
 }
 
 wait_for_available_cluster() {
+  wait_for_startup_activation 30 "${NODE_IPS[@]}" || return 1
   wait_until 60 holds_for 5 available_cluster_ready || {
     dump_diag
     fail "cluster lacks sustained daemon/leader agreement, unique ownership, or VIP reachability"
@@ -745,6 +755,7 @@ wait_for_available_cluster() {
 }
 
 wait_for_steady_state() {
+  wait_for_startup_activation 30 "${NODE_IPS[@]}" || return 1
   wait_until 60 holds_for 5 steady_cluster_ready || {
     dump_diag
     fail "cluster lacks sustained leader agreement, unique even ownership, or VIP reachability"
@@ -1335,7 +1346,7 @@ clean_reform() {
   for ip in "${NODE_IPS[@]}"; do kafd_stop "${ip}" || return 1; done
   sleep 2
   for ip in "${NODE_IPS[@]}"; do kafd_start "${ip}" || return 1; done
-  wait_until 30 all_daemons_active
+  wait_until 30 all_daemons_active && wait_for_startup_activation 30 "${NODE_IPS[@]}"
 }
 
 restore_baseline() {

@@ -33,6 +33,8 @@ for r in $(seq 1 "${rounds}"); do
   if ! wait_until 90 all_vips_uniquely_held; then
     evid "  ✗ round ${r}: cluster did not return to unique holders after rejoin"; _PASS=0
   fi
+  check "restarted daemon completes activation before the next fault" \
+    wait_for_startup_activation 30 "${victim}"
 done
 
 check "every VIP gained exactly one live holder across all ${rounds} rounds" test "${not_served}" -eq 0

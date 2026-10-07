@@ -32,7 +32,7 @@ raft:
   election_timeout_max_ms: 800
   heartbeat_interval_ms: 250
 
-cluster_secret: "lab-shared-secret-please-change"
+cluster_secret: "replace-me-with-a-random-32-byte-string"
 max_frame_bytes: 4194304
 submit_timeout_ms: 2000
 

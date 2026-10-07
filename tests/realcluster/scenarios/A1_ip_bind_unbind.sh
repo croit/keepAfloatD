@@ -31,6 +31,8 @@ safe_rejoin() {
   all_daemons_active && all_vips_uniquely_held && all_vips_pingable
 }
 kafd_start "${victim}"
+check "restarted holder completes activation without overlapping VIPs" \
+  wait_for_startup_activation 30 "${victim}"
 check "unique reachable ownership persists after rejoin" wait_until 60 holds_for 5 safe_rejoin
 
 scenario_end

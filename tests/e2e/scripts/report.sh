@@ -32,6 +32,8 @@ declare -A SCENARIO_META=(
   [13_stale_survivor_rejected_after_reform]="Partition node-a, reform the majority with new state, heal: node-a's stale state is fenced; it resets and rejoins blank (no split brain)"
   [14_connection_pressure]="Saturate unauthenticated and authenticated admission; excess work is shed and both listeners recover"
   [15_crash_removed_vip_cleanup]="Remove a SIGKILL orphan while preserving unmarked and differently marked addresses from other owners"
+  [16_signal_restart]="SIGHUP and SIGQUIT release VIPs before exit; survivors take over and the restarted node rejoins"
+  [17_gratuitous_arp]="After health-driven handoff, a passive observer sees both gratuitous ARP packets from the new holder"
 )
 
 # The decisive failure lines from a scenario's captured output, flattened into

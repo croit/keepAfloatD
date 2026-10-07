@@ -145,24 +145,10 @@ hard_kill_is_scoped_and_propagates_failure() (
 )
 
 d16_activation_evidence_fails_closed() (
-  local mode=absent
-  NODE_IPS=(first second third)
-  eval "$(sed -n '/^activation_logged_since()/,/^holder_excludes()/p' \
-    "${HERE}/scenarios/D16_chained_legacy_activation.sh" | sed '$d')"
-  journal_event_count() {
-    case "${mode}:$1" in
-      present:*|mixed:first) printf '1\n' ;;
-      unreadable:*|mixed:second) return 255 ;;
-      partial:*) printf '0\n'; return 255 ;;
-      *) printf '0\n' ;;
-    esac
-  }
-  activation_not_logged_since fixture-time && ! activation_logged_since fixture-time || return 1
-  mode=present
-  activation_logged_since fixture-time && ! activation_not_logged_since fixture-time || return 1
-  for mode in unreadable partial mixed; do
-    ! activation_logged_since fixture-time && ! activation_not_logged_since fixture-time || return 1
-  done
+  local scenario="${HERE}/scenarios/D16_chained_legacy_activation.sh"
+  grep -q -- '--legacy-rejection' "${scenario}" &&
+    grep -q 'wait_for_available_cluster' "${scenario}" &&
+    ! grep -q 'LEGACY_BINARY' "${scenario}"
 )
 
 final_audit_requires_a_campaign_start() (
@@ -541,7 +527,7 @@ assert "API auth explicitly uses Bash on the management node" api_auth_uses_bash
 assert "API request arguments remain separate" api_request_arguments_remain_separate
 assert "example preserves environment credentials" example_preserves_environment_credentials
 assert "hard kill targets one unit and propagates failures" hard_kill_is_scoped_and_propagates_failure
-assert "D16 activation evidence fails closed" d16_activation_evidence_fails_closed
+assert "D16 rejects legacy framing without rolling old binaries" d16_activation_evidence_fails_closed
 assert "final audit requires a campaign start" final_audit_requires_a_campaign_start
 assert "failed backup removes only its own captures" failed_backup_removes_only_its_own_captures
 assert "successful backup restores every original" successful_backup_restores_every_original

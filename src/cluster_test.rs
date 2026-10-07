@@ -1,9 +1,9 @@
 //! In-process, end-to-end cluster tests.
 //!
-//! Spins up real `keepafloatd` daemons (via [`crate::run`]) on loopback ports with dry-run VIP
-//! binding - both a single node and a three-node cluster - lets them auto-form, publish health and
-//! reconcile VIPs, then asserts every VIP ends up bound on exactly one holder and is released on
-//! shutdown.
+//! Spins up real `keepafloatd` daemons (via [`crate::run_with_listeners`]) on loopback ports with
+//! dry-run VIP binding - both a single node and a three-node cluster - lets them auto-form, publish
+//! health and reconcile VIPs, then asserts every VIP ends up bound on exactly one holder and is
+//! released on shutdown.
 //!
 //! This exercises the networked stack the unit tests cannot reach - peer handshake + RPC transport
 //! (`raft::network`), auto-formation (`raft::mod`), the full `RaftStorage` trait (`raft::store`),
@@ -14,27 +14,34 @@
 //! shutdown), never "which node holds which VIP", so the upcoming sticky/min-move placement change
 //! does not contradict it.
 
-use crate::config::{Config, HealthConfig, PeerConfig, RaftTuneConfig, VipAddr, VipConfig};
+use crate::config::{PeerConfig, VipAddr, VipConfig};
+use crate::listener::ListenerSource;
 use crate::raft::KafRequest;
 use crate::vip::LocalVip;
 use crate::{
     StopReason, finish_daemon_run, record_lifecycle_result, record_optional_failure, run,
-    stop_daemon_task, submit_task_failure, supervision_channel_failure, unexpected_task_failure,
+    run_with_listeners, run_with_probe, stop_daemon_task, submit_task_failure,
+    supervision_channel_failure, unexpected_task_failure,
 };
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+mod bind_health;
+mod fixtures;
 mod health_proof;
+mod restart;
+mod stop_handoff;
+mod submit_pressure;
 
-// These tests release ephemeral-port reservations immediately before starting the daemons. Keep
-// the complete network-test lifetime serial so another in-process cluster cannot claim that port
-// window when the Rust test runner executes this module in parallel.
-static CLUSTER_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+use fixtures::{
+    ClusterFixture, ControlledProbe, ReservedListeners, advance_until, make_cfg, startup_budget,
+};
+
 const CLUSTER_TEST_ADDR: &str = "127.255.255.254";
 
 async fn join_daemon(
@@ -222,215 +229,48 @@ fn ip4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(a, b, c, d))
 }
 
-/// Reserve `n` free loopback ports by binding then immediately releasing them. Callers hold
-/// [`CLUSTER_TEST_LOCK`] across the daemon lifetime to exclude other tests using this allocator.
-fn free_ports(n: usize) -> Vec<u16> {
-    let listeners: Vec<TcpListener> = (0..n)
-        .map(|_| TcpListener::bind((CLUSTER_TEST_ADDR, 0)).expect("bind ephemeral port"))
-        .collect();
-    listeners
-        .iter()
-        .map(|l| l.local_addr().unwrap().port())
-        .collect()
-}
-
-fn make_cfg(node_idx: usize, peers: &[PeerConfig], vips: &[VipConfig]) -> Arc<Config> {
-    let p = &peers[node_idx];
-    Arc::new(Config {
-        node_id: p.id,
-        raft_listen: p.raft_address.clone(),
-        client_submit_listen: p.client_submit_address.clone(),
-        peers: peers.to_vec(),
-        vips: vips.to_vec(),
-        health: HealthConfig {
-            command: vec!["/bin/true".into()],
-            interval_ms: 200,
-            timeout_ms: 500,
-            // Generous staleness window so scheduling jitter under coverage instrumentation does
-            // not transiently fence a healthy node.
-            stale_secs: Some(10),
-        },
-        raft: RaftTuneConfig::default(),
-        cluster_secret: None,
-        max_frame_bytes: crate::config::DEFAULT_MAX_FRAME_BYTES,
-        submit_timeout_ms: 2_000,
-        address_protocol: crate::config::DEFAULT_VIP_ADDRESS_PROTOCOL,
-        dry_run: true,
-        notify: None,
-        failover_delay_secs: 0,
-        failback: true,
-        failback_delay_secs: 0,
-    })
-}
-
-async fn raw_health_submit(port: u16) -> anyhow::Result<()> {
-    let mut stream = test_cluster_connect(port).await?;
-    let body = serde_json::to_vec(&serde_json::json!({
-        "secret": null,
-        "request": KafRequest::HealthUpdate {
-            node_id: 1,
-            healthy: true,
-        },
-    }))?;
-    stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
-    stream.write_all(&body).await?;
-    let mut len = [0_u8; 4];
-    tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut len)).await??;
-    let mut response = vec![0_u8; u32::from_be_bytes(len) as usize];
-    tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut response)).await??;
-    let response: serde_json::Value = serde_json::from_slice(&response)?;
-    anyhow::ensure!(response["ok"] == true, "submit rejected: {response}");
-    // #26: the response can arrive before the server task releases its source permit.
-    // That body-local permit drops before the captured socket, so EOF orders slot reuse.
-    let mut trailing = [0_u8; 1];
-    let bytes = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut trailing)).await??;
-    anyhow::ensure!(bytes == 0, "submit server sent data after its response");
-    Ok(())
-}
-
 #[tokio::test]
-async fn raw_health_submit_waits_for_server_close_after_successful_response() {
-    let listener = tokio::net::TcpListener::bind((CLUSTER_TEST_ADDR, 0))
-        .await
-        .unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (replied_tx, replied_rx) = oneshot::channel();
-    let (close_tx, close_rx) = oneshot::channel();
-    // Lifetime: the test releases close_rx and joins this server before returning.
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut prefix = [0; 4];
-        stream.read_exact(&mut prefix).await.unwrap();
-        let mut request = vec![0; u32::from_be_bytes(prefix) as usize];
-        stream.read_exact(&mut request).await.unwrap();
-        let reply = br#"{"ok":true}"#;
-        stream
-            .write_all(&(reply.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        stream.write_all(reply).await.unwrap();
-        replied_tx.send(()).unwrap();
-        close_rx.await.unwrap();
-    });
-    let submit = raw_health_submit(port);
-    tokio::pin!(submit);
-    tokio::select! {
-        result = &mut submit => panic!("submit finished before server closure: {result:?}"),
-        result = replied_rx => result.unwrap(),
+async fn reserved_cluster_listeners_reject_competing_binds() {
+    let mut reserved = ReservedListeners::bind(6).await;
+    let ports = reserved.ports();
+    for &port in &ports {
+        let error = TcpListener::bind((CLUSTER_TEST_ADDR, port))
+            .expect_err("fixture reservation must prevent competing bind");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
     }
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut submit)
-            .await
-            .is_err(),
-        "successful response is not proof that the server released its connection slot"
-    );
-    close_tx.send(()).unwrap();
-    submit.await.unwrap();
-    server.await.unwrap();
+
+    let sources: Vec<_> = (0..ports.len()).map(|index| reserved.take(index)).collect();
+    drop(reserved);
+    for (source, port) in sources.iter().zip(ports) {
+        let ListenerSource::Bound(listener) = source else {
+            panic!("reserved listener must be transferred, not rebound");
+        };
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        let error = TcpListener::bind((CLUSTER_TEST_ADDR, port))
+            .expect_err("transferred listener must prevent competing bind");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    }
 }
 
 async fn test_cluster_connect(port: u16) -> anyhow::Result<tokio::net::TcpStream> {
+    test_cluster_connect_to(&format!("{CLUSTER_TEST_ADDR}:{port}")).await
+}
+
+async fn test_cluster_connect_to(address: &str) -> anyhow::Result<tokio::net::TcpStream> {
     tokio::time::timeout(
         Duration::from_secs(1),
-        crate::connection_admission::connect_from_advertised(
-            &format!("{CLUSTER_TEST_ADDR}:0"),
-            &format!("{CLUSTER_TEST_ADDR}:{port}"),
-        ),
+        crate::connection_admission::connect_from_advertised(address, address),
     )
     .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn submit_admission_sheds_saturation_and_recovers() {
-    let _cluster_test_guard = CLUSTER_TEST_LOCK.lock().await;
-    let ports = free_ports(2);
-    let peers = vec![PeerConfig {
-        id: 1,
-        raft_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[0]),
-        client_submit_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[1]),
-    }];
-    let vips = vec![VipConfig {
-        address: VipAddr::host(ip4(10, 0, 0, 1)),
-        interface: "lo".into(),
-        vlan: None,
-    }];
-    let cfg = make_cfg(0, &peers, &vips);
-    let table = Arc::new(cfg.sorted_vips());
-    let local = LocalVip::new(true);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(run(cfg, table, local.clone(), async move {
-        let _ = shutdown_rx.await;
-    }));
-
-    for _ in 0..100 {
-        if local.bound_addrs().await == [ip4(10, 0, 0, 1)] {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(local.bound_addrs().await, [ip4(10, 0, 0, 1)]);
-
-    let mut raft_stalled = Vec::new();
-    for _ in 0..8 {
-        raft_stalled.push(test_cluster_connect(ports[0]).await.unwrap());
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let mut raft_excess = test_cluster_connect(ports[0]).await.unwrap();
-    let mut byte = [0_u8; 1];
-    let shed = tokio::time::timeout(Duration::from_secs(1), raft_excess.read(&mut byte))
-        .await
-        .expect("one source exceeded the eight-connection Raft quota");
-    assert!(matches!(shed, Err(_) | Ok(0)));
-    drop(raft_stalled);
-
-    let mut stalled = Vec::new();
-    // #27: one source must not consume the other peers' listener capacity.
-    for _ in 0..7 {
-        let mut stream = test_cluster_connect(ports[1]).await.unwrap();
-        stream.write_all(&1_u32.to_be_bytes()).await.unwrap();
-        stalled.push(stream);
-    }
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    raw_health_submit(ports[1])
-        .await
-        .expect("one reserved slot must carry legitimate traffic under pressure");
-
-    let mut last = test_cluster_connect(ports[1]).await.unwrap();
-    last.write_all(&1_u32.to_be_bytes()).await.unwrap();
-    stalled.push(last);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut excess = test_cluster_connect(ports[1]).await.unwrap();
-    excess.write_all(&1_u32.to_be_bytes()).await.unwrap();
-    let mut byte = [0_u8; 1];
-    let shed = tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte))
-        .await
-        .expect("excess submit connection was not shed promptly");
-    assert!(
-        matches!(shed, Err(_) | Ok(0)),
-        "excess submit connection remained admitted: {shed:?}"
-    );
-
-    drop(stalled.pop());
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    raw_health_submit(ports[1])
-        .await
-        .expect("submit capacity did not recover after a stalled client disconnected");
-
-    drop(stalled);
-    let _ = shutdown_tx.send(());
-    join_daemon(handle).await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn occupied_submit_listener_fails_the_composition_root() {
-    let _cluster_test_guard = CLUSTER_TEST_LOCK.lock().await;
-    let raft_port = free_ports(1)[0];
     let occupied_submit = TcpListener::bind((CLUSTER_TEST_ADDR, 0)).expect("occupy submit port");
     let submit_port = occupied_submit.local_addr().unwrap().port();
     let peers = vec![PeerConfig {
         id: 1,
-        raft_address: format!("{CLUSTER_TEST_ADDR}:{raft_port}"),
+        raft_address: format!("{CLUSTER_TEST_ADDR}:0"),
         client_submit_address: format!("{CLUSTER_TEST_ADDR}:{submit_port}"),
     }];
     let vips = vec![VipConfig {
@@ -453,15 +293,9 @@ async fn occupied_submit_listener_fails_the_composition_root() {
     assert!(error.to_string().contains("submit server"), "{error:#}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn single_node_cluster_binds_all_vips_then_releases_on_shutdown() {
-    let _cluster_test_guard = CLUSTER_TEST_LOCK.lock().await;
-    let ports = free_ports(2);
-    let peers = vec![PeerConfig {
-        id: 1,
-        raft_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[0]),
-        client_submit_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[1]),
-    }];
+    let mut cluster = ClusterFixture::bind(1).await;
     let vips = vec![
         VipConfig {
             address: VipAddr::host(ip4(10, 0, 0, 1)),
@@ -477,26 +311,31 @@ async fn single_node_cluster_binds_all_vips_then_releases_on_shutdown() {
     let mut expected: Vec<IpAddr> = vips.iter().map(|v| v.address.addr).collect();
     expected.sort_unstable();
 
-    let cfg = make_cfg(0, &peers, &vips);
+    let cfg = cluster.config(0, &vips);
+    let raft_address = cfg.raft_listen.clone();
+    let submit_address = cfg.client_submit_listen.clone();
+    let budget = startup_budget(&cfg);
     let table = Arc::new(cfg.sorted_vips());
     let lv = LocalVip::new(true);
     let (tx, rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(run(cfg, table, lv.clone(), async move {
-        let _ = rx.await;
-    }));
+    let handle = tokio::spawn(run_with_probe(
+        cfg,
+        table,
+        lv.clone(),
+        async move {
+            let _ = rx.await;
+        },
+        cluster.take_raft(0),
+        cluster.take_submit(0),
+        ControlledProbe::new(true),
+    ));
 
-    // A single node forms immediately and, as sole eligible holder, binds every VIP.
-    let mut converged = false;
-    for _ in 0..150 {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        if lv.bound_addrs().await == expected {
-            converged = true;
-            break;
-        }
-    }
+    tokio::task::yield_now().await;
+    assert!(lv.bound_addrs().await.is_empty());
+    let converged = advance_until(budget, async || lv.bound_addrs().await == expected).await;
     assert!(converged, "single node did not bind all VIPs");
 
-    let mut stalled_submit = test_cluster_connect(ports[1]).await.unwrap();
+    let mut stalled_submit = test_cluster_connect_to(&submit_address).await.unwrap();
     stalled_submit
         .write_all(&64_u32.to_be_bytes())
         .await
@@ -509,7 +348,7 @@ async fn single_node_cluster_binds_all_vips_then_releases_on_shutdown() {
         lv.bound_addrs().await.is_empty(),
         "VIPs not released on shutdown"
     );
-    match tokio::net::TcpStream::connect((CLUSTER_TEST_ADDR, ports[0])).await {
+    match tokio::net::TcpStream::connect(&raft_address).await {
         Ok(_) => panic!("Raft listener must not accept connections after shutdown"),
         Err(error) => assert_eq!(
             error.kind(),
@@ -525,20 +364,12 @@ async fn single_node_cluster_binds_all_vips_then_releases_on_shutdown() {
     assert_eq!(read, 0, "submit connection remained open after shutdown");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(start_paused = true)]
 async fn three_node_cluster_forms_distributes_and_releases_vips() {
-    let _cluster_test_guard = CLUSTER_TEST_LOCK.lock().await;
-    let ports = free_ports(6);
-    let raft_ports = &ports[0..3];
-    let submit_ports = &ports[3..6];
-
-    let peers: Vec<PeerConfig> = (0..3)
-        .map(|i| PeerConfig {
-            id: (i as u64) + 1,
-            raft_address: format!("{}:{}", CLUSTER_TEST_ADDR, raft_ports[i]),
-            client_submit_address: format!("{}:{}", CLUSTER_TEST_ADDR, submit_ports[i]),
-        })
-        .collect();
+    let (logs, _capture) = crate::warning_limit::test_support::LogCapture::start(
+        "keepafloatd::raft::admission=debug,keepafloatd::health=warn",
+    );
+    let mut cluster = ClusterFixture::bind(3).await;
     let vips = vec![
         VipConfig {
             address: VipAddr::host(ip4(10, 0, 0, 1)),
@@ -558,18 +389,32 @@ async fn three_node_cluster_forms_distributes_and_releases_vips() {
     ];
     let mut expected: Vec<IpAddr> = vips.iter().map(|v| v.address.addr).collect();
     expected.sort_unstable();
+    let mut budget = Duration::ZERO;
 
     let mut locals: Vec<Arc<LocalVip>> = Vec::new();
     let mut shutdowns: Vec<oneshot::Sender<()>> = Vec::new();
     let mut handles = Vec::new();
     for i in 0..3 {
-        let cfg = make_cfg(i, &peers, &vips);
+        let mut cfg = cluster.config(i, &vips);
+        // Bound protocol work during startup fencing without extending health freshness.
+        let tune = Arc::make_mut(&mut cfg);
+        tune.health.interval_ms = 1_000;
+        tune.health.stale_secs = Some(3);
+        budget = budget.max(startup_budget(&cfg));
         let table = Arc::new(cfg.sorted_vips());
         let lv = LocalVip::new(true);
         let (tx, rx) = oneshot::channel::<()>();
-        let handle = tokio::spawn(run(cfg, table, lv.clone(), async move {
-            let _ = rx.await;
-        }));
+        let handle = tokio::spawn(run_with_probe(
+            cfg,
+            table,
+            lv.clone(),
+            async move {
+                let _ = rx.await;
+            },
+            cluster.take_raft(i),
+            cluster.take_submit(i),
+            ControlledProbe::new(true),
+        ));
         locals.push(lv);
         shutdowns.push(tx);
         handles.push(handle);
@@ -577,17 +422,25 @@ async fn three_node_cluster_forms_distributes_and_releases_vips() {
 
     // Wait for the cluster to form, elect a leader, commit health and reconcile: every VIP should
     // end up bound on exactly one node (union == all VIPs, with no duplicates across nodes).
-    let mut converged = false;
-    for _ in 0..300 {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    let converged = advance_until(budget, async || {
+        if handles.iter().any(|handle| handle.is_finished()) {
+            return true;
+        }
         let mut bound: Vec<IpAddr> = Vec::new();
         for lv in &locals {
             bound.extend(lv.bound_addrs().await);
         }
         bound.sort_unstable();
-        if bound == expected {
-            converged = true;
-            break;
+        bound == expected
+    })
+    .await;
+    for handle in &mut handles {
+        if handle.is_finished() {
+            panic!(
+                "daemon exited before convergence: {:?}\n{}",
+                handle.await,
+                logs.text()
+            );
         }
     }
     assert!(
@@ -614,9 +467,8 @@ async fn three_node_cluster_forms_distributes_and_releases_vips() {
 ///
 /// Verifies that acquiring a VIP causes the script to be invoked with `INSTANCE <addr> MASTER`,
 /// and that a health-loss release triggers `INSTANCE <addr> FAULT`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn notify_script_fires_master_on_vip_acquisition_and_fault_on_health_failure() {
-    let _cluster_test_guard = CLUSTER_TEST_LOCK.lock().await;
     // Use a unique suffix so parallel test runs do not share the same temporary directory.
     static NOTIFY_TEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let uid = NOTIFY_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -625,9 +477,7 @@ async fn notify_script_fires_master_on_vip_acquisition_and_fault_on_health_failu
     let script = tmp.join("notify.sh");
     let log = tmp.join("notify.log");
 
-    // The node is healthy while the flag exists and unhealthy after it is removed.
-    let health_flag = tmp.join("healthy");
-    tokio::fs::write(&health_flag, "").await.unwrap();
+    let probe = ControlledProbe::new(true);
 
     tokio::fs::write(
         &script,
@@ -642,49 +492,40 @@ async fn notify_script_fires_master_on_vip_acquisition_and_fault_on_health_failu
         .await
         .unwrap();
 
-    let ports = free_ports(2);
-    let peers = vec![PeerConfig {
-        id: 1,
-        raft_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[0]),
-        client_submit_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[1]),
-    }];
+    let mut cluster = ClusterFixture::bind(1).await;
     let vips = vec![VipConfig {
         address: "10.0.0.99/32".parse().unwrap(),
         interface: "lo".into(),
         vlan: None,
     }];
 
-    let mut cfg = (*make_cfg(0, &peers, &vips)).clone();
-    // Quote the path because the temporary directory may contain spaces.
-    cfg.health.command = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        format!("test -f '{}'", health_flag.display()),
-    ];
+    let mut cfg = (*cluster.config(0, &vips)).clone();
     cfg.notify = Some(script.to_str().unwrap().to_owned());
     cfg.failover_delay_secs = 1;
-    // notify script needs to execute; override dry_run from make_cfg.
+    // notify script needs to execute; override dry_run from the fixture.
     cfg.dry_run = false;
     let cfg = Arc::new(cfg);
+    let budget = startup_budget(&cfg);
     let table = Arc::new(cfg.sorted_vips());
     let lv = LocalVip::new(true);
     let (tx, rx) = oneshot::channel::<()>();
-    let handle = tokio::spawn(run(cfg, table, lv.clone(), async move {
-        let _ = rx.await;
-    }));
+    let handle = tokio::spawn(run_with_probe(
+        cfg,
+        table,
+        lv.clone(),
+        async move {
+            let _ = rx.await;
+        },
+        cluster.take_raft(0),
+        cluster.take_submit(0),
+        probe.clone(),
+    ));
 
     let vip_ip = ip4(10, 0, 0, 99);
 
-    // Wait for MASTER bind.
-    let mut bound = false;
-    for _ in 0..150 {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        if lv.bound_addrs().await.contains(&vip_ip) {
-            bound = true;
-            break;
-        }
-    }
+    let bound = advance_until(budget, async || lv.bound_addrs().await.contains(&vip_ip)).await;
     assert!(bound, "VIP was not acquired");
+    tokio::time::resume();
 
     // Poll for the log entry instead of sleeping a fixed duration.
     // tokio::fs avoids blocking a worker thread during the read.
@@ -703,8 +544,7 @@ async fn notify_script_fires_master_on_vip_acquisition_and_fault_on_health_failu
         }
     }
 
-    // Trigger FAULT: remove the health flag so the health check starts failing.
-    tokio::fs::remove_file(&health_flag).await.unwrap();
+    probe.set(false);
 
     // The first failed probe starts, but cannot complete, the configured one-second delay.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -747,8 +587,8 @@ async fn notify_script_fires_master_on_vip_acquisition_and_fault_on_health_failu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn config_mismatch_fatal_signal_runs_composition_root_cleanup() {
-    let _cluster_test_guard = CLUSTER_TEST_LOCK.lock().await;
-    let ports = free_ports(6);
+    let mut reserved = ReservedListeners::bind(6).await;
+    let ports = reserved.ports();
     let peers: Vec<PeerConfig> = (0..3)
         .map(|index| PeerConfig {
             id: index as u64 + 1,
@@ -774,9 +614,16 @@ async fn config_mismatch_fatal_signal_runs_composition_root_cleanup() {
         let table = Arc::new(cfg.sorted_vips());
         let local = LocalVip::new(true);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        handles.push(tokio::spawn(run(cfg, table, local.clone(), async move {
-            let _ = shutdown_rx.await;
-        })));
+        handles.push(tokio::spawn(run_with_listeners(
+            cfg,
+            table,
+            local.clone(),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            reserved.take(index),
+            reserved.take(index + 3),
+        )));
         locals.push(local);
         shutdowns.push(shutdown_tx);
     }
@@ -805,79 +652,82 @@ async fn config_mismatch_fatal_signal_runs_composition_root_cleanup() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn existing_single_voter_cluster_activates_v2_after_legacy_state() {
-    let _cluster_test_guard = CLUSTER_TEST_LOCK.lock().await;
-    let ports = free_ports(2);
-    let peers = vec![PeerConfig {
-        id: 1,
-        raft_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[0]),
-        client_submit_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[1]),
-    }];
+#[tokio::test(start_paused = true)]
+async fn single_voter_genesis_activates_v2_and_rejects_replacement() {
+    let mut cluster = ClusterFixture::bind(1).await;
     let vips = vec![VipConfig {
         address: VipAddr::host(ip4(10, 0, 0, 1)),
         interface: "lo".into(),
         vlan: None,
     }];
-    let cfg = make_cfg(0, &peers, &vips);
+    let cfg = cluster.config(0, &vips);
+    let budget = startup_budget(&cfg);
     let table = Arc::new(cfg.sorted_vips());
     let (raft, network, state_ref, _fatal_rx, _network_failure_rx, mut control_tasks) =
-        crate::raft::start_raft(cfg, table).await.unwrap();
+        crate::raft::start_raft(cfg, table, cluster.take_raft(0))
+            .await
+            .unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let state = state_ref.read().await;
-        if state.cluster_epoch.is_some()
-            && state.failover_semantics == crate::raft::FailoverSemantics::V2
-        {
-            break;
-        }
-        drop(state);
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "fresh single-voter cluster did not form with V2 semantics"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    state_ref.write().await.failover_semantics = crate::raft::FailoverSemantics::Legacy;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        if state_ref.read().await.failover_semantics == crate::raft::FailoverSemantics::V2 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "all-new existing cluster did not activate V2 semantics"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert!(
+        advance_until(budget, async || {
+            let state = state_ref.read().await;
+            state.genesis.is_some()
+                && state.failover_semantics == crate::raft::FailoverSemantics::V2
+        })
+        .await,
+        "fresh cluster did not commit its V2 genesis"
+    );
+    let genesis = state_ref.read().await.genesis.clone().unwrap();
+    let mut changed = genesis.clone();
+    changed.epoch ^= 1;
+    let response = raft
+        .client_write(KafRequest::AdmissionGenesis(changed))
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.data,
+        crate::raft::types::KafResponse::Rejected(_)
+    ));
+    assert_eq!(state_ref.read().await.genesis.as_ref(), Some(&genesis));
+    assert_eq!(state_ref.read().await.cluster_epoch, Some(genesis.epoch));
+    assert_eq!(
+        state_ref.read().await.failover_semantics,
+        crate::raft::FailoverSemantics::V2
+    );
 
     control_tasks.shutdown().await.unwrap();
     network.shutdown().await.unwrap();
     raft.shutdown().await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn blocked_health_probe_withdraws_vips_and_recovers_without_restart() {
-    let _cluster_test_guard = CLUSTER_TEST_LOCK.lock().await;
-    let ports = free_ports(2);
-    let peers = vec![PeerConfig {
-        id: 1,
-        raft_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[0]),
-        client_submit_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[1]),
-    }];
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct AfterStartupProbe {
+        enabled: AtomicBool,
+        command: crate::health_publication::CommandProbe,
+    }
+    impl crate::health_publication::Probe for Arc<AfterStartupProbe> {
+        async fn check(&self) -> bool {
+            !self.enabled.load(Ordering::SeqCst) || self.command.check().await
+        }
+    }
+    let mut cluster = ClusterFixture::bind(1).await;
     let address = ip4(10, 0, 0, 98);
     let vips = vec![VipConfig {
         address: VipAddr::host(address),
         interface: "lo".into(),
         vlan: None,
     }];
-    let directory = std::env::temp_dir().join(format!("kafd-proof-{}", ports[0]));
+    let directory = std::env::temp_dir().join(format!(
+        "kafd-proof-{}-{}",
+        std::process::id(),
+        cluster.config(0, &[]).raft_listen.replace(':', "-")
+    ));
     tokio::fs::create_dir(&directory).await.unwrap();
     let block = directory.join("block");
     let entered = directory.join("entered");
-    let mut cfg = (*make_cfg(0, &peers, &vips)).clone();
+    let mut cfg = (*cluster.config(0, &vips)).clone();
     cfg.health.stale_secs = Some(1);
     cfg.health.timeout_ms = 2_000;
     cfg.health.command = vec![
@@ -889,18 +739,37 @@ async fn blocked_health_probe_withdraws_vips_and_recovers_without_restart() {
             entered.display()
         ),
     ];
+    let probe = Arc::new(AfterStartupProbe {
+        enabled: AtomicBool::new(false),
+        command: crate::health_publication::CommandProbe::new(cfg.health.clone()),
+    });
     let cfg = Arc::new(cfg);
+    let budget = startup_budget(&cfg);
     let table = Arc::new(cfg.sorted_vips());
     let local = LocalVip::new(true);
     let (tx, rx) = oneshot::channel();
-    let handle = tokio::spawn(run(cfg, table, local.clone(), async move {
-        let _ = rx.await;
-    }));
+    let handle = tokio::spawn(run_with_probe(
+        cfg,
+        table,
+        local.clone(),
+        async move {
+            let _ = rx.await;
+        },
+        cluster.take_raft(0),
+        cluster.take_submit(0),
+        probe.clone(),
+    ));
+    assert!(
+        advance_until(budget, async || local
+            .bound_addrs()
+            .await
+            .contains(&address))
+        .await
+    );
+    tokio::time::resume();
     let outcome = tokio::time::timeout(Duration::from_secs(4), async {
-        while !local.bound_addrs().await.contains(&address) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         tokio::fs::write(&block, b"").await.unwrap();
+        probe.enabled.store(true, Ordering::SeqCst);
         while !entered.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -924,63 +793,73 @@ async fn blocked_health_probe_withdraws_vips_and_recovers_without_restart() {
     assert!(local.bound_addrs().await.is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn minimum_stale_window_does_not_flap_during_regular_probe_jitter() {
-    let _cluster_test_guard = CLUSTER_TEST_LOCK.lock().await;
-    let ports = free_ports(2);
-    let peers = vec![PeerConfig {
-        id: 1,
-        raft_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[0]),
-        client_submit_address: format!("{}:{}", CLUSTER_TEST_ADDR, ports[1]),
-    }];
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    struct JitterProbe {
+        enabled: AtomicBool,
+        alternate: AtomicBool,
+        delayed: AtomicUsize,
+    }
+    impl crate::health_publication::Probe for Arc<JitterProbe> {
+        async fn check(&self) -> bool {
+            if self.enabled.load(Ordering::SeqCst)
+                && self.alternate.fetch_xor(true, Ordering::SeqCst)
+            {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                self.delayed.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        }
+    }
+    let mut cluster = ClusterFixture::bind(1).await;
     let address = ip4(10, 0, 0, 97);
     let vips = vec![VipConfig {
         address: VipAddr::host(address),
         interface: "lo".into(),
         vlan: None,
     }];
-    let directory = std::env::temp_dir().join(format!("kafd-renewal-{}", ports[0]));
-    tokio::fs::create_dir(&directory).await.unwrap();
-    let flag = directory.join("alternate");
-    let mut cfg = (*make_cfg(0, &peers, &vips)).clone();
+    let mut cfg = (*cluster.config(0, &vips)).clone();
     cfg.health.interval_ms = 1_000;
     cfg.health.stale_secs = Some(1);
     cfg.health.timeout_ms = 1_000;
-    cfg.health.command = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        format!(
-            "if test -f '{0}'; then rm '{0}'; sleep 0.15; else touch '{0}'; fi",
-            flag.display()
-        ),
-    ];
     let cfg = Arc::new(cfg);
+    let budget = startup_budget(&cfg);
     let table = Arc::new(cfg.sorted_vips());
     let local = LocalVip::new(true);
     let (tx, rx) = oneshot::channel();
-    let handle = tokio::spawn(run(cfg, table, local.clone(), async move {
-        let _ = rx.await;
-    }));
-    let acquired = tokio::time::timeout(Duration::from_secs(2), async {
-        while !local.bound_addrs().await.contains(&address) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    let probe = Arc::new(JitterProbe {
+        enabled: AtomicBool::new(false),
+        alternate: AtomicBool::new(true),
+        delayed: AtomicUsize::new(0),
+    });
+    let handle = tokio::spawn(run_with_probe(
+        cfg,
+        table,
+        local.clone(),
+        async move {
+            let _ = rx.await;
+        },
+        cluster.take_raft(0),
+        cluster.take_submit(0),
+        probe.clone(),
+    ));
+    let acquired = advance_until(budget, async || {
+        local.bound_addrs().await.contains(&address)
     })
-    .await
-    .is_ok();
-    let until = tokio::time::Instant::now() + Duration::from_millis(2_200);
-    let mut flapped = false;
-    while acquired && tokio::time::Instant::now() < until {
-        if !local.bound_addrs().await.contains(&address) {
-            flapped = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    .await;
+    probe.enabled.store(true, Ordering::SeqCst);
+    let flapped = advance_until(Duration::from_millis(2_200), async || {
+        !local.bound_addrs().await.contains(&address)
+    })
+    .await;
     let _ = tx.send(());
     join_daemon(handle).await.unwrap();
-    tokio::fs::remove_dir_all(&directory).await.unwrap();
     assert!(acquired, "healthy node did not acquire its VIP");
+    assert!(
+        probe.delayed.load(Ordering::SeqCst) > 0,
+        "jitter was not exercised"
+    );
     assert!(
         !flapped,
         "regular successful probe renewal flapped a healthy VIP"

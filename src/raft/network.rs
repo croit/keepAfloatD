@@ -2,16 +2,13 @@
 //!
 //! Wire format
 //! -----------
-//! 1. Handshake (sender to receiver): 8-byte BE [`Config::node_id`]; then 4-byte BE secret length
-//!    `s` followed by `s` bytes of [`Config::cluster_secret`] (zero-length means "no secret");
-//!    then a 1-byte semantics/incarnation flag: `0` legacy without incarnation, `1` legacy with
-//!    incarnation, `2` V2 without incarnation, or `3` V2 with incarnation. Flags `1`/`3` are
-//!    followed by the 16-byte BE committed incarnation. Incarnations fence a different cluster
-//!    lineage (see [`wire::epochs_compatible`]); the V2 bit fences legacy Raft frames only after
-//!    the cluster commits V2 activation.
+//! 1. Mutual HMAC-SHA256 authentication through [`crate::auth`]. Fresh nonces and both
+//!    endpoint IDs, roles, version, listener, epoch and capabilities are transcript-bound.
+//!    No shared secret is transmitted. See docs/authentication.md for the byte layout.
 //! 2. Frames (both directions): 4-byte BE `u32` length followed by JSON body. Receivers refuse
 //!    frames larger than their cap before allocation: [`Config::max_frame_bytes`] for Raft frames,
 //!    a fixed 64 KiB cap for status/preflight frames and a fixed 4 KiB cap for submit envelopes.
+//!    Raft/status bodies carry one operation tag; replies must match the requested operation.
 //!
 //! Concurrency model
 //! -----------------
@@ -23,25 +20,47 @@
 //!
 //! Failure handling
 //! ----------------
-//! On any I/O error (write, read, framing or timeout violation) the offending stream is dropped
-//! from its slot, so the next RPC will see `None` and immediately return `Unreachable` while a
-//! background reconnect task re-establishes the stream. Each
+//! An RPC retries a disconnected cached stream once on a fresh, authenticated connection. The
+//! same deadline covers lock acquisition, reconnect and both exchanges. Other errors drop the
+//! stream and leave recovery to the background task, which also detects idle peer closes. Each
 //! [`RaftNetworkV2`](openraft::network::v2::RaftNetworkV2) call honours
 //! [`openraft::network::RPCOption::hard_ttl`] via [`tokio::time::timeout`]; this is what turns a
 //! half-open connection into a prompt `Timeout` error instead of an unbounded `read_exact`.
 //! Cancellation during an in-flight exchange also drops the stream so its unread response cannot
-//! be consumed by a later RPC. During a rolling upgrade, status preflight advertises that behavior.
-//! A cancellation-unsafe legacy reader reuses only responses dispatched and accepted by one TCP
+//! be consumed by a later RPC. Status preflight advertises that behavior.
+//! A cancellation-unsafe reader reuses only responses dispatched and accepted by one TCP
 //! write inside the timeout safety margin; a later response is dropped and the connection closes.
 
+mod admission_rpc;
+pub mod authorization;
 mod client;
 mod inbound;
+mod reconnect;
+mod request;
 mod server;
 mod status;
 mod wire;
 
 #[cfg(test)]
+mod authorization_tests;
+
+#[cfg(test)]
+pub(crate) mod testing;
+
+#[cfg(test)]
 mod deadline_tests;
+
+#[cfg(test)]
+mod reconnect_tests;
+
+#[cfg(test)]
+mod pre_vote_tests;
+
+#[cfg(test)]
+mod sender_tests;
+
+#[cfg(test)]
+mod transport_tests;
 
 pub(super) use status::probe_peer_status;
 
@@ -50,20 +69,26 @@ use super::types::{FailoverSemantics, TypeConfig};
 use super::{KafRaft, KafStorageState};
 use crate::config::{ClusterConfigFingerprint, Config};
 use anyhow::Context;
+use authorization::{AdmissionController, ReplicaId};
 use openraft::alias::{SnapshotMetaOf, VoteOf};
 use openraft::error::{NetworkError, RPCError, Timeout, Unreachable};
 use openraft::network::RPCTypes;
+use reconnect::ReconnectDecision;
+#[cfg(test)]
+use reconnect::idle_stream_is_usable;
+use request::{Operation, decode_payload, encode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream};
+#[cfg(test)]
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use wire::{
-    InFlightRpcStream, connect_with_handshake, connect_with_legacy_handshake,
-    connection_requires_config_identity, connection_requires_upgrade, read_framed_bounded,
-    write_framed,
+    InFlightRpcStream, connect_with_handshake, connection_requires_config_identity,
+    connection_requires_upgrade, read_framed_bounded, write_framed,
 };
 
 /// Per-peer outbound channel. The `address` is fixed at construction time; only the inner
@@ -73,7 +98,7 @@ struct PeerLink {
     stream: Mutex<Option<TcpStream>>,
     advertises_v2: AtomicBool,
     advertises_config_identity: AtomicBool,
-    config_identity_learned: AtomicBool,
+    remote_replica: std::sync::RwLock<Option<ReplicaId>>,
 }
 
 /// Wire envelope shared by the outbound OpenRaft adapter and inbound dispatcher.
@@ -109,19 +134,67 @@ fn is_safety_fence_error(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Reconnecting a peer already authenticated as legacy must not depend on that legacy Raft
-/// actor answering another status RPC during an election (#26). Once identity enforcement is
-/// active, every reconnect must preflight again so a legacy or changed peer is fenced.
-fn should_reuse_known_legacy_identity(
-    config_identity_enforced: bool,
-    identity_learned: bool,
-    peer_advertises_identity: bool,
-) -> bool {
-    !config_identity_enforced && identity_learned && !peer_advertises_identity
+fn is_disconnect(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::NotConnected
+            | ErrorKind::WriteZero
+    )
+}
+
+async fn connect_peer_stream(
+    link: &PeerLink,
+    cfg: &Config,
+    state_ref: &RwLock<KafStorageState>,
+    fingerprint: ClusterConfigFingerprint,
+    local_replica: ReplicaId,
+) -> anyhow::Result<TcpStream> {
+    // Advertise the committed incarnation at connect time; the peer fences stale survivors.
+    let (epoch, advertises_v2, identity_enforced) = {
+        let state = state_ref.read().await;
+        (
+            state.cluster_epoch,
+            state.failover_semantics == FailoverSemantics::V2,
+            state.config_identity_enforced,
+        )
+    };
+    let (stream, peer_identity, replica) = connect_with_handshake(
+        &link.address,
+        cfg,
+        epoch,
+        advertises_v2,
+        fingerprint,
+        identity_enforced,
+        local_replica,
+    )
+    .await?;
+    let current = state_ref.read().await;
+    anyhow::ensure!(
+        !connection_requires_upgrade(current.failover_semantics, advertises_v2)
+            && !connection_requires_config_identity(
+                current.config_identity_enforced,
+                peer_identity
+            ),
+        "raft connection policy changed during handshake"
+    );
+    link.advertises_v2.store(advertises_v2, Ordering::SeqCst);
+    link.advertises_config_identity
+        .store(peer_identity, Ordering::SeqCst);
+    *link
+        .remote_replica
+        .write()
+        .map_err(|_| anyhow::anyhow!("peer identity lock poisoned"))? = Some(replica);
+    Ok(stream)
 }
 
 #[derive(Clone)]
 pub struct RaftNetworkImpl {
+    admission: Arc<dyn AdmissionController>,
     config: Arc<Config>,
     /// Immutable map keyed by peer id (excludes self). Per-peer links are interior-mutable via
     /// their own `Mutex<Option<TcpStream>>`; the map shape never changes after construction.
@@ -131,6 +204,7 @@ pub struct RaftNetworkImpl {
     state_ref: Arc<RwLock<KafStorageState>>,
     config_fingerprint: ClusterConfigFingerprint,
     shutdown: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
     /// Set by the first `start`; a second start would push duplicate accept and reconnect tasks.
     started: Arc<AtomicBool>,
     tasks: Arc<Mutex<Vec<SupervisedTask>>>,
@@ -149,7 +223,12 @@ impl RaftNetworkImpl {
     pub fn new(
         config: Arc<Config>,
         state_ref: Arc<RwLock<KafStorageState>>,
+        admission: Arc<dyn AdmissionController>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            admission.local_replica().physical_id == config.node_id,
+            "local replica does not match configured physical member"
+        );
         let config_fingerprint = config.cluster_config_fingerprint()?;
         let mut peers: HashMap<u64, Arc<PeerLink>> = HashMap::new();
         for p in config.other_peers() {
@@ -160,16 +239,18 @@ impl RaftNetworkImpl {
                     stream: Mutex::new(None),
                     advertises_v2: AtomicBool::new(false),
                     advertises_config_identity: AtomicBool::new(false),
-                    config_identity_learned: AtomicBool::new(false),
+                    remote_replica: std::sync::RwLock::new(None),
                 }),
             );
         }
         Ok(Self {
+            admission,
             config,
             peers: Arc::new(peers),
             state_ref,
             config_fingerprint,
             shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             started: Arc::new(AtomicBool::new(false)),
             tasks: Arc::new(Mutex::new(Vec::new())),
         })
@@ -177,14 +258,24 @@ impl RaftNetworkImpl {
 
     /// Bind `raft_listen`, accept peer handshakes, spawn per-peer reconnect loops, and serve
     /// inbound Raft RPCs on accepted-stream tasks.
+    #[cfg(test)]
     pub async fn start(&self, raft: KafRaft) -> anyhow::Result<mpsc::UnboundedReceiver<String>> {
+        self.start_with_listener(raft, crate::listener::ListenerSource::Configured)
+            .await
+    }
+
+    pub(crate) async fn start_with_listener(
+        &self,
+        raft: KafRaft,
+        source: crate::listener::ListenerSource,
+    ) -> anyhow::Result<mpsc::UnboundedReceiver<String>> {
         claim_start(&self.started)?;
         let addr: std::net::SocketAddr = self
             .config
             .raft_listen
             .parse()
             .with_context(|| format!("parse raft_listen {}", self.config.raft_listen))?;
-        let listener = TcpListener::bind(addr).await?;
+        let listener = source.bind(addr).await?;
         tracing::info!("Raft listening on {}", addr);
         let (failure_tx, failure_rx) = mpsc::unbounded_channel();
 
@@ -196,6 +287,7 @@ impl RaftNetworkImpl {
                 state_ref: self.state_ref.clone(),
                 config_fingerprint: self.config_fingerprint,
                 shutdown: self.shutdown.clone(),
+                admission: self.admission.clone(),
             },
             failure_tx.clone(),
         );
@@ -209,6 +301,7 @@ impl RaftNetworkImpl {
             let cfg = self.config.clone();
             let state_ref = self.state_ref.clone();
             let config_fingerprint = self.config_fingerprint;
+            let local_replica = self.admission.local_replica();
             let failure_tx = failure_tx.clone();
             let shutdown_for_task = shutdown.clone();
             let task = spawn_supervised_task(
@@ -223,93 +316,55 @@ impl RaftNetworkImpl {
                         if shutdown.load(Ordering::SeqCst) {
                             return Ok(());
                         }
+                        let mut cached = link.stream.lock().await;
                         let (local_semantics, config_identity_enforced) = {
                             let state = state_ref.read().await;
                             (state.failover_semantics, state.config_identity_enforced)
                         };
-                        let needs_reconnect = {
-                            let mut stream = link.stream.lock().await;
-                            if stream.is_some()
-                                && (connection_requires_upgrade(
-                                    local_semantics,
-                                    link.advertises_v2.load(Ordering::SeqCst),
-                                ) || connection_requires_config_identity(
-                                    config_identity_enforced,
-                                    link.advertises_config_identity.load(Ordering::SeqCst),
-                                ))
-                            {
-                                *stream = None;
-                            }
-                            stream.is_none()
-                        };
-                        if !needs_reconnect {
-                            tokio::time::sleep(RECONNECT_PROBE_INTERVAL).await;
-                            attempts = 0;
-                            continue;
-                        }
-                        // Advertise the incarnation held at connect time. The inbound side re-reads its
-                        // own incarnation per frame, so that direction is always current; a stale
-                        // survivor reconnects only after healing, by which point it carries its real
-                        // (old) incarnation and is fenced by the peer.
-                        let (epoch, advertises_v2, config_identity_enforced) = {
-                            let state = state_ref.read().await;
-                            (
-                                state.cluster_epoch,
-                                state.failover_semantics == FailoverSemantics::V2,
-                                state.config_identity_enforced,
-                            )
-                        };
-                        let reuse_known_legacy = should_reuse_known_legacy_identity(
+                        match link.reconnect_decision(
+                            cached.as_ref(),
+                            local_semantics,
                             config_identity_enforced,
-                            link.config_identity_learned.load(Ordering::SeqCst),
-                            link.advertises_config_identity.load(Ordering::SeqCst),
-                        );
-                        let connection = if reuse_known_legacy {
-                            connect_with_legacy_handshake(&link.address, &cfg, epoch, advertises_v2)
-                                .await
-                                .map(|stream| (stream, false))
-                        } else {
-                            connect_with_handshake(
-                                &link.address,
-                                &cfg,
-                                epoch,
-                                advertises_v2,
-                                config_fingerprint,
-                                config_identity_enforced,
-                            )
-                            .await
-                        };
+                        ) {
+                            ReconnectDecision::Keep => {
+                                drop(cached);
+                                tokio::time::sleep(RECONNECT_PROBE_INTERVAL).await;
+                                attempts = 0;
+                                continue;
+                            }
+                            ReconnectDecision::Replace => {
+                                tracing::debug!(
+                                    peer_id,
+                                    "reconnecting closed or outdated raft stream"
+                                );
+                                *cached = None;
+                            }
+                            ReconnectDecision::Connect => {}
+                        }
+                        let connection = connect_peer_stream(
+                            &link,
+                            &cfg,
+                            &state_ref,
+                            config_fingerprint,
+                            local_replica,
+                        )
+                        .await;
                         match connection {
-                            Ok((stream, peer_advertises_config_identity)) => {
-                                let (current_semantics, current_identity_enforced) = {
-                                    let state = state_ref.read().await;
-                                    (state.failover_semantics, state.config_identity_enforced)
-                                };
-                                if connection_requires_upgrade(current_semantics, advertises_v2)
-                                    || connection_requires_config_identity(
-                                        current_identity_enforced,
-                                        peer_advertises_config_identity,
-                                    )
-                                {
-                                    continue;
-                                }
+                            Ok(stream) => {
                                 tracing::info!(
                                     "connected raft peer {} at {} (after {} attempts)",
                                     peer_id,
                                     link.address,
                                     attempts.saturating_add(1)
                                 );
-                                link.advertises_v2.store(advertises_v2, Ordering::SeqCst);
-                                link.advertises_config_identity
-                                    .store(peer_advertises_config_identity, Ordering::SeqCst);
-                                if !reuse_known_legacy {
-                                    link.config_identity_learned.store(true, Ordering::SeqCst);
-                                }
-                                *link.stream.lock().await = Some(stream);
+                                *cached = Some(stream);
                                 attempts = 0;
                                 safety_fence_visible = false;
+                                drop(cached);
+                                tokio::time::sleep(RECONNECT_RETRY_INTERVAL).await;
                             }
                             Err(e) => {
+                                drop(cached);
                                 attempts = attempts.wrapping_add(1);
                                 if is_safety_fence_error(&e) {
                                     if !safety_fence_visible {
@@ -351,30 +406,22 @@ impl RaftNetworkImpl {
         self.shutdown.load(Ordering::SeqCst)
     }
 
+    pub(super) async fn wait_until_shutdown(&self) {
+        let notified = self.shutdown_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_shutting_down() {
+            notified.await;
+        }
+    }
+
     pub(super) fn config_fingerprint(&self) -> ClusterConfigFingerprint {
         self.config_fingerprint
     }
 
-    /// Drop streams opened with the legacy handshake so reconnects immediately advertise V2.
-    pub(super) async fn drop_legacy_outbound(&self) {
-        for link in self.peers.values() {
-            if !link.advertises_v2.load(Ordering::SeqCst) {
-                *link.stream.lock().await = None;
-            }
-        }
-    }
-
-    /// Drop rolling-upgrade links whose preflight response omitted config identity.
-    pub(super) async fn drop_legacy_config_outbound(&self) {
-        for link in self.peers.values() {
-            if !link.advertises_config_identity.load(Ordering::SeqCst) {
-                *link.stream.lock().await = None;
-            }
-        }
-    }
-
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
         let tasks = std::mem::take(&mut *self.tasks.lock().await);
         let task_result = stop_supervised_tasks(tasks, NETWORK_TASK_SHUTDOWN_TIMEOUT).await;
         for link in self.peers.values() {
@@ -390,13 +437,15 @@ impl RaftNetworkImpl {
     /// stream on any I/O or timeout failure so the reconnect task can re-establish it.
     async fn send_rpc<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
         &self,
-        target: u64,
+        target: ReplicaId,
         request: &Req,
         action: RPCTypes,
         hard_ttl: Duration,
     ) -> Result<Resp, RPCError<TypeConfig>> {
+        let operation = Operation::try_from(action)
+            .map_err(|message| RPCError::Network(NetworkError::from_string(message.to_owned())))?;
         let request_bytes =
-            serde_json::to_vec(request).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+            encode(operation, request).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let max_frame = self.config.max_frame_bytes;
         // Sender-side guard: an over-cap frame can never be delivered. openraft 0.10 dropped the
         // `PayloadTooLarge` chunk-hint error, so surface this as a transport error and let openraft
@@ -408,12 +457,16 @@ impl RaftNetworkImpl {
             ))));
         }
 
-        let link = self.peers.get(&target).cloned().ok_or_else(|| {
-            RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("unknown peer {}", target),
-            )))
-        })?;
+        let link = self
+            .peers
+            .get(&target.physical_id)
+            .cloned()
+            .ok_or_else(|| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("unknown peer {}", target),
+                )))
+            })?;
 
         let effective_ttl = if hard_ttl < RPC_MIN_TIMEOUT {
             RPC_MIN_TIMEOUT
@@ -422,68 +475,121 @@ impl RaftNetworkImpl {
         };
         let started = Instant::now();
 
-        let (local_semantics, config_identity_enforced) = {
-            let state = self.state_ref.read().await;
-            (state.failover_semantics, state.config_identity_enforced)
-        };
-        let mut guard = link.stream.lock().await;
-        if connection_requires_upgrade(local_semantics, link.advertises_v2.load(Ordering::SeqCst))
-            || connection_requires_config_identity(
-                config_identity_enforced,
-                link.advertises_config_identity.load(Ordering::SeqCst),
-            )
-        {
-            *guard = None;
-        }
-        if guard.is_none() {
-            return Err(RPCError::Unreachable(Unreachable::new(
-                &std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "outbound stream not yet established",
-                ),
-            )));
-        }
-        let mut in_flight = InFlightRpcStream::new(guard);
-        let stream = in_flight.stream_mut().ok_or_else(|| {
-            RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "outbound stream disappeared before rpc",
-            )))
-        })?;
-
         let io = async {
-            write_framed(stream, &request_bytes).await?;
-            read_framed_bounded(stream, max_frame).await
-        };
-
-        let result = tokio::time::timeout(effective_ttl, io).await;
-        match result {
-            Ok(Ok(resp_buf)) => match serde_json::from_slice(&resp_buf) {
-                Ok(response) => {
-                    in_flight.retain();
-                    Ok(response)
+            let mut guard = link.stream.lock().await;
+            let state = self.state_ref.read().await;
+            if connection_requires_upgrade(
+                state.failover_semantics,
+                link.advertises_v2.load(Ordering::SeqCst),
+            ) || connection_requires_config_identity(
+                state.config_identity_enforced,
+                link.advertises_config_identity.load(Ordering::SeqCst),
+            ) {
+                *guard = None;
+            }
+            drop(state);
+            let mut in_flight = InFlightRpcStream::new(guard);
+            let mut retried = false;
+            loop {
+                let authorization = self
+                    .admission
+                    .authorize_raft_async(target)
+                    .await
+                    .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
+                let validate = || -> anyhow::Result<()> {
+                    let remote = *link
+                        .remote_replica
+                        .read()
+                        .map_err(|_| anyhow::anyhow!("peer identity lock poisoned"))?;
+                    anyhow::ensure!(remote == Some(target), "Raft destination boot changed");
+                    authorization.check(self.admission.local_replica(), target)?;
+                    authorization.validate_request(
+                        self.admission.local_replica(),
+                        &request::decode(&request_bytes)?,
+                    )
+                };
+                validate().map_err(|error| {
+                    RPCError::Network(NetworkError::from_string(error.to_string()))
+                })?;
+                let stream = in_flight.stream_mut().ok_or_else(|| {
+                    RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "outbound stream not yet established",
+                    )))
+                })?;
+                let exchange = async {
+                    write_framed(stream, &request_bytes).await?;
+                    read_framed_bounded(stream, max_frame).await
+                };
+                let deadline = authorization
+                    .session
+                    .check()
+                    .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
+                let exchange = tokio::time::timeout_at(deadline, exchange)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Raft admission expired during exchange",
+                        ))
+                    });
+                match exchange {
+                    Ok(body) => {
+                        let authorization = self
+                            .admission
+                            .authorize_raft_async(target)
+                            .await
+                            .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
+                        authorization
+                            .check(self.admission.local_replica(), target)
+                            .and_then(|()| authorization.validate_response(&body))
+                            .map_err(|error| {
+                                RPCError::Network(NetworkError::from_string(error.to_string()))
+                            })?;
+                        let response = decode_payload(&body, operation).map_err(|e| {
+                            RPCError::Network(NetworkError::from_string(e.to_string()))
+                        })?;
+                        in_flight.retain();
+                        return Ok(response);
+                    }
+                    Err(error) if !retried && is_disconnect(&error) => {
+                        retried = true;
+                        tracing::debug!(%target, %error, "retrying raft rpc on a fresh connection");
+                        in_flight.replace(None);
+                        let stream = connect_peer_stream(
+                            &link,
+                            &self.config,
+                            &self.state_ref,
+                            self.config_fingerprint,
+                            self.admission.local_replica(),
+                        )
+                        .await
+                        .map_err(|e| RPCError::Network(NetworkError::from_string(e.to_string())))?;
+                        in_flight.replace(Some(stream));
+                    }
+                    Err(error) => return Err(RPCError::Network(NetworkError::new(&error))),
                 }
-                Err(e) => Err(RPCError::Network(NetworkError::new(&e))),
-            },
-            Ok(Err(io_err)) => Err(RPCError::Network(NetworkError::new(&io_err))),
-            Err(_) => Err(RPCError::Timeout(Timeout {
-                action,
-                id: self.config.node_id,
-                target,
-                timeout: started.elapsed(),
-            })),
-        }
+            }
+        };
+        tokio::time::timeout(effective_ttl, io)
+            .await
+            .unwrap_or_else(|_| {
+                Err(RPCError::Timeout(Timeout {
+                    action,
+                    id: self.admission.local_replica(),
+                    target,
+                    timeout: started.elapsed(),
+                }))
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::client::RaftConnection;
+    use super::request::{Operation, decode_payload, encode};
     use super::server::{is_known_raft_source, raft_source_matches_peer};
-    use super::{
-        RPCError, RPCTypes, RaftNetworkImpl, is_safety_fence_error, read_framed_bounded,
-        should_reuse_known_legacy_identity,
-    };
+    use super::{RPCError, RPCTypes, RaftNetworkImpl, is_safety_fence_error, read_framed_bounded};
     use crate::config::{
         Config, DEFAULT_SUBMIT_TIMEOUT_MS, HealthConfig, PeerConfig, RaftTuneConfig,
     };
@@ -524,14 +630,6 @@ mod tests {
         super::claim_start(&started).unwrap();
         let err = super::claim_start(&started).unwrap_err().to_string();
         assert!(err.contains("already started"), "{err}");
-    }
-
-    #[test]
-    fn known_legacy_identity_reconnect_skips_only_before_activation() {
-        assert!(should_reuse_known_legacy_identity(false, true, false));
-        assert!(!should_reuse_known_legacy_identity(true, true, false));
-        assert!(!should_reuse_known_legacy_identity(false, false, false));
-        assert!(!should_reuse_known_legacy_identity(false, true, true));
     }
 
     #[test]
@@ -605,6 +703,7 @@ mod tests {
             },
             raft: RaftTuneConfig::default(),
             cluster_secret: Some("network-test-secret".into()),
+            cluster_secret_file: None,
             max_frame_bytes,
             submit_timeout_ms: DEFAULT_SUBMIT_TIMEOUT_MS,
             address_protocol: crate::config::DEFAULT_VIP_ADDRESS_PROTOCOL,
@@ -615,10 +714,18 @@ mod tests {
             failback_delay_secs: 0,
         });
         let (_, _, state_ref) = new_store(Arc::new(Vec::new()), 3, true, 0);
-        RaftNetworkImpl::new(config, state_ref).unwrap()
+        RaftNetworkImpl::new(
+            config.clone(),
+            state_ref,
+            crate::raft::network::testing::controller(&config),
+        )
+        .unwrap()
     }
 
-    async fn attach_loopback_stream(network: &RaftNetworkImpl, target: u64) -> TcpStream {
+    pub(super) async fn attach_loopback_stream(
+        network: &RaftNetworkImpl,
+        target: u64,
+    ) -> TcpStream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (client, accepted) = tokio::time::timeout(Duration::from_secs(1), async {
@@ -627,6 +734,8 @@ mod tests {
         .await
         .expect("loopback connection must not stall");
         *network.peers.get(&target).unwrap().stream.lock().await = Some(client.unwrap());
+        *network.peers[&target].remote_replica.write().unwrap() =
+            Some(crate::raft::types::test_replica(target));
         accepted.unwrap().0
     }
 
@@ -646,19 +755,47 @@ mod tests {
         let network = test_network(1_024, &[1, 2]);
 
         let serialization = network
-            .send_rpc::<_, Value>(2, &RejectSerialize, RPCTypes::Vote, Duration::from_secs(1))
+            .send_rpc::<_, Value>(
+                crate::raft::types::test_replica(2),
+                &RejectSerialize,
+                RPCTypes::Vote,
+                Duration::from_secs(1),
+            )
             .await
             .unwrap_err();
         assert!(matches!(serialization, RPCError::Network(_)));
 
+        let unsupported = network
+            .send_rpc::<_, Value>(
+                crate::raft::types::test_replica(2),
+                &super::testing::vote_request(),
+                RPCTypes::TransferLeader,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(unsupported.to_string().contains("no wire operation"));
+
         let unknown = network
-            .send_rpc::<_, Value>(99, &json!(0), RPCTypes::Vote, Duration::from_secs(1))
+            .send_rpc::<_, Value>(
+                crate::raft::types::test_replica(99),
+                &super::testing::vote_request(),
+                RPCTypes::Vote,
+                Duration::from_secs(1),
+            )
             .await
             .unwrap_err();
         assert!(matches!(unknown, RPCError::Unreachable(_)));
 
+        *network.peers[&2].remote_replica.write().unwrap() =
+            Some(crate::raft::types::test_replica(2));
         let disconnected = network
-            .send_rpc::<_, Value>(2, &json!(0), RPCTypes::Vote, Duration::ZERO)
+            .send_rpc::<_, Value>(
+                crate::raft::types::test_replica(2),
+                &super::testing::vote_request(),
+                RPCTypes::Vote,
+                Duration::ZERO,
+            )
             .await
             .unwrap_err();
         assert!(matches!(disconnected, RPCError::Unreachable(_)));
@@ -666,7 +803,7 @@ mod tests {
         let tiny_frame_network = test_network(4, &[1, 2]);
         let oversize = tiny_frame_network
             .send_rpc::<_, Value>(
-                2,
+                crate::raft::types::test_replica(2),
                 &json!({"larger": "than-four-bytes"}),
                 RPCTypes::AppendEntries,
                 Duration::from_secs(1),
@@ -686,10 +823,10 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let request = read_framed_bounded(&mut server, 1_024).await.unwrap();
             assert_eq!(
-                serde_json::from_slice::<Value>(&request).unwrap(),
-                json!({"request": 1})
+                decode_payload::<Value>(&request, Operation::Vote).unwrap(),
+                serde_json::to_value(super::testing::vote_request()).unwrap()
             );
-            let response = serde_json::to_vec(&json!({"response": 2})).unwrap();
+            let response = encode(Operation::Vote, &super::testing::vote_response(true)).unwrap();
             server
                 .write_all(&(response.len() as u32).to_be_bytes())
                 .await
@@ -698,12 +835,82 @@ mod tests {
         });
 
         let response: Value = network
-            .send_rpc(2, &json!({"request": 1}), RPCTypes::Vote, Duration::ZERO)
+            .send_rpc(
+                crate::raft::types::test_replica(2),
+                &super::testing::vote_request(),
+                RPCTypes::Vote,
+                Duration::ZERO,
+            )
             .await
             .unwrap();
-        assert_eq!(response, json!({"response": 2}));
+        assert_eq!(
+            response,
+            serde_json::to_value(super::testing::vote_response(true)).unwrap()
+        );
         server_task.await.unwrap();
         assert!(network.peers.get(&2).unwrap().stream.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn tagged_wire_wrong_response_operation_discards_stream() {
+        let network = test_network(1_024, &[1, 2]);
+        let mut server = attach_loopback_stream(&network, 2).await;
+        // Lifetime: one bounded response exchange, joined before the test returns.
+        let server_task = tokio::spawn(async move {
+            read_framed_bounded(&mut server, 1_024).await.unwrap();
+            super::write_framed(&mut server, br#"{"append_entries":true}"#)
+                .await
+                .unwrap();
+        });
+        let result = network
+            .send_rpc::<_, Value>(
+                crate::raft::types::test_replica(2),
+                &super::testing::vote_request(),
+                RPCTypes::Vote,
+                Duration::from_secs(1),
+            )
+            .await;
+        server_task.await.unwrap();
+        assert!(result.is_err(), "wrong-operation response was accepted");
+        assert!(network.peers[&2].stream.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tagged_wire_invalid_responses_never_retain_a_stream() {
+        use openraft::raft::VoteResponse;
+        let payload = r#"{"vote":{"leader_id":{"term":7,"node_id":2},"committed":false},"vote_granted":true,"last_log_id":null}"#;
+        for bytes in [
+            payload.to_owned(),
+            format!("{{\"other\":{payload}}}"),
+            format!("{{\"pre_vote\":{payload}}}"),
+            format!("{{\"vote\":{payload},\"vote\":{payload}}}"),
+            format!("{{\"vote\":{payload},\"pre_vote\":{payload}}}"),
+            "{\"vote\":false}".to_owned(),
+            "{\"vote\":{}}".to_owned(),
+            "null".to_owned(),
+        ] {
+            let network = test_network(1_024, &[1, 2]);
+            let mut server = attach_loopback_stream(&network, 2).await;
+            let reply = bytes.clone();
+            // Lifetime: one bounded response exchange, joined before the next case.
+            let server_task = tokio::spawn(async move {
+                read_framed_bounded(&mut server, 1_024).await.unwrap();
+                super::write_framed(&mut server, reply.as_bytes())
+                    .await
+                    .unwrap();
+            });
+            let result = network
+                .send_rpc::<_, VoteResponse<TypeConfig>>(
+                    crate::raft::types::test_replica(2),
+                    &super::testing::vote_request(),
+                    RPCTypes::Vote,
+                    Duration::from_secs(1),
+                )
+                .await;
+            server_task.await.unwrap();
+            assert!(result.is_err(), "accepted invalid response {bytes}");
+            assert!(network.peers[&2].stream.lock().await.is_none());
+        }
     }
 
     #[tokio::test]
@@ -723,7 +930,12 @@ mod tests {
         });
 
         let error = network
-            .send_rpc::<_, Value>(2, &json!(0), RPCTypes::Vote, Duration::from_secs(1))
+            .send_rpc::<_, Value>(
+                crate::raft::types::test_replica(2),
+                &super::testing::vote_request(),
+                RPCTypes::Vote,
+                Duration::from_secs(1),
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, RPCError::Network(_)));
@@ -735,7 +947,7 @@ mod tests {
         let network = test_network(16, &[1, 2]);
         let mut connection = RaftConnection {
             network: Arc::new(network),
-            target: 2,
+            target: crate::raft::types::test_replica(2),
         };
         let snapshot = openraft::Snapshot {
             meta: SnapshotMeta {
@@ -748,7 +960,7 @@ mod tests {
 
         let error = connection
             .full_snapshot(
-                VoteOf::<TypeConfig>::new(1, 1),
+                VoteOf::<TypeConfig>::new(1, crate::raft::types::test_replica(1)),
                 snapshot,
                 std::future::pending(),
                 RPCOption::new(Duration::from_secs(1)),
@@ -760,21 +972,23 @@ mod tests {
 
     #[tokio::test]
     async fn send_rpc_drops_stream_after_framing_error_and_timeout() {
-        let framing_network = test_network(32, &[1, 2]);
+        let framing_network = test_network(1_024, &[1, 2]);
         let mut framing_server = attach_loopback_stream(&framing_network, 2).await;
         // Lifetime: sends one deliberately oversized response prefix and is then joined.
         let framing_task = tokio::spawn(async move {
-            read_framed_bounded(&mut framing_server, 32).await.unwrap();
+            read_framed_bounded(&mut framing_server, 1_024)
+                .await
+                .unwrap();
             framing_server
-                .write_all(&33_u32.to_be_bytes())
+                .write_all(&1_025_u32.to_be_bytes())
                 .await
                 .unwrap();
         });
         let framing_error = framing_network
             .send_rpc::<_, Value>(
-                2,
-                &json!(0),
-                RPCTypes::AppendEntries,
+                crate::raft::types::test_replica(2),
+                &super::testing::vote_request(),
+                RPCTypes::Vote,
                 Duration::from_secs(1),
             )
             .await
@@ -802,7 +1016,12 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let timeout_error = timeout_network
-            .send_rpc::<_, Value>(2, &json!(0), RPCTypes::Vote, Duration::ZERO)
+            .send_rpc::<_, Value>(
+                crate::raft::types::test_replica(2),
+                &super::testing::vote_request(),
+                RPCTypes::Vote,
+                Duration::ZERO,
+            )
             .await
             .unwrap_err();
         assert!(matches!(timeout_error, RPCError::Timeout(_)));
@@ -836,8 +1055,8 @@ mod tests {
         let rpc_task = tokio::spawn(async move {
             rpc_network
                 .send_rpc::<_, Value>(
-                    2,
-                    &json!({"term": 1}),
+                    crate::raft::types::test_replica(2),
+                    &super::testing::vote_request(),
                     RPCTypes::Vote,
                     Duration::from_secs(30),
                 )

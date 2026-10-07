@@ -40,6 +40,6 @@ raft:
   election_timeout_max_ms: 2500
   heartbeat_interval_ms: 500
 
-cluster_secret: "keepafloatd-e2e-secret"
+cluster_secret: "keepafloatd-e2e-fixture-secret-0123456789"
 submit_timeout_ms: 5000
 dry_run: false

@@ -13,7 +13,7 @@
 //! That last pair of fences is what removes the old "two healthy nodes with different applied
 //! views both bind" failure mode.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::raft::store::{VipAssignment, is_node_probe_fresh};
 
@@ -48,7 +48,7 @@ pub(crate) fn should_bind_vip(
     consensus_fresh: bool,
     node_id: u64,
     assignment: Option<&VipAssignment>,
-    node_probe_ticks: &HashMap<u64, u64>,
+    node_probe_ticks: &BTreeMap<u64, u64>,
     latest_probe_tick: u64,
     stale_missed_probes: u64,
 ) -> bool {
@@ -75,7 +75,7 @@ pub(crate) fn should_bind_or_keep_vip(
     gates: BindGates,
     node_id: u64,
     assignment: Option<&VipAssignment>,
-    node_probe_ticks: &HashMap<u64, u64>,
+    node_probe_ticks: &BTreeMap<u64, u64>,
     latest_probe_tick: u64,
     stale_missed_probes: u64,
     activated_generation: Option<u64>,
@@ -115,11 +115,11 @@ pub(crate) fn should_bind_or_keep_vip(
 pub(crate) fn binder_count_for_vip(
     has_leader: bool,
     vip: IpAddr,
-    assignments: &HashMap<IpAddr, VipAssignment>,
+    assignments: &BTreeMap<IpAddr, VipAssignment>,
     peer_ids_sorted: &[u64],
-    local_healthy_per_node: &HashMap<u64, bool>,
-    consensus_fresh_per_node: &HashMap<u64, bool>,
-    node_probe_ticks: &HashMap<u64, u64>,
+    local_healthy_per_node: &BTreeMap<u64, bool>,
+    consensus_fresh_per_node: &BTreeMap<u64, bool>,
+    node_probe_ticks: &BTreeMap<u64, u64>,
     latest_probe_tick: u64,
     stale_missed_probes: u64,
 ) -> usize {
@@ -150,11 +150,11 @@ pub(crate) fn binder_count_for_vip(
 pub(crate) fn binder_count_for_vip_per_node_view(
     has_leader: bool,
     vip: IpAddr,
-    per_node_assignments: &HashMap<u64, HashMap<IpAddr, VipAssignment>>,
+    per_node_assignments: &BTreeMap<u64, BTreeMap<IpAddr, VipAssignment>>,
     peer_ids_sorted: &[u64],
-    local_healthy_per_node: &HashMap<u64, bool>,
-    consensus_fresh_per_node: &HashMap<u64, bool>,
-    node_probe_ticks: &HashMap<u64, u64>,
+    local_healthy_per_node: &BTreeMap<u64, bool>,
+    consensus_fresh_per_node: &BTreeMap<u64, bool>,
+    node_probe_ticks: &BTreeMap<u64, u64>,
     latest_probe_tick: u64,
     stale_missed_probes: u64,
 ) -> usize {
@@ -185,11 +185,13 @@ mod tests {
         should_bind_or_keep_vip, should_bind_vip,
     };
     use crate::config::VipAddr;
-    use crate::raft::store::{VipAssignment, recompute_vip_holder, reconcile_vip_assignments};
-    use crate::raft::types::TypeConfig;
+    use crate::raft::store::{
+        EligibilityInputs, VipAssignment, recompute_vip_holder, reconcile_vip_assignments,
+    };
+    use crate::raft::types::{TypeConfig, test_replica};
     use openraft::alias::StoredMembershipOf;
     use openraft::{BasicNode, Membership};
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::net::{IpAddr, Ipv4Addr};
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
@@ -208,10 +210,10 @@ mod tests {
 
     #[test]
     fn failure_no_leader_prevents_any_bind_even_if_health_and_holder_match() {
-        let assignments = HashMap::from([(ip(10, 0, 0, 5), assignment(1))]);
-        let node_ticks = HashMap::from([(1_u64, 5_u64)]);
-        let local = HashMap::from([(1_u64, true)]);
-        let consensus = HashMap::from([(1_u64, true)]);
+        let assignments = BTreeMap::from([(ip(10, 0, 0, 5), assignment(1))]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64)]);
+        let local = BTreeMap::from([(1_u64, true)]);
+        let consensus = BTreeMap::from([(1_u64, true)]);
         assert_eq!(
             binder_count_for_vip(
                 false,
@@ -230,7 +232,7 @@ mod tests {
 
     #[test]
     fn failure_local_unhealthy_prevents_bind_when_this_node_is_holder() {
-        let node_ticks = HashMap::from([(1_u64, 5_u64)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64)]);
         assert!(!should_bind_vip(
             true,
             false,
@@ -245,7 +247,7 @@ mod tests {
 
     #[test]
     fn failure_consensus_not_fresh_prevents_bind() {
-        let node_ticks = HashMap::from([(1_u64, 5_u64)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64)]);
         assert!(!should_bind_vip(
             true,
             true,
@@ -260,7 +262,7 @@ mod tests {
 
     #[test]
     fn failure_holder_mismatch_even_if_healthy() {
-        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64), (2, 5)]);
         assert!(!should_bind_vip(
             true,
             true,
@@ -282,7 +284,7 @@ mod tests {
             previous_holder_released: false,
             activation_tick: 5,
         };
-        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64), (2, 5)]);
         assert!(!should_bind_vip(
             true,
             true,
@@ -304,7 +306,7 @@ mod tests {
             previous_holder_released: false,
             activation_tick: 5,
         };
-        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64), (2, 5)]);
 
         assert!(!should_bind_vip(
             true,
@@ -327,7 +329,7 @@ mod tests {
             previous_holder_released: false,
             activation_tick: 5,
         };
-        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64), (2, 5)]);
         assert!(should_bind_or_keep_vip(
             BindGates {
                 has_leader: true,
@@ -352,7 +354,7 @@ mod tests {
             previous_holder_released: false,
             activation_tick: 5,
         };
-        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64), (2, 5)]);
 
         assert!(!should_bind_or_keep_vip(
             BindGates {
@@ -378,7 +380,7 @@ mod tests {
             previous_holder_released: false,
             activation_tick: 5,
         };
-        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64), (2, 5)]);
         for (has_leader, local_healthy, consensus_fresh, node_id, latest_tick) in [
             (false, true, true, 2, 5),
             (true, false, true, 2, 5),
@@ -411,7 +413,7 @@ mod tests {
             previous_holder_released: true,
             activation_tick: 5,
         };
-        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64), (2, 5)]);
         assert!(should_bind_vip(
             true,
             true,
@@ -433,7 +435,7 @@ mod tests {
             previous_holder_released: false,
             activation_tick: 6,
         };
-        let node_ticks = HashMap::from([(1_u64, 1_u64), (2, 6)]);
+        let node_ticks = BTreeMap::from([(1_u64, 1_u64), (2, 6)]);
         assert!(!should_bind_vip(
             true,
             true,
@@ -461,15 +463,15 @@ mod tests {
     #[test]
     fn exhaustive_two_vips_three_peers_fixed_assignment_map_at_most_one_binder() {
         let vips = vec![ip(10, 0, 0, 11), ip(10, 0, 0, 12)];
-        let assignments = HashMap::from([(vips[0], assignment(2)), (vips[1], assignment(1))]);
+        let assignments = BTreeMap::from([(vips[0], assignment(2)), (vips[1], assignment(1))]);
         let peers = [1_u64, 2, 3];
-        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5), (3, 5)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64), (2, 5), (3, 5)]);
 
         for has_leader in [false, true] {
             for local_mask in 0u8..(1 << 3) {
                 for consensus_mask in 0u8..(1 << 3) {
-                    let mut local = HashMap::new();
-                    let mut consensus = HashMap::new();
+                    let mut local = BTreeMap::new();
+                    let mut consensus = BTreeMap::new();
                     for (i, p) in peers.iter().enumerate() {
                         local.insert(*p, (local_mask & (1 << i)) != 0);
                         consensus.insert(*p, (consensus_mask & (1 << i)) != 0);
@@ -497,12 +499,16 @@ mod tests {
     /// binder set.
     #[test]
     fn recompute_health_masks_three_members_exclusive_bind_under_leader() {
-        let m = Membership::<u64, BasicNode>::new(
-            vec![BTreeSet::from([1_u64, 2, 3])],
+        let m = Membership::new(
+            vec![BTreeSet::from([
+                test_replica(1),
+                test_replica(2),
+                test_replica(3),
+            ])],
             BTreeMap::from([
-                (1_u64, BasicNode::default()),
-                (2, BasicNode::default()),
-                (3, BasicNode::default()),
+                (test_replica(1), BasicNode::default()),
+                (test_replica(2), BasicNode::default()),
+                (test_replica(3), BasicNode::default()),
             ]),
         )
         .unwrap();
@@ -513,39 +519,41 @@ mod tests {
             (VipAddr::host(ip(10, 0, 0, 103)), "eth0".into()),
         ];
         let peers_vec = vec![1_u64, 2, 3];
-        let local = HashMap::from([(1_u64, true), (2, true), (3, true)]);
-        let consensus = HashMap::from([(1_u64, true), (2, true), (3, true)]);
+        let local = BTreeMap::from([(1_u64, true), (2, true), (3, true)]);
+        let consensus = BTreeMap::from([(1_u64, true), (2, true), (3, true)]);
 
         for mask in 0u8..(1 << 3) {
-            let mut node_health = HashMap::new();
-            let mut node_ticks = HashMap::new();
+            let mut node_health = BTreeMap::new();
+            let mut node_ticks = BTreeMap::new();
             for i in 0..3_u64 {
                 node_health.insert(i + 1, (mask & (1 << i)) != 0);
                 node_ticks.insert(i + 1, 4_u64);
             }
-            let mut vip_holder = HashMap::new();
+            let mut vip_holder = BTreeMap::new();
             recompute_vip_holder(
                 &membership,
-                &node_health,
-                &node_ticks,
-                4,
-                3,
-                0,
-                &HashMap::new(),
-                &HashSet::new(),
+                &EligibilityInputs {
+                    node_health: &node_health,
+                    node_probe_ticks: &node_ticks,
+                    latest_probe_tick: 4,
+                    stale_missed_probes: 3,
+                    failback_delay_ticks: 0,
+                    node_recovery_tick: &BTreeMap::new(),
+                },
+                &BTreeSet::new(),
                 &vip_list,
-                &HashMap::new(),
+                &BTreeMap::new(),
                 &mut vip_holder,
             );
-            let mut assignments = HashMap::new();
-            let mut generations = HashMap::new();
+            let mut assignments = BTreeMap::new();
+            let mut generations = BTreeMap::new();
             reconcile_vip_assignments(
                 &vip_holder,
                 4,
                 &vip_list,
                 &mut assignments,
                 &mut generations,
-                &mut HashMap::new(),
+                &mut BTreeMap::new(),
             );
             for (vip, _) in &vip_list {
                 let cnt = binder_count_for_vip(
@@ -574,9 +582,9 @@ mod tests {
     fn divergent_applied_index_release_gate_preserves_at_most_one_binder() {
         let vip = ip(10, 0, 0, 7);
         let peers = [1_u64, 2];
-        let mut node1_view = HashMap::new();
+        let mut node1_view = BTreeMap::new();
         node1_view.insert(vip, assignment(1));
-        let mut node2_view = HashMap::new();
+        let mut node2_view = BTreeMap::new();
         node2_view.insert(
             vip,
             VipAssignment {
@@ -587,10 +595,10 @@ mod tests {
                 activation_tick: 5,
             },
         );
-        let per_node = HashMap::from([(1_u64, node1_view), (2, node2_view)]);
-        let local = HashMap::from([(1_u64, true), (2, true)]);
-        let consensus = HashMap::from([(1_u64, true), (2, true)]);
-        let node_ticks = HashMap::from([(1_u64, 5_u64), (2, 5)]);
+        let per_node = BTreeMap::from([(1_u64, node1_view), (2, node2_view)]);
+        let local = BTreeMap::from([(1_u64, true), (2, true)]);
+        let consensus = BTreeMap::from([(1_u64, true), (2, true)]);
+        let node_ticks = BTreeMap::from([(1_u64, 5_u64), (2, 5)]);
 
         let cnt = binder_count_for_vip_per_node_view(
             true,
@@ -610,7 +618,7 @@ mod tests {
     fn activation_tick_boundary_gates_first_bind() {
         // No previous holder, so the activation tick is the only remaining fence.
         let a = assignment(1); // previous_holder: None, activation_tick: 5
-        let ticks = HashMap::from([(1_u64, 5_u64)]);
+        let ticks = BTreeMap::from([(1_u64, 5_u64)]);
         // One round before activation: blocked.
         assert!(!should_bind_vip(
             true,
@@ -637,7 +645,7 @@ mod tests {
             activation_tick: 0,
         };
         // At the stale threshold, node 1 remains eligible and blocks replacement.
-        let at_threshold = HashMap::from([(1_u64, 7_u64), (2, 10)]);
+        let at_threshold = BTreeMap::from([(1_u64, 7_u64), (2, 10)]);
         assert!(!should_bind_vip(
             true,
             true,
@@ -649,7 +657,7 @@ mod tests {
             3
         ));
         // One round past the threshold, node 1 is ineligible and replacement is allowed.
-        let past_threshold = HashMap::from([(1_u64, 6_u64), (2, 10)]);
+        let past_threshold = BTreeMap::from([(1_u64, 6_u64), (2, 10)]);
         assert!(should_bind_vip(
             true,
             true,
@@ -666,7 +674,7 @@ mod tests {
     fn node_holding_two_vips_binds_both_when_fresh_and_neither_when_consensus_stale() {
         let a1 = assignment(1);
         let a2 = assignment(1);
-        let ticks = HashMap::from([(1_u64, 5_u64)]);
+        let ticks = BTreeMap::from([(1_u64, 5_u64)]);
         // A healthy, fresh holder with a fresh leader binds both of its VIPs.
         assert!(should_bind_vip(
             true,

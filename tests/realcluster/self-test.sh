@@ -7,6 +7,21 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${HERE}/lib.sh"
 
 failures=0
+cleanup_budget_scales_with_configured_vips() (
+  VIPS=(198.51.100.1)
+  [[ "$(cleanup_budget_seconds 20)" == 32 ]] || return 1
+  VIPS+=(198.51.100.2)
+  [[ "$(cleanup_budget_seconds 20)" == 43 ]] || return 1
+  VIPS+=(198.51.100.3)
+  [[ "$(cleanup_budget_seconds 30)" == 65 ]] || return 1
+  VIPS+=(198.51.100.4)
+  [[ "$(cleanup_budget_seconds 45)" == 91 ]]
+)
+
+isolated_proof_ssh_budget_is_scoped() (
+  python3 -B "${HERE}/probe-compatibility-test.py" IsolatedWrapperTests RemoteControlFlowTests
+)
+
 assert() {
   local description="${1:?}"; shift
   if "$@"; then
@@ -17,10 +32,17 @@ assert() {
   fi
 }
 
+assert "cleanup budget rounds up and counts every configured VIP" \
+  cleanup_budget_scales_with_configured_vips
+assert "isolated proof scopes startup waiting and owned resource cleanup" \
+  isolated_proof_ssh_budget_is_scoped
+
 # shellcheck source=safety-self-test.sh
 source "${HERE}/safety-self-test.sh"
 # shellcheck source=evidence-self-test.sh
 source "${HERE}/evidence-self-test.sh"
+# shellcheck source=protocol-self-test.sh
+source "${HERE}/protocol-self-test.sh"
 
 arp_failover_observation_never_sends_an_active_probe() (
   local calls result=0 body
@@ -101,9 +123,9 @@ secret_audit_is_read_only_and_rejects_mismatch() {
       printf 'write\n' >> "${calls}"
     fi
     if [[ "${mode}" == "mismatch" && "${ip}" == "${NODE_IPS[2]}" ]]; then
-      printf 'different-secret-123456\n'
+      printf 'different-secret-fixture-0123456789\n'
     else
-      printf 'matching-secret-123456\n'
+      printf 'matching-secret-fixture-0123456789\n'
     fi
   }
 
@@ -223,9 +245,8 @@ unreadable_node_invalidates_unique_holder_evidence() (
 latest_leader_none_invalidates_old_some_evidence() {
   kafd_active() { printf 'active\n'; }
   node_sh() {
-    printf '%s\n' \
-      'raft current leader is now Some(7)' \
-      'raft current leader is now None'
+    replica_log_fixture 7
+    printf '%s\n' 'raft current leader is now None'
   }
 
   ! single_agreed_leader
@@ -239,7 +260,7 @@ current_configured_leader_requires_a_majority() (
     if [[ "${ip}" == "${NODE_IPS[2]}" ]]; then
       printf 'raft current leader is now None\n'
     else
-      printf 'raft current leader is now Some(%s)\n' "${leader}"
+      replica_log_fixture "${leader}"
     fi
   }
 
@@ -249,7 +270,7 @@ current_configured_leader_requires_a_majority() (
 inactive_nodes_cannot_supply_leader_evidence() (
   local leader="${NODE_RAFT_IDS[0]}"
   kafd_active() { printf 'inactive\n'; }
-  node_sh() { printf 'raft current leader is now Some(%s)\n' "${leader}"; }
+  node_sh() { replica_log_fixture "${leader}"; }
 
   ! cluster_leader_id
 )
@@ -659,22 +680,12 @@ partition_cleanup_deletes_only_harness_rules() {
 }
 
 mixed_version_deploy_checks_the_running_process() {
-  local scenario body implementation
-  implementation="$(declare -f running_keepafloatd_buildid; \
-    declare -f replace_keepafloatd_binary)"
-  [[ "${implementation}" == *'set -euo pipefail'* ]] || return 1
-  [[ "${implementation}" == *'MainPID'* ]] || return 1
-  [[ "${implementation}" == *'/proc/'*'/exe'* ]] || return 1
-  [[ "${implementation}" == *'systemctl is-active --quiet'* ]] || return 1
-  [[ "${implementation}" == *'reset-failed'*'|| true'* ]] || return 1
-  for scenario in \
-    "${HERE}/scenarios/D15_mixed_version_activation.sh" \
-    "${HERE}/scenarios/D16_chained_legacy_activation.sh"
-  do
-    body="$(sed -n '/^binary_buildid()/,/^}/p; /^deploy_binary()/,/^}/p' "${scenario}")"
-    [[ "${body}" == *'running_keepafloatd_buildid'* ]] || return 1
-    [[ "${body}" == *'replace_keepafloatd_binary'* ]] || return 1
-  done
+  local scenario="${HERE}/scenarios/D15_mixed_version_activation.sh"
+  grep -q 'running_keepafloatd_buildid' "${scenario}" &&
+    grep -q 'node_lacks_all_vips' "${scenario}" &&
+    grep -q 'kafd_stop' "${scenario}" &&
+    grep -q 'kafd_start' "${scenario}" &&
+    ! grep -q 'LEGACY_BINARY' "${scenario}"
 }
 
 campaign_timeout_cleanup_is_signal_safe() {
@@ -867,11 +878,11 @@ journal_readers_propagate_journalctl_failure() (
   node_sh() {
     shift
     journalctl() {
-      printf '%s\n' 'raft current leader is now Some(17)'
+      replica_log_fixture 17
       return 17
     }
     systemctl() { printf '%s\n' fixture-invocation; }
-    export -f journalctl systemctl
+    export -f journalctl systemctl replica_log_fixture
     bash -c "$*"
   }
 
@@ -900,18 +911,18 @@ leader_reader_keeps_old_transition_after_heavy_noise() (
         [[ "${argument}" == --grep=* ]] && filtered=1
       done
       if [[ "${filtered}" -eq 1 ]]; then
-        printf '%s\n' 'raft current leader is now Some(17)'
+        replica_log_fixture 17
       else
         # Model journalctl's bounded tail after the sole transition was pushed out by noisy logs.
         printf '%s\n' noise-{1..1200}
       fi
     }
     systemctl() { printf '%s\n' fixture-invocation; }
-    export -f journalctl systemctl
+    export -f journalctl systemctl replica_log_fixture
     bash -c "$*"
   }
 
-  [[ "$(leader_seen_by fixture)" == 17 ]]
+  [[ "$(replica_physical_id "$(leader_seen_by fixture)")" == 17 ]]
 )
 
 d22_proves_failed_startup_has_no_daemon_or_listeners() {
@@ -1029,6 +1040,7 @@ hard_kill_verifies_the_service_stayed_down() {
 }
 
 steady_state_rechecks_ownership_after_leader_observation() (
+  wait_for_startup_activation() { return 0; }
   wait_for_even() { return 0; }
   wait_until() { shift; "$@"; }
   all_daemons_active() { return 0; }

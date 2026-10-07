@@ -4,7 +4,7 @@ use crate::bind_policy::{BindGates, should_bind_or_keep_vip};
 use crate::config::VipAddr;
 use crate::raft::KafRequest;
 use crate::raft::store::{KafStateMachine, new_store};
-use crate::raft::types::TypeConfig;
+use crate::raft::types::{TypeConfig, test_replica};
 use openraft::Membership;
 use openraft::alias::EntryOf;
 use openraft::entry::RaftEntry;
@@ -18,7 +18,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 async fn apply_health(sm: &mut KafStateMachine, index: &mut u64, node_id: u64) {
     *index += 1;
     let entry = EntryOf::<TypeConfig>::new_normal(
-        log_id::<TypeConfig>(1, 1, *index),
+        log_id::<TypeConfig>(1, test_replica(1), *index),
         KafRequest::HealthUpdate {
             node_id,
             healthy: true,
@@ -37,9 +37,13 @@ async fn delayed_probe_completion_cannot_activate_before_old_holder_proof_expire
     let table = Arc::new(vec![(VipAddr::host(vip), "lo".into())]);
     let (_, mut sm, state) = new_store(table, 1, false, 0);
     let members = [1, 2, 3];
+    let replicas = members.map(test_replica);
     let entry = EntryOf::<TypeConfig>::new_membership(
-        log_id::<TypeConfig>(1, 1, 0),
-        Membership::new_with_defaults(vec![members.into_iter().collect::<BTreeSet<_>>()], members),
+        log_id::<TypeConfig>(1, test_replica(1), 0),
+        Membership::new_with_defaults(
+            vec![replicas.into_iter().collect::<BTreeSet<_>>()],
+            replicas,
+        ),
     );
     sm.apply(futures::stream::iter([Ok::<_, std::io::Error>((
         entry, None,

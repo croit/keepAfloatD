@@ -6,7 +6,6 @@ import asyncio
 import json
 import os
 import signal
-import struct
 import time
 from pathlib import Path
 
@@ -33,12 +32,10 @@ def initial_state(endpoint):
 def payload(transport, mode):
     if mode == 0:
         return b"\x00"
-    if transport == "raft":
-        # Neither a partial secret nor an oversized secret is an authenticated handshake.
-        secret_length = 256 if mode == 1 else 257
-        return struct.pack("!QI", 1, secret_length) + b"x"
-    frame_length = 1024 if mode == 1 else 4097
-    return struct.pack("!I", frame_length) + b"{"
+    if mode == 1:
+        # A partial versioned hello holds only a bounded pre-authentication slot.
+        return b"KAFDAUTH\x03"
+    return b"OBSOLETE"
 
 
 async def worker(state, mode):
@@ -141,8 +138,9 @@ def main():
     parser.add_argument("--duration", type=int, default=90)
     parser.add_argument("--connections", type=int, default=32)
     args = parser.parse_args()
-    if not 9 <= args.connections <= 64 or not 1 <= args.duration <= 120:
-        parser.error("connections must be 9 to 64 and duration 1 to 120 seconds")
+    # The three-VIP fallback adds 34.5 seconds to the 90-second pressure window.
+    if not 9 <= args.connections <= 64 or not 1 <= args.duration <= 125:
+        parser.error("connections must be 9 to 64 and duration 1 to 125 seconds")
     asyncio.run(run(args))
 
 

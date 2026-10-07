@@ -4,8 +4,10 @@ use super::state::{
 };
 use super::{KafLogStore, KafStateMachine};
 use crate::config::{Config, VipAddr};
+use crate::raft::admission::ReplicaId;
 use crate::raft::probe::config_identity_compatible;
-use crate::raft::store::vip_logic::is_node_eligible;
+use crate::raft::store::vip_logic::{EligibilityInputs, is_node_eligible};
+use crate::raft::types::test_replica;
 use crate::raft::types::{KafRequest, KafSnapshotData, TypeConfig};
 use futures::stream;
 use openraft::alias::{EntryOf, LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf};
@@ -15,7 +17,7 @@ use openraft::storage::{
 };
 use openraft::testing::log_id;
 use openraft::{BasicNode, EntryPayload, LogId, Membership, OptionalSend, SnapshotMeta, Vote};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Cursor};
 use std::net::{IpAddr, Ipv4Addr};
 use std::ops::Bound;
@@ -24,6 +26,216 @@ use tokio::sync::RwLock;
 
 #[path = "ownerless_gap_tests.rs"]
 mod ownerless_gap_tests;
+
+#[path = "snapshot_tests.rs"]
+mod snapshot_tests;
+
+#[path = "admission_tests.rs"]
+mod admission_tests;
+
+#[tokio::test]
+async fn physical_health_survives_legacy_membership_until_admission_genesis() {
+    use crate::raft::admission::Genesis;
+    for semantics in [FailoverSemantics::Legacy, FailoverSemantics::V2] {
+        let mut store = storage(&[], 3);
+        store.state.write().await.failover_semantics = semantics;
+        store
+            .apply_to_state_machine(&[health_entry(1, 1, true)])
+            .await
+            .unwrap();
+        let (health, ticks) = {
+            let state = store.state.read().await;
+            (state.node_health.clone(), state.node_probe_ticks.clone())
+        };
+        store
+            .apply_to_state_machine(&[membership_entry(2, &[1])])
+            .await
+            .unwrap();
+        {
+            let state = store.state.read().await;
+            assert_eq!(state.node_health, health, "semantics={semantics:?}");
+            assert_eq!(state.node_probe_ticks, ticks);
+        }
+        let genesis = Genesis {
+            config: crate::config::ClusterConfigFingerprint {
+                version: 1,
+                digest: [8; 32],
+            },
+            epoch: 42,
+            voters: [test_replica(1)].into(),
+        };
+        store
+            .apply_to_state_machine(&[log_entry(
+                3,
+                EntryPayload::Normal(KafRequest::AdmissionGenesis(genesis)),
+            )])
+            .await
+            .unwrap();
+        let state = store.state.read().await;
+        assert!(state.node_health.is_empty());
+        assert!(state.node_probe_ticks.is_empty());
+        assert!(state.node_recovery_tick.is_empty());
+        assert!(state.applied_progress.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn admitted_membership_clears_replaced_boot_but_preserves_unchanged_boot() {
+    use crate::raft::admission::{Genesis, HealthProgress};
+    let mut store = storage(&[], 3);
+    let genesis = Genesis {
+        config: crate::config::ClusterConfigFingerprint {
+            version: 1,
+            digest: [8; 32],
+        },
+        epoch: 42,
+        voters: [test_replica(1), test_replica(2)].into(),
+    };
+    store
+        .apply_to_state_machine(&[
+            membership_entry(1, &[1, 2]),
+            log_entry(
+                2,
+                EntryPayload::Normal(KafRequest::AdmissionGenesis(genesis.clone())),
+            ),
+        ])
+        .await
+        .unwrap();
+    for id in [1, 2] {
+        store
+            .apply_to_state_machine(&[log_entry(
+                2 + id,
+                EntryPayload::Normal(KafRequest::HealthProgress(HealthProgress {
+                    node_id: id,
+                    healthy: Some(true),
+                    replica: test_replica(id),
+                    epoch: genesis.epoch,
+                    request_nonce: [id as u8; 32],
+                    genesis: genesis.clone(),
+                })),
+            )])
+            .await
+            .unwrap();
+    }
+    let (health, ticks, progress) = {
+        let state = store.state.read().await;
+        (
+            state.node_health.clone(),
+            state.node_probe_ticks.clone(),
+            state.applied_progress.clone(),
+        )
+    };
+    let replacement = ReplicaId {
+        physical_id: 2,
+        boot_nonce: [99; 32],
+    };
+    let voters = BTreeSet::from([test_replica(1), replacement]);
+    store
+        .apply_to_state_machine(&[log_entry(
+            5,
+            EntryPayload::Membership(Membership::new_with_defaults(vec![voters.clone()], voters)),
+        )])
+        .await
+        .unwrap();
+    let state = store.state.read().await;
+    assert_eq!(state.node_health.get(&1), health.get(&1));
+    assert_eq!(state.node_probe_ticks.get(&1), ticks.get(&1));
+    assert_eq!(state.applied_progress.get(&1), progress.get(&1));
+    assert!(!state.node_health.contains_key(&2));
+    assert!(!state.node_probe_ticks.contains_key(&2));
+    assert!(!state.node_recovery_tick.contains_key(&2));
+    assert!(!state.applied_progress.contains_key(&2));
+}
+
+#[tokio::test]
+async fn healthy_learner_never_receives_vip_in_either_semantics() {
+    let vip = ip4(192, 0, 2, 40);
+    for semantics in [FailoverSemantics::Legacy, FailoverSemantics::V2] {
+        let mut store = storage(&[vip], 3);
+        store.state.write().await.failover_semantics = semantics;
+        let membership = Membership::new_with_defaults(
+            vec![BTreeSet::from([test_replica(2)])],
+            [1, 2].map(test_replica),
+        );
+        store
+            .apply_to_state_machine(&[
+                log_entry(1, EntryPayload::Membership(membership)),
+                health_entry(2, 1, true),
+                health_entry(3, 2, true),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.state.read().await.vip_assignments[&vip].holder,
+            2,
+            "learner received VIP under {semantics:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn applied_progress_requires_genesis_and_preserves_exact_challenge() {
+    use crate::raft::admission::{Genesis, HealthProgress};
+    let replica = test_replica(1);
+    let genesis = Genesis {
+        config: crate::config::ClusterConfigFingerprint {
+            version: 1,
+            digest: [8; 32],
+        },
+        epoch: u128::MAX,
+        voters: BTreeSet::from([replica]),
+    };
+    let progress = HealthProgress {
+        node_id: 1,
+        healthy: Some(true),
+        replica,
+        epoch: u128::MAX,
+        request_nonce: [9; 32],
+        genesis: genesis.clone(),
+    };
+    let mut store = storage(&[], 3);
+    store
+        .apply_to_state_machine(&[log_entry(
+            1,
+            EntryPayload::Normal(KafRequest::HealthProgress(progress.clone())),
+        )])
+        .await
+        .unwrap();
+    assert!(store.state.read().await.node_health.is_empty());
+    store
+        .apply_to_state_machine(&[
+            membership_entry(2, &[1]),
+            log_entry(
+                2,
+                EntryPayload::Normal(KafRequest::AdmissionGenesis(genesis.clone())),
+            ),
+            log_entry(
+                3,
+                EntryPayload::Normal(KafRequest::HealthProgress(progress.clone())),
+            ),
+        ])
+        .await
+        .unwrap();
+    let state = store.state.read().await;
+    assert_eq!(state.genesis.as_ref(), Some(&genesis));
+    assert_eq!(state.applied_progress.get(&1).unwrap().request, progress);
+    assert_eq!(state.applied_progress.get(&1).unwrap().log_id, lid(1, 3));
+    assert_eq!(state.node_health.get(&1), Some(&true));
+    drop(state);
+    let mut foreign = genesis;
+    foreign.epoch -= 1;
+    store
+        .apply_to_state_machine(&[log_entry(
+            4,
+            EntryPayload::Normal(KafRequest::AdmissionGenesis(foreign)),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.state.read().await.genesis.as_ref().unwrap().epoch,
+        u128::MAX
+    );
+}
 
 /// Combined test handle over one shared in-memory state, exposing the openraft-0.9-shaped method
 /// names the migrated tests still use. It forwards each call to the matching 0.10 trait method on
@@ -131,10 +343,13 @@ fn ip4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
 /// Build a `LogId` at the given term/index via openraft's test helper (the 0.10
 /// `CommittedLeaderId` is not a public root type; this constructs it through the type config).
 fn lid(term: u64, index: u64) -> LogIdOf<TypeConfig> {
-    log_id::<TypeConfig>(term, 0, index)
+    log_id::<TypeConfig>(term, test_replica(0), index)
 }
 
-fn log_entry(index: u64, payload: EntryPayload<KafRequest, u64, BasicNode>) -> EntryOf<TypeConfig> {
+fn log_entry(
+    index: u64,
+    payload: EntryPayload<KafRequest, ReplicaId, BasicNode>,
+) -> EntryOf<TypeConfig> {
     EntryOf::<TypeConfig>::new(lid(1, index), payload)
 }
 
@@ -146,14 +361,14 @@ fn health_entry_term(term: u64, index: u64, node_id: u64, healthy: bool) -> Entr
 }
 
 fn membership_entry(index: u64, voters: &[u64]) -> EntryOf<TypeConfig> {
-    let set: BTreeSet<u64> = voters.iter().copied().collect();
+    let set: BTreeSet<ReplicaId> = voters.iter().copied().map(test_replica).collect();
     // `Membership::new` rejects an empty voter config in 0.10 (`ensure_valid`); these tests
     // deliberately exercise the no-voters case (membership_without_voters_clears_assignments), so
     // use `new_with_defaults`, which builds the membership without that validation - matching the
     // 0.9 behaviour the regression suite relies on.
     EntryOf::<TypeConfig>::new_membership(
         lid(1, index),
-        Membership::new_with_defaults(vec![set], voters.iter().copied()),
+        Membership::new_with_defaults(vec![set], voters.iter().copied().map(test_replica)),
     )
 }
 
@@ -243,12 +458,14 @@ async fn health_updates_advance_frontier_and_assign_only_eligible_holders() {
         assert!(
             is_node_eligible(
                 a.holder,
-                &st.node_health,
-                &st.node_probe_ticks,
-                st.latest_probe_tick,
-                st.stale_missed_probes,
-                st.failback_delay_ticks,
-                &st.node_recovery_tick,
+                &EligibilityInputs {
+                    node_health: &st.node_health,
+                    node_probe_ticks: &st.node_probe_ticks,
+                    latest_probe_tick: st.latest_probe_tick,
+                    stale_missed_probes: st.stale_missed_probes,
+                    failback_delay_ticks: st.failback_delay_ticks,
+                    node_recovery_tick: &st.node_recovery_tick,
+                },
                 &st.node_failback_blocked,
             ),
             "holder {} of {vip} must be eligible",
@@ -703,7 +920,7 @@ async fn storage_trait_log_vote_and_snapshot_roundtrip() {
     assert_eq!(reader.try_get_log_entries(1..=2).await.unwrap().len(), 2);
 
     // Vote persistence.
-    let vote = Vote::new(3, 1);
+    let vote = Vote::new(3, test_replica(1));
     s.save_vote(&vote).await.unwrap();
     assert_eq!(s.read_vote().await.unwrap(), Some(vote));
 
@@ -1472,15 +1689,15 @@ async fn install_v2_snapshot_on_failback_node_clears_nopreempt_history() {
 
 #[derive(Debug, PartialEq, Eq)]
 struct TransitionFingerprint {
-    node_health: HashMap<u64, bool>,
-    node_probe_ticks: HashMap<u64, u64>,
+    node_health: BTreeMap<u64, bool>,
+    node_probe_ticks: BTreeMap<u64, u64>,
     latest_probe_tick: u64,
-    vip_assignments: HashMap<IpAddr, VipAssignment>,
-    vip_generation: HashMap<IpAddr, u64>,
-    vip_last_holder: HashMap<IpAddr, u64>,
-    node_recovery_tick: HashMap<u64, u64>,
-    node_recovery_pending: HashSet<u64>,
-    node_nopreempt: HashSet<u64>,
+    vip_assignments: BTreeMap<IpAddr, VipAssignment>,
+    vip_generation: BTreeMap<IpAddr, u64>,
+    vip_last_holder: BTreeMap<IpAddr, u64>,
+    node_recovery_tick: BTreeMap<u64, u64>,
+    node_recovery_pending: BTreeSet<u64>,
+    node_nopreempt: BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1513,14 +1730,14 @@ async fn run_v2_transition_sequence_with_policy(
     let initial = store.state.read().await;
     let mut previous_assignments = initial.vip_assignments.clone();
     let mut previous_generations = initial.vip_generation.clone();
-    let mut last_holders: HashMap<IpAddr, u64> = previous_assignments
+    let mut last_holders: BTreeMap<IpAddr, u64> = previous_assignments
         .iter()
         .map(|(vip, assignment)| (*vip, assignment.holder))
         .collect();
     drop(initial);
-    let mut expected_nopreempt = HashSet::new();
-    let mut expected_recovery_pending = HashSet::new();
-    let mut expected_recovery_tick = HashMap::new();
+    let mut expected_nopreempt = BTreeSet::new();
+    let mut expected_recovery_pending = BTreeSet::new();
+    let mut expected_recovery_tick = BTreeMap::new();
 
     for (offset, &(node_id, healthy)) in sequence.iter().enumerate() {
         store
@@ -1576,18 +1793,20 @@ async fn run_v2_transition_sequence_with_policy(
             state.node_recovery_tick, expected_recovery_tick,
             "policy={policy:?} sequence={sequence:?}: recovery timing diverged"
         );
-        let no_legacy_blocks = HashSet::new();
+        let no_legacy_blocks = BTreeSet::new();
         let eligible: Vec<u64> = [1_u64, 2, 3]
             .into_iter()
             .filter(|candidate| {
                 is_node_eligible(
                     *candidate,
-                    &state.node_health,
-                    &state.node_probe_ticks,
-                    state.latest_probe_tick,
-                    state.stale_missed_probes,
-                    state.failback_delay_ticks,
-                    &state.node_recovery_tick,
+                    &EligibilityInputs {
+                        node_health: &state.node_health,
+                        node_probe_ticks: &state.node_probe_ticks,
+                        latest_probe_tick: state.latest_probe_tick,
+                        stale_missed_probes: state.stale_missed_probes,
+                        failback_delay_ticks: state.failback_delay_ticks,
+                        node_recovery_tick: &state.node_recovery_tick,
+                    },
                     &no_legacy_blocks,
                 )
             })

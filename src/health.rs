@@ -9,6 +9,9 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
+mod local;
+pub(crate) use local::LocalHealth;
+
 #[cfg(test)]
 mod test_probe;
 
@@ -149,7 +152,6 @@ pub async fn run_health_check(cfg: &HealthConfig) -> bool {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use tracing::instrument::WithSubscriber;
 
     #[derive(Clone, Default)]
     struct DiagnosticBuffer(Arc<Mutex<Vec<u8>>>);
@@ -165,22 +167,91 @@ mod tests {
         }
     }
 
-    async fn recorded_probe(cfg: &HealthConfig) -> (bool, String) {
+    async fn isolated_diagnostics(case: &str) -> Option<DiagnosticBuffer> {
+        let test_name = format!("health::tests::{case}");
+        if std::env::var("KEEPAFLOATD_DIAGNOSTIC_TEST").as_deref() != Ok(&test_name) {
+            let child = tokio::time::timeout(
+                Duration::from_secs(3),
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &test_name, "--nocapture", "--color=never"])
+                    .env("KEEPAFLOATD_DIAGNOSTIC_TEST", &test_name)
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("isolated diagnostic test timed out")
+            .unwrap();
+            assert!(
+                child.status.success(),
+                "{test_name}: {}\n{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&child.stdout)
+                    .contains(&format!("test {test_name} ... ok")),
+                "child did not run {test_name}: {}",
+                String::from_utf8_lossy(&child.stdout)
+            );
+            return None;
+        }
+
         let output = DiagnosticBuffer::default();
         let writer = output.clone();
+        // Isolate global callsite registration from the parallel test suite.
         let subscriber = tracing_subscriber::fmt()
             .without_time()
             .with_ansi(false)
             .with_max_level(tracing::Level::WARN)
             .with_writer(move || writer.clone())
             .finish();
-        let healthy = run_health_check(cfg).with_subscriber(subscriber).await;
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+        Some(output)
+    }
+
+    async fn recorded_probe(cfg: &HealthConfig, output: &DiagnosticBuffer) -> (bool, String) {
+        output.0.lock().unwrap().clear();
+        let healthy = run_health_check(cfg).await;
         let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
         (healthy, text)
     }
 
     #[tokio::test]
+    async fn cold_probe_log_is_captured_after_an_unsubscribed_probe() {
+        let output = DiagnosticBuffer::default();
+        let writer = output.clone();
+        let subscriber = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let cfg = health_cfg(&["/bin/sh", "-c", "exit 7"], 200);
+        assert!(!run_health_check(&cfg).await);
+        let Some(output) =
+            isolated_diagnostics("cold_probe_log_is_captured_after_an_unsubscribed_probe").await
+        else {
+            return;
+        };
+        let (healthy, log) = recorded_probe(&cfg, &output).await;
+        assert!(!healthy);
+        assert!(
+            log.contains("health probe exited non-zero"),
+            "captured: {log:?}"
+        );
+        drop(subscriber);
+    }
+
+    #[tokio::test]
     async fn failed_probe_reports_bounded_output_and_exit_code() {
+        let Some(output) =
+            isolated_diagnostics("failed_probe_reports_bounded_output_and_exit_code").await
+        else {
+            return;
+        };
         let cfg = health_cfg(
             &[
                 "/bin/sh",
@@ -189,7 +260,7 @@ mod tests {
             ],
             2000,
         );
-        let (healthy, log) = recorded_probe(&cfg).await;
+        let (healthy, log) = recorded_probe(&cfg, &output).await;
         assert!(!healthy);
         assert!(log.contains("health probe exited non-zero"), "{log}");
         assert!(log.contains("exit_code=Some(7)"), "{log}");
@@ -201,14 +272,25 @@ mod tests {
 
     #[tokio::test]
     async fn failed_spawn_and_timeout_have_distinct_diagnostics() {
-        let (healthy, log) =
-            recorded_probe(&health_cfg(&["/definitely/missing-keepafloatd-probe"], 200)).await;
+        let Some(output) =
+            isolated_diagnostics("failed_spawn_and_timeout_have_distinct_diagnostics").await
+        else {
+            return;
+        };
+        let (healthy, log) = recorded_probe(
+            &health_cfg(&["/definitely/missing-keepafloatd-probe"], 200),
+            &output,
+        )
+        .await;
         assert!(!healthy);
         assert!(log.contains("health probe spawn failed"), "{log}");
         assert!(!log.contains("health probe timed out"));
 
-        let (healthy, log) =
-            recorded_probe(&health_cfg(&["/bin/sh", "-c", "exec sleep 10"], 200)).await;
+        let (healthy, log) = recorded_probe(
+            &health_cfg(&["/bin/sh", "-c", "exec sleep 10"], 200),
+            &output,
+        )
+        .await;
         assert!(!healthy);
         assert!(log.contains("health probe timed out"), "{log}");
         assert!(log.contains("timeout_ms=200"), "{log}");
@@ -217,7 +299,13 @@ mod tests {
 
     #[tokio::test]
     async fn successful_probe_emits_no_failure_diagnostics() {
-        let (healthy, log) = recorded_probe(&health_cfg(&["/bin/sh", "-c", "exit 0"], 200)).await;
+        let Some(output) =
+            isolated_diagnostics("successful_probe_emits_no_failure_diagnostics").await
+        else {
+            return;
+        };
+        let (healthy, log) =
+            recorded_probe(&health_cfg(&["/bin/sh", "-c", "exit 0"], 200), &output).await;
         assert!(healthy);
         assert!(log.is_empty(), "{log}");
     }

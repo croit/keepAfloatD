@@ -8,7 +8,8 @@ source "$(dirname "$0")/../scenario.sh"
 scenario_start "silently-killed holder is staled out and its VIPs reassigned"
 
 snapshot_vips
-old_leader_id="$(cluster_leader_id)"
+old_leader_replica="$(cluster_leader_replica)"
+old_leader_id="$(replica_physical_id "$old_leader_replica")"
 victim=""
 for i in "${!NODE_RAFT_IDS[@]}"; do
   [[ "${NODE_RAFT_IDS[$i]}" == "${old_leader_id}" ]] && victim="${NODE_IPS[$i]}"
@@ -64,7 +65,8 @@ survivors_agree_on_new_leader() {
   local ip leader agreed=""
   for ip in $(nodes_except "${victim}"); do
     leader="$(leader_seen_by_since "${ip}" "${fault_since}")"
-    [[ -n "${leader}" && "${leader}" != "${old_leader_id}" ]] || return 1
+    replica_is_configured "$leader" || return 1
+    [[ "$leader" != "$old_leader_replica" && "$(replica_physical_id "$leader")" != "$old_leader_id" ]] || return 1
     [[ -z "${agreed}" || "${agreed}" == "${leader}" ]] || return 1
     agreed="${leader}"
   done
@@ -79,6 +81,10 @@ evid "reassignment to live nodes completed ~${elapsed}s after kill (stale window
 
 # Restart: startup_cleanup reclaims the orphan, node rejoins cleanly.
 kafd_start "${victim}"
+check "startup cleanup removes the crash orphan before activation observation" \
+  wait_until 60 no_vip_is_duplicate
+check "restarted victim completes activation without overlapping VIPs" \
+  wait_for_startup_activation 30 "${victim}"
 rejoined_cluster_stable() {
   all_daemons_active && all_vips_uniquely_held && single_agreed_leader
 }

@@ -6,11 +6,14 @@ scenario_evidence_fixture() (
   trap 'rm -rf "${fixture}"' EXIT
   body="$(sed '/^source /d' "${HERE}/scenarios/${scenario}.sh")"
   NODE_IPS=(192.0.2.1 192.0.2.2 192.0.2.3)
+  NODE_RAFT_IDS=(1 2 3)
   VIPS=(198.51.100.1 198.51.100.2 198.51.100.3)
   IFACE=eth0
   local fixture_boot=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   local fixture_old=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb fixture_new=cccccccccccccccccccccccccccccccc
-  local restarted=0 result=0 clock=0
+  local restarted=0 result=0 clock=0 healed=0 fixture_emit_inv=""
+  local old_replica="0000000000000001:$(printf 'ab%.0s' {1..32})"
+  local new_replica="0000000000000001:$(printf 'cd%.0s' {1..32})"
   printf '0\n' > "${fixture}/clock"
   printf '0\n' > "${fixture}/context-count"
   scenario_start() { :; }; scenario_end() { exit "${result}"; }
@@ -38,7 +41,7 @@ scenario_evidence_fixture() (
     printf '%s %s 100\n' "${fixture_current_boot}" "${fixture_inv}"
   }
   emit_record() {
-    local fixture_inv="${fixture_old}"
+    local fixture_inv="${fixture_emit_inv:-${fixture_old}}"
     [[ "$scenario" == A5* ]] && fixture_inv="${fixture_new}"
     [[ "$fixture_mode" == old-invocation ]] && fixture_inv=dddddddddddddddddddddddddddddddd
     python3 -c 'import json,sys; print(json.dumps(dict(
@@ -46,9 +49,9 @@ scenario_evidence_fixture() (
         __MONOTONIC_TIMESTAMP="200", MESSAGE=sys.argv[3])))' "${fixture_boot}" "${fixture_inv}" "$1"
   }
   emit_cycle() {
-    local index="$1"
-    emit_record "INFO openraft::core::raft_core: sm::StateMachine command done: BuildSnapshotDone: {snapshot_id: snapshot-T1-N1.${index}, last_log:T1-N1.${index}, last_membership: {}}"
-    emit_record "INFO openraft::engine::handler::log_handler: purge log, last_purged: None, purge_upto: T1-N1.$((index-1000))"
+    local index="$1" replica="0000000000000001:$(printf 'ab%.0s' {1..32})"
+    emit_record "INFO openraft::core::raft_core: sm::StateMachine command done: BuildSnapshotDone: {snapshot_id: snapshot-T1-N${replica}.${index}, last_log:T1-N${replica}.${index}, last_membership: {}}"
+    emit_record "INFO openraft::engine::handler::log_handler: purge log, last_purged: None, purge_upto: T1-N${replica}.$((index-1000))"
   }
   node_sh() {
     if [[ "$2" == journalctl* ]]; then
@@ -58,13 +61,36 @@ scenario_evidence_fixture() (
             emit_record 'ERROR startup_cleanup: spawn ip del: failure'
           else emit_record "INFO keepafloatd::vip: startup_cleanup: reclaimed orphan ${VIPS[2]}/32 on eth0"; fi;;
         D7*)
-          if [[ "$fixture_mode" == generic-epoch ]]; then emit_record 'WARN unrelated epoch message'
-          else emit_record 'ERROR keepafloatd::raft: stale cluster incarnation confirmed; shutting down safely before rejoining with fresh state'; fi;;
+          fixture_emit_inv="$fixture_old"
+          [[ "$2" != *"_SYSTEMD_INVOCATION_ID=${fixture_new}"* ]] || fixture_emit_inv="$fixture_new"
+          if [[ "$1" == "${NODE_IPS[0]}" ]]; then
+            if [[ "$fixture_emit_inv" == "$fixture_old" ]]; then
+              emit_record "INFO keepafloatd::raft::admission::runtime::driver: runtime admission acquired replica=${old_replica}"
+              [[ "$fixture_mode" == missing-release ]] || emit_record "INFO keepafloatd::vip: unbound ${VIPS[0]}/32 on eth0"
+              if [[ "$fixture_mode" == generic-epoch ]]; then emit_record 'WARN unrelated epoch message'
+              elif [[ "$fixture_mode" == arbitrary-restart ]]; then emit_record 'Error: network task failed'
+              else emit_record 'Error: runtime admission task: runtime admission expired terminally'; fi
+              [[ "$fixture_mode" != rebound ]] || emit_record "INFO keepafloatd::vip: bound ${VIPS[0]}/32 on eth0"
+            else
+              local replica="$new_replica"
+              [[ "$fixture_mode" != missing-admission ]] || return 0
+              [[ "$fixture_mode" != same-boot ]] || replica="$old_replica"
+              [[ "$fixture_mode" != wrong-admission ]] || replica="0000000000000002:${new_replica#*:}"
+              emit_record "INFO keepafloatd::raft::admission::runtime::driver: runtime admission acquired replica=${replica}"
+            fi
+          elif (( healed )); then
+            local promoted="$new_replica"
+            [[ "$fixture_mode" != wrong-promotion ]] || promoted="$old_replica"
+            [[ "$fixture_mode" != missing-promotion ]] || return 0
+            [[ "$fixture_mode" != peer-read-error || "$1" != "${NODE_IPS[2]}" ]] || return 255
+            [[ "$1" == "${NODE_IPS[1]}" ]] || return 0
+            emit_record "INFO keepafloatd::raft::store::membership: committed learner promotion consumer=${promoted}"
+          fi;;
         D19*)
           local target="${VIPS[0]}"
           [[ "$fixture_mode" == unrelated-unbind ]] && target="${VIPS[2]}"
           emit_record "INFO keepafloatd::vip: unbound ${target}/32 on eth0"
-          emit_record 'ERROR keepafloatd::raft: cluster configuration mismatch confirmed; shutting down safely'
+          emit_record 'ERROR keepafloatd::raft::control: cluster configuration mismatch confirmed; shutting down safely'
           if [[ "$fixture_mode" == rebound ]]; then emit_record "INFO keepafloatd::vip: bound ${target}/32 on eth0"; fi;;
         C2*)
           if [[ "$fixture_mode" == one-node-only && "$1" != "${NODE_IPS[0]}" ]]; then
@@ -77,19 +103,35 @@ scenario_evidence_fixture() (
     fi
   }
   node_active() { :; }; kafd_kill() { :; }; kafd_stop() { :; }; kafd_restart() { restarted=1; }
-  kafd_start() { [[ "$1" != "${NODE_IPS[0]}" ]] || restarted=1; }
-  partition_node() { :; }; heal_node() { restarted=1; }
+  kafd_start() {
+    [[ "$1" != "${NODE_IPS[0]}" && "$scenario" != D7* ]] || restarted=1
+  }
+  partition_node() { :; }; heal_node() { restarted=1; healed=1; }
   all_vips_uniquely_held() { [[ "$fixture_mode" != duplicate-vip ]]; }
   no_vip_is_duplicate() { :; }; all_vips_pingable() { :; }; all_daemons_active() { :; }
   node_lacks_all_vips() { :; }; single_agreed_leader() { :; }
   wait_for_live_service_without() { :; }; wait_for_available_cluster() { :; }
+  wait_for_startup_activation() { :; }
   backup_cluster_configs() { :; }; restore_cluster_configs() { :; }; clean_reform() { :; }
   instance_for_ip() { printf 'fixture\n'; }
-  nodes_except() { printf '%s\n' "${NODE_IPS[1]} ${NODE_IPS[2]}"; }
+  nodes_except() { printf '%s\n' "${NODE_IPS[1]}" "${NODE_IPS[2]}"; }
+  leader_seen_by() {
+    local physical=2
+    [[ "$1" != "${NODE_IPS[0]}" ]] || return 1
+    [[ "$fixture_mode" != leader-read-error || "$1" != "${NODE_IPS[2]}" ]] || return 255
+    [[ "$fixture_mode" != leader-outside-subset ]] || physical=1
+    [[ "$fixture_mode" != leader-unknown ]] || physical=4
+    [[ "$fixture_mode" != leader-disagreement || "$1" != "${NODE_IPS[2]}" ]] || physical=3
+    printf '%016x:%s\n' "$physical" "$(printf 'ef%.0s' {1..32})"
+  }
+  replica_is_configured() { [[ "$1" =~ ^000000000000000[123]:[a-f0-9]{64}$ ]]; }
+  replica_physical_id() { printf '%s\n' "$((16#${1%%:*}))"; }
   next_behavior_changing_stale_secs() { echo 4; }; journal_event_count() { echo 0; }
   clear_health_sentinels() { :; }; configure_sentinel_health() { :; }; wait_for_even() { :; }
   (eval "${body}") >/dev/null 2>&1 || status=$?
-  if [[ "$fixture_mode" == good ]]; then [[ "$status" == 0 ]]; else [[ "$status" != 0 ]]; fi
+  if [[ "$fixture_mode" == good || "$fixture_mode" == expiry-before-heal ]]; then
+    [[ "$status" == 0 ]]
+  else [[ "$status" != 0 ]]; fi
 )
 
 for scenario in A5_startup_cleanup D7_stale_survivor D19_config_identity C2_endurance_snapshots; do
@@ -97,10 +139,14 @@ for scenario in A5_startup_cleanup D7_stale_survivor D19_config_identity C2_endu
     assert "${scenario} scoped evidence: ${mode}" scenario_evidence_fixture "${scenario}" "${mode}"
   done
 done
+assert "D7 accepts terminal permission expiry before partition healing" \
+  scenario_evidence_fixture D7_stale_survivor expiry-before-heal
 for mode in same-process boot-change cleanup-error; do
   assert "A5 rejects ${mode}" scenario_evidence_fixture A5_startup_cleanup "${mode}"
 done
-for mode in same-process boot-change generic-epoch; do
+for mode in same-process boot-change generic-epoch arbitrary-restart same-boot missing-release rebound \
+  missing-promotion wrong-promotion peer-read-error leader-read-error missing-admission wrong-admission \
+  leader-outside-subset leader-unknown leader-disagreement; do
   assert "D7 rejects ${mode}" scenario_evidence_fixture D7_stale_survivor "${mode}"
 done
 for mode in unrelated-unbind rebound same-process boot-change; do

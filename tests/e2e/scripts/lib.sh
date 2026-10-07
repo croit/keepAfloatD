@@ -20,6 +20,206 @@ if [[ -n "${E2E_VIPS:-}" ]]; then read -r -a VIPS <<<"${E2E_VIPS}"; else VIPS=("
 if [[ -n "${E2E_NODES:-}" ]]; then read -r -a NODES <<<"${E2E_NODES}"; else NODES=("node-a" "node-b" "node-c"); fi
 readonly -a VIPS NODES
 
+# Extend only known-predecessor fallback waits by the configured cleanup budget.
+cleanup_budget_seconds() {
+  local base_seconds="${1:?base seconds required}"
+  printf '%s\n' "$(((base_seconds * 1000 + 11500 * ${#VIPS[@]} + 999) / 1000))"
+}
+
+# shellcheck source=tests/e2e/scripts/startup-budget.sh
+. "$(dirname "${BASH_SOURCE[0]}")/startup-budget.sh"
+
+wait_for_startup_state() {
+  wait_for_startup_over_nodes 30 "${NODES[@]}" &&
+    wait_for_single_agreed_leader 20
+}
+
+assert_no_duplicate_holders() {
+  local service cid running addresses vip previous previous_addresses
+  local -A owners=()
+  for service in "${NODES[@]}"; do
+    cid="$(service_container_id "${service}")" || return 1
+    [[ -n "${cid}" ]] || return 1
+    running="$(docker inspect -f '{{.State.Running}}' "${cid}")" || return 1
+    [[ "${running}" != false ]] || continue
+    [[ "${running}" == true ]] || return 1
+    if ! addresses="$(node_sh "${service}" 'ip -o -4 addr show dev eth0')"; then
+      # The daemon may have completed its supervised stop between these reads.
+      [[ "$(docker inspect -f '{{.State.Running}}' "${cid}")" == false ]] || return 1
+      continue
+    fi
+    for vip in "${VIPS[@]}"; do
+      [[ " ${addresses} " == *" ${vip}/32 "* ]] || continue
+      if [[ -n "${owners[${vip}]+x}" ]]; then
+        previous="${owners[${vip}]}"
+        # Sequential reads can straddle a valid handoff; recheck the old owner.
+        if ! previous_addresses="$(node_sh "${previous}" 'ip -o -4 addr show dev eth0')"; then
+          cid="$(service_container_id "${previous}")" || return 1
+          [[ -n "${cid}" ]] || return 1
+          [[ "$(docker inspect -f '{{.State.Running}}' "${cid}")" == false ]] || return 1
+          previous_addresses=""
+        fi
+        if [[ " ${previous_addresses} " == *" ${vip}/32 "* ]]; then
+          fail "VIP ${vip} overlaps on ${previous} and ${service}"
+          return 1
+        fi
+      fi
+      owners["${vip}"]="${service}"
+    done
+  done
+}
+
+wait_until_no_duplicates() {
+  local timeout_secs="${1:?timeout required}"
+  shift
+  local deadline=$((SECONDS + timeout_secs))
+  while true; do
+    assert_no_duplicate_holders || return 1
+    "$@" && return 0
+    ((SECONDS < deadline)) || return 1
+    sleep 0.2
+  done
+}
+
+wait_for_startup_without_overlap() {
+  local base="${1:?convergence seconds required}"
+  shift
+  local budget
+  budget="$(startup_budget_seconds "${base}" "$@")" || return 1
+  wait_for_even_without_overlap "${budget}" "$@"
+}
+
+wait_for_even_without_overlap() {
+  local budget="${1:?convergence seconds required}"
+  shift
+  wait_until_no_duplicates "${budget}" even_over_nodes "$@" || {
+    dump_cluster_diagnostics
+    fail "startup did not converge without overlapping VIPs"
+    return 1
+  }
+  wait_until 5 all_vips_arpable && assert_unique_holders
+}
+
+wait_for_log_after_without_overlap() {
+  local checkpoint="${1:?checkpoint required}" budget="${2:?seconds required}" pattern="${3:?pattern required}"
+  wait_until_no_duplicates "${budget}" cluster_logs_contain_after "${checkpoint}" "${pattern}" || {
+    dump_cluster_diagnostics
+    fail "no overlap-free post-checkpoint event: ${pattern}"
+    return 1
+  }
+}
+
+current_boot_log() {
+  awk '/runtime admission timing/ { output = "" }
+       { output = output $0 "\n" } END { printf "%s", output }'
+}
+
+node_boot_replica() {
+  local logs replica
+  logs="$(compose logs --no-color "${1:?service required}")" || return 1
+  replica="$(printf '%s\n' "${logs}" | current_boot_log |
+    grep 'runtime admission acquired' |
+    grep -oE 'replica=[0-9a-f]{16}:[0-9a-f]{64}' | tail -n 1)" || return 1
+  [[ -n "${replica}" ]] || return 1
+  printf '%s\n' "${replica#replica=}"
+}
+
+admission_exit_budget_seconds() {
+  local service="${1:?service required}" base="${2:?shutdown seconds required}"
+  local logs quarantine
+  logs="$(compose logs --no-color "${service}")" || return 1
+  quarantine="$(printf '%s\n' "${logs}" | current_boot_log |
+    sed -E $'s/\033\\[[0-9;]*[mK]//g' |
+    grep 'runtime admission timing' | grep -oE 'quarantine_ms=[^[:space:]]+' | tail -n 1)" || return 1
+  quarantine="${quarantine#quarantine_ms=}"
+  [[ "${quarantine}" =~ ^[1-9][0-9]{0,11}$ ]] || return 1
+  # Permission lifetime U is independent of the health-freshness deadline.
+  printf '%s\n' "$(((quarantine + 3999) / 4000 + base))"
+}
+
+admission_pause_seconds() {
+  admission_exit_budget_seconds "${1:?service required}" 1
+}
+
+fixture_watchdog_stop() {
+  if [[ -n "${fixture_watchdog_pid:-}" ]]; then
+    kill "${fixture_watchdog_pid}" 2>/dev/null || true
+    wait "${fixture_watchdog_pid}" 2>/dev/null || true
+    fixture_watchdog_pid=""
+  fi
+}
+
+fixture_watchdog_arm() {
+  fixture_watchdog_stop
+  local remaining=$((fixture_watchdog_budget - SECONDS + fixture_watchdog_started))
+  ((remaining > 0)) || { fail 'fixture watchdog budget expired'; return 1; }
+  local owner="${BASHPID}"
+  (
+    timer=""
+    # Cancellation can arrive before the new timer PID is assigned.
+    trap 'for child in $(jobs -pr); do kill "${child}" 2>/dev/null || true; wait "${child}" 2>/dev/null || true; done' EXIT
+    trap 'exit 0' TERM INT
+    sleep "${remaining}" &
+    timer=$!
+    wait "${timer}" || exit 0
+    timer=""
+    printf 'fixture watchdog expired for %s\n' "${fixture_watchdog_container}" >&2
+    timeout -k 2s 10s docker stop --time 1 "${fixture_watchdog_container}" >/dev/null 2>&1 || true
+    kill -TERM "${owner}"
+  ) &
+  fixture_watchdog_pid=$!
+}
+
+fixture_watchdog_start() {
+  fixture_watchdog_container="${1:?fixture container required}"
+  fixture_watchdog_budget="${2:?work seconds required}"
+  fixture_watchdog_started=${SECONDS}
+  fixture_watchdog_arm
+}
+
+fixture_watchdog_add_startup() {
+  local delay
+  delay="$(startup_budget_from_log 0)" || return 1
+  fixture_watchdog_budget=$((fixture_watchdog_budget + delay))
+  fixture_watchdog_arm
+}
+
+observe_no_duplicates_for() {
+  local deadline=$((SECONDS + ${1:?observation seconds required}))
+  while ((SECONDS < deadline)); do
+    assert_no_duplicate_holders || return 1
+    sleep 0.2
+  done
+}
+
+assert_admission_stop_log() {
+  local logs
+  logs="$(current_boot_log)" || return 1
+  grep -q 'runtime admission timing' <<<"${logs}" || return 1
+  grep -Eq 'runtime admission.*(expired|sealed)' <<<"${logs}" || return 1
+  awk '
+    / (bound|unbound) [^ ]+ on / {
+      for (i = 1; i < NF; i++) {
+        if ($i == "bound") { active[$(i+1)] = 1; bound++ }
+        if ($i == "unbound") delete active[$(i+1)]
+      }
+    }
+    END { for (vip in active) exit 1; if (!bound) exit 1 }
+  ' <<<"${logs}"
+}
+
+wait_for_admission_exit() {
+  local service="${1:?service required}" budget="${2:?exit seconds required}" logs
+  wait_until_no_duplicates "${budget}" service_is_not_running "${service}" || return 1
+  assert_service_exit_code "${service}" 1 || return 1
+  logs="$(compose logs --no-color "${service}")" || return 1
+  printf '%s\n' "${logs}" | assert_admission_stop_log || {
+    fail "${service} did not prove admission expiry and release of its bound VIPs"
+    return 1
+  }
+  assert_node_lacks_all_vips "${service}"
+}
+
 log() {
   printf '[e2e] %s\n' "$*"
 }
@@ -96,17 +296,26 @@ wait_until() {
   done
 }
 
+capture_resource_evidence() {
+  local status=0
+  timeout -k 1s 12s bash "${ROOT_DIR}/tests/e2e/scripts/resource-evidence.sh" \
+    "${COMPOSE_FILE}" "${COMPOSE_PROJECT_NAME}" "${NODES[@]}" e2e-runner \
+    2>/dev/null || status=$?
+  (( status == 0 )) || printf 'resource_collection_unavailable status=%s\n' "${status}"
+}
+
 capture_cluster_artifacts() {
   local scenario="${1:?scenario required}"
   local dir="${ARTIFACT_DIR}/${scenario}"
   mkdir -p "${dir}"
 
+  capture_resource_evidence >"${dir}/resources.txt" || true
   compose ps --all >"${dir}/compose-ps.txt" 2>&1 || true
-  compose logs --no-color >"${dir}/compose.log" 2>&1 || true
+  compose logs --timestamps --no-color >"${dir}/compose.log" 2>&1 || true
 
   local service
   for service in e2e-fixtures "${NODES[@]}" e2e-runner; do
-    compose logs --no-color "${service}" >"${dir}/${service}.log" 2>&1 || true
+    compose logs --timestamps --no-color "${service}" >"${dir}/${service}.log" 2>&1 || true
     if service_is_running "${service}"; then
       if [[ "${service}" == "e2e-runner" ]]; then
         runner_sh "ip -o addr show" >"${dir}/${service}.ip-addr.txt" 2>&1 || true
@@ -424,9 +633,34 @@ wait_for_log_any() {
   }
 }
 
-log_checkpoint() {
-  compose logs --no-color "${NODES[@]}" 2>&1 | wc -l | tr -d ' '
+log_prefix_signature() {
+  local signature
+  if command -v sha256sum >/dev/null 2>&1; then
+    signature="$(sha256sum)" || return 1
+    printf '%s\n' "${signature%% *}"
+  else
+    signature="$(cksum)" || return 1
+    printf '%s\n' "${signature// /:}"
+  fi
 }
+
+log_checkpoint() (
+  local log_file service cid current_cid count signature
+  log_file="$(mktemp)" || return 1
+  trap 'rm -f "${log_file}"' EXIT
+
+  printf 'container-logs-v1\n'
+  for service in "${NODES[@]}"; do
+    cid="$(service_container_id "${service}")" || return 1
+    [[ "${cid}" =~ ^[[:xdigit:]]+$ ]] || return 1
+    docker logs --timestamps "${cid}" >"${log_file}" 2>&1 || return 1
+    current_cid="$(service_container_id "${service}")" || return 1
+    [[ "${current_cid}" == "${cid}" ]] || return 1
+    count="$(wc -l <"${log_file}" | tr -d ' ')" || return 1
+    signature="$(log_prefix_signature <"${log_file}")" || return 1
+    printf '%s %s %s %s\n' "${service}" "${cid}" "${count}" "${signature}"
+  done
+)
 
 capture_compose_logs() {
   local output="${1:?output required}"
@@ -450,25 +684,47 @@ cluster_logs_contain() {
   return "${status}"
 }
 
-cluster_logs_contain_after() {
+cluster_logs_contain_after() (
   local checkpoint="${1:?checkpoint required}"
   local pattern="${2:?pattern required}"
-  local log_file
-  local filtered_log_file
-  local status
+  local log_file filtered_log_file service saved_service cid current_cid
+  local version count signature extra prefix_count status=1 grep_status
 
-  log_file="$(mktemp)"
-  filtered_log_file="$(mktemp)"
-  capture_compose_logs "${log_file}" "${NODES[@]}"
-  tail -n "+$((checkpoint + 1))" "${log_file}" >"${filtered_log_file}"
-  if grep -E -q "${pattern}" "${filtered_log_file}"; then
-    status=0
-  else
-    status=$?
-  fi
-  rm -f "${filtered_log_file}" "${log_file}"
+  log_file="$(mktemp)" || return 1
+  filtered_log_file=''
+  trap 'rm -f "${filtered_log_file}" "${log_file}"' EXIT
+  filtered_log_file="$(mktemp)" || return 1
+  {
+    read -r version || return 1
+    [[ "${version}" == container-logs-v1 ]] || return 1
+    for service in "${NODES[@]}"; do
+      read -r saved_service cid count signature extra || return 1
+      [[ "${saved_service}" == "${service}" && -z "${extra}" ]] || return 1
+      [[ "${cid}" =~ ^[[:xdigit:]]+$ && "${count}" =~ ^(0|[1-9][0-9]*)$ ]] || return 1
+      [[ "${signature}" =~ ^([[:xdigit:]]{64}|[0-9]+:[0-9]+)$ ]] || return 1
+      current_cid="$(service_container_id "${service}")" || return 1
+      [[ "${current_cid}" == "${cid}" ]] || return 1
+      docker logs --timestamps "${cid}" >"${log_file}" 2>&1 || return 1
+      current_cid="$(service_container_id "${service}")" || return 1
+      [[ "${current_cid}" == "${cid}" ]] || return 1
+
+      # Container-local prefixes avoid Compose reordering and reject lost log history.
+      head -n "${count}" "${log_file}" >"${filtered_log_file}" || return 1
+      prefix_count="$(wc -l <"${filtered_log_file}" | tr -d ' ')" || return 1
+      [[ "${prefix_count}" == "${count}" ]] || return 1
+      [[ "$(log_prefix_signature <"${filtered_log_file}")" == "${signature}" ]] || return 1
+      tail -n "+$((count + 1))" "${log_file}" >"${filtered_log_file}" || return 1
+      if grep -E -q -- "${pattern}" "${filtered_log_file}"; then
+        status=0
+      else
+        grep_status=$?
+        [[ "${grep_status}" == 1 ]] || return 1
+      fi
+    done
+    if read -r extra; then return 1; fi
+  } <<<"${checkpoint}"
   return "${status}"
-}
+)
 
 # Number of node-log lines matching ${pattern}. Counting occurrences is stable under
 # compose-log reordering, unlike a line-number checkpoint: callers snapshot the count before an
@@ -568,16 +824,22 @@ wait_for_service_running() {
   }
 }
 
-# Most recently observed leader id for one node (from its 'raft current leader is now Some(N)'
-# lines), ignoring transient 'None'. Empty if the node has never observed a leader.
-node_last_leader() {
+# Preserve exact boot identity when comparing agreement, not just the physical ID.
+node_last_leader_replica() {
   local service="${1:?service required}"
   local log_file id
   log_file="$(mktemp)"
   capture_compose_logs "${log_file}" "${service}"
-  id="$(grep -oE 'raft current leader is now Some\([0-9]+\)' "${log_file}" | tail -n 1 | grep -oE '[0-9]+' || true)"
+  id="$(current_boot_log <"${log_file}" |
+    awk '/raft current leader is now / { last = $0 } END { print last }' |
+    sed -nE 's/.*raft current leader is now Some\((ReplicaId \{ physical_id: [0-9]+, boot_nonce: \[[0-9, ]+\] \})\).*/\1/p')"
   rm -f "${log_file}"
   printf '%s' "${id}"
+}
+
+node_last_leader() {
+  node_last_leader_replica "${1:?service required}" |
+    sed -nE 's/^ReplicaId \{ physical_id: ([0-9]+),.*/\1/p'
 }
 
 # True when every running node reports the same, non-empty leader id (i.e. one cluster, one leader).
@@ -585,7 +847,7 @@ single_agreed_leader() {
   local first="" svc leader
   for svc in "${NODES[@]}"; do
     service_is_running "${svc}" || continue
-    leader="$(node_last_leader "${svc}")"
+    leader="$(node_last_leader_replica "${svc}")"
     [[ -n "${leader}" ]] || return 1
     if [[ -z "${first}" ]]; then
       first="${leader}"

@@ -4,12 +4,12 @@
 //! foreign fingerprint group and the largest identical foreign epoch group into
 //! [`ClusterGuard::observe`]. Two independent consecutive-round hold-downs decide whether the node
 //! must fence itself: configuration identity fencing applies in every state, stale-survivor epoch
-//! fencing applies only to an initialized, leaderless node. Keeping the decision pure keeps the
-//! majority arithmetic and the strike hold-down testable without a transport.
+//! fencing applies to an initialized node regardless of cached leader metrics. The pure decision
+//! keeps majority arithmetic and the strike hold-down testable without a transport.
 //!
 //! Structural limit: the epoch fence needs `majority = roster / 2 + 1` peers to report one
 //! foreign epoch, but a node can only probe `roster - 1` others, so it can never fire on a 1- or
-//! 2-node roster. Such a survivor stays transport-fenced until an operator restarts it.
+//! 2-node roster. Runtime admission expiry supplies an independent supervised-stop path.
 
 use super::probe::ConsecutiveMajority;
 
@@ -18,8 +18,6 @@ use super::probe::ConsecutiveMajority;
 pub(crate) struct GuardRound {
     /// The local node has joined a cluster incarnation (`cluster_epoch` is committed).
     pub(crate) local_epoch_known: bool,
-    /// Raft currently reports a leader.
-    pub(crate) has_leader: bool,
     /// Largest group of peers reporting one identical fingerprint that differs from ours.
     pub(crate) foreign_config: usize,
     /// Largest group of peers reporting one identical concrete epoch that differs from ours.
@@ -70,9 +68,8 @@ impl ClusterGuard {
         if self.config.observe(round.foreign_config, self.majority) {
             return GuardVerdict::FenceConfig;
         }
-        // Epoch fencing applies only to initialized, leaderless survivors; any other state counts
-        // as a clean round so the hold-down restarts once the node is initialized and leaderless.
-        let foreign_epoch = if round.local_epoch_known && !round.has_leader {
+        // A cached leader ID can outlive its incarnation when Pre-Vote prevents a new election.
+        let foreign_epoch = if round.local_epoch_known {
             round.foreign_epoch
         } else {
             0
@@ -93,7 +90,6 @@ mod tests {
     fn round(foreign_config: usize, foreign_epoch: usize) -> GuardRound {
         GuardRound {
             local_epoch_known: true,
-            has_leader: false,
             foreign_config,
             foreign_epoch,
         }
@@ -121,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_fence_requires_an_initialized_leaderless_node() {
+    fn epoch_fence_requires_an_initialized_node() {
         let mut guard = ClusterGuard::new(3, STRIKES);
         for _ in 0..STRIKES {
             let uninitialized = GuardRound {
@@ -138,16 +134,21 @@ mod tests {
     }
 
     #[test]
-    fn a_visible_leader_resets_the_epoch_hold_down() {
+    fn a_below_majority_round_resets_the_epoch_hold_down() {
         let mut guard = ClusterGuard::new(3, STRIKES);
         guard.observe(round(0, 2));
         guard.observe(round(0, 2));
-        let led = GuardRound {
-            has_leader: true,
-            ..round(0, 2)
-        };
-        assert_eq!(guard.observe(led), GuardVerdict::Continue);
+        assert_eq!(guard.observe(round(0, 1)), GuardVerdict::Continue);
         assert_eq!(guard.epoch_strikes(), 0);
+    }
+
+    #[test]
+    fn coherent_foreign_majority_overrides_a_cached_leader() {
+        let mut guard = ClusterGuard::new(3, STRIKES);
+        let stale = round(0, 2);
+        assert_eq!(guard.observe(stale), GuardVerdict::Continue);
+        assert_eq!(guard.observe(stale), GuardVerdict::Continue);
+        assert_eq!(guard.observe(stale), GuardVerdict::FenceEpoch);
     }
 
     #[test]

@@ -2,7 +2,10 @@
 
 This is the canonical architecture reference for `keepafloatd`; keep `AGENTS.md` short and point deeper design questions here.
 
-Current-code note: some older design notes mention `HealthUpdate { node_id, healthy, unix_secs }` as the only replicated command, but the implementation in this repository has moved on. The current Raft log carries `HealthUpdate { node_id, healthy }` and `VipReleased { node_id, vip, generation }`, and peer staleness is derived from committed probe ticks rather than wall-clock timestamps.
+The Raft log carries exact-boot admission operations, challenged health
+progress and generation-fenced VIP releases. Peer health staleness uses
+committed probe ticks, not wall-clock timestamps. Process-local runtime
+permission has a separate expiry and is never restored from a snapshot.
 
 ## 1. System overview
 
@@ -37,9 +40,9 @@ flowchart LR
   b_probe --> b_kaf
   c_probe --> c_kaf
 
-  a_kaf <-->|Raft TCP + JSON| b_kaf
-  b_kaf <-->|Raft TCP + JSON| c_kaf
-  a_kaf <-->|Raft TCP + JSON| c_kaf
+  a_kaf <-->|TCP: mutual HMAC then Raft JSON| b_kaf
+  b_kaf <-->|TCP: mutual HMAC then Raft JSON| c_kaf
+  a_kaf <-->|TCP: mutual HMAC then Raft JSON| c_kaf
 ```
 
 Each node runs one daemon process with one YAML config, one Raft identity, one health-check
@@ -55,9 +58,9 @@ The code is split into four layers so that consensus decisions stay deterministi
 ```mermaid
 flowchart TB
   main[Composition root<br/>src/main.rs]
-  adapters[Adapter layer<br/>config.rs, health.rs, process.rs, submit.rs, raft/network/*]
+  adapters[Adapter layer<br/>config.rs, health.rs, process.rs, auth.rs, submit.rs, raft/network/*]
   effects[Local effect layer<br/>vip.rs, vip/*]
-  consensus[Consensus layer<br/>raft/store.rs, bind_policy.rs, raft/types.rs]
+  consensus[Consensus layer<br/>raft/store/, bind_policy.rs, raft/types.rs]
 
   main --> adapters
   main --> effects
@@ -73,11 +76,14 @@ flowchart TB
 ```
 
 - Consensus layer:
-  - `src/raft/store.rs` owns replicated state, deterministic eligibility, and fenced VIP assignment recomputation.
+  - `src/raft/store/` separates the volatile log (`log.rs`), shared state
+    (`state.rs`), apply/snapshot logic (`state_machine.rs`) and pure
+    eligibility/assignment rules (`vip_logic.rs`), wired by `mod.rs`.
   - `src/bind_policy.rs` mirrors the pure "should this node bind?" decision from committed state plus local gates.
 - Local effect layer:
   - `src/vip.rs` coordinates local lifecycle; `src/vip/effects.rs` owns bounded `ip` command
     construction and verification; `src/vip/ownership.rs` owns Linux address-protocol discovery;
+    `src/vip/announce.rs` owns background ARP/NA announcements;
     `src/vip/notify.rs` owns bounded notify hooks; and `src/vip/reconcile.rs` maps committed
     ownership into those local effects and publishes confirmed release acknowledgments.
   - It tracks which VIPs this process has actually bound so cleanup is safe.
@@ -86,15 +92,18 @@ flowchart TB
     non-secret cluster identity.
   - `src/health.rs` runs the subprocess health check.
   - `src/process.rs` owns bounded Linux process groups for all daemon-owned child commands.
+  - `src/auth.rs` owns the shared fixed-format mutual HMAC handshake for both TCP listeners.
   - `src/submit.rs` forwards follower-originated writes to the leader.
   - `src/raft/tasks.rs` catches, reports, aborts, and joins Raft background control tasks.
   - `src/raft/network.rs` owns peer connection lifecycle, outbound preflight, and RPC exchange.
-  - `src/raft/network/client.rs` adapts RPC exchange to OpenRaft's outbound client traits.
+  - `src/raft/network/client.rs` adapts RPC exchange to OpenRaft's outbound client traits and
+    negotiates real Pre-Vote requests on fresh peer connections.
   - `src/raft/network/server.rs` owns listener admission, authentication, and stream supervision.
   - `src/raft/network/inbound.rs` owns authenticated, preflight-gated inbound RPC dispatch.
-  - `src/raft/network/wire.rs` owns bounded framing, authentication handshakes, and compatibility
-    checks.
-  - `src/raft/network/status.rs` owns legacy-compatible capability and cluster-status probes.
+  - `src/raft/network/wire.rs` owns bounded framing, calls the shared authentication handshake,
+    and checks compatibility.
+  - `src/raft/network/status.rs` owns capability and cluster-status probes over fresh mutually
+    authenticated connections, with no legacy authentication fallback.
 - Composition root:
   - `src/main.rs` wires config, Raft, health publishing, submit listener, reconcile loop, and shutdown ordering.
 
@@ -114,9 +123,9 @@ sequenceDiagram
   participant Reconcile as Local reconcile loop
 
   Probe->>Node: exit status -> healthy / unhealthy
-  Node->>Leader: submit_request(HealthUpdate)
+  Node->>Leader: admitted HealthProgress(Some(healthy))
   Leader->>Log: append and replicate
-  Log->>SM: apply HealthUpdate in log order
+  Log->>SM: validate exact boot and apply progress in log order
   SM->>SM: update node_health and probe ticks
   SM->>SM: recompute holder map and fences
   Reconcile->>Node: read committed assignments + local gates
@@ -126,26 +135,31 @@ sequenceDiagram
 What the current code replicates through Raft:
 
 - Direct keepafloatd requests:
-  - `HealthUpdate { node_id, healthy }`
+  - `AdmissionGenesis`, `PrepareJoin`, `LearnerApplied`, `CancelJoin`
+  - `HealthProgress` with exact boot, challenge and optional health
   - `VipReleased { node_id, vip, generation }`
-  - `ClusterFormed { cluster_id, failover_semantics, config_identity_enforced }`
-  - `EnableFailoverSemanticsV2`
-  - `EnableConfigIdentityV1`
+  - Compatibility readers retain `HealthUpdate`, `ClusterFormed`,
+    `EnableFailoverSemanticsV2` and `EnableConfigIdentityV1`; production
+    health publication uses admitted progress, not a physical-ID fallback.
 - OpenRaft membership entries:
-  - membership changes are still OpenRaft log entries even though keepafloatd v1 does not expose a dynamic membership API
+  - learner attachment, catch-up and voter replacement are committed
+    through OpenRaft membership entries, not a public roster-change API
 
 What lives in the replicated state machine or snapshot:
 
 - `node_health: HashMap<NodeId, bool>`
 - `node_probe_ticks: HashMap<NodeId, u64>`
 - `latest_probe_tick: u64`
-- `vip_assignments: HashMap<VipAddr, VipAssignment>`
-- `vip_generation: HashMap<VipAddr, u64>`
+- `vip_assignments: HashMap<IpAddr, VipAssignment>`
+- `vip_generation: HashMap<IpAddr, u64>`
+- `vip_last_holder: HashMap<IpAddr, u64>` retains the release fence
+  across intervals with no eligible owner
 - `cluster_epoch: Option<u128>`
 - `failover_semantics: Legacy | V2`
 - `config_identity_enforced: bool`
 - recovery/nopreempt tracking used by the selected semantics
 - `last_membership`
+- admission genesis, pending learner operations and completed JOIN receipts
 
 What is derived locally but not replicated:
 
@@ -153,6 +167,7 @@ What is derived locally but not replicated:
 - `consensus_fresh`: whether this node can still submit health or release updates through Raft
 - `has_leader`: observed from local Raft metrics
 - `LocalVip.bound`: the set of VIPs this process itself attached
+- the local boot identity, admission certificate, expiry and issuer reservations
 
 Determinism rules in the current implementation:
 
@@ -217,7 +232,7 @@ Plain-language algorithm:
     the recorded previous holder from revoking it. The proof is cleared on any unbind path and
     never carries into another generation; all leader, health, consensus-freshness, holder, and
     activation-tick gates still apply. If the previous holder releases after that first bind, the
-    incumbent emits one more generation-scoped gratuitous ARP so removal of a crash orphan cannot
+    incumbent emits one more generation-scoped ARP/NA announcement so removal of a crash orphan cannot
     leave neighbors using the old holder's MAC.
 
 Worked example, 3 nodes and 3 VIPs (all three eligible before the first assignment; a staggered
@@ -257,12 +272,16 @@ stateDiagram-v2
   Bound --> Unbound: SIGINT / shutdown
 ```
 
-The three independent failover triggers are:
+The failover paths are:
 
 - Local health fails:
   - after continuous failure for `failover_delay_secs`, the health task flips `local_healthy` to
     `false` (default zero; a successful probe resets the delay)
   - the next 250 ms reconcile tick removes any VIP currently bound here
+- A bind or ownership-marker write fails:
+  - the local health gate faults immediately, bypassing probe-failure delay
+  - successful service probes cannot reset this sticky fault; repair the
+    cause and restart the process
 - This node stops being allowed to hold the VIP:
   - no current leader, or
   - committed ownership moves to another node, or
@@ -277,6 +296,37 @@ The three independent failover triggers are:
   - a failed or unreadable kernel delete cannot be mistaken for a crash
 
 There is also a local self-fencing path for partitions: if this node cannot commit health or release updates anymore, `consensus_fresh` flips false and the VIP is unbound even before the rest of the cluster necessarily marks it stale.
+
+### Election stability with Pre-Vote
+
+`src/raft/mod.rs` enables OpenRaft Pre-Vote with `enable_pre_vote: Some(true)`.
+Before starting an ordinary election, a node asks whether a majority would
+grant its prospective vote. The receiver handles this through
+`Raft::pre_vote`, not `Raft::vote`: the request does not save a vote,
+advance the receiver's term, append log entries, or change VIP ownership.
+The transport and protocol version boundary are described in section 7.
+
+An isolated follower cannot collect that majority and repeatedly attempts
+Pre-Vote without inflating its saved term. When it reconnects to an
+upgraded, healthy majority, those unsuccessful attempts do not force the
+current leader to step down. This protects majority leadership, not the
+isolated follower's VIPs: failed health submissions or expiry of its local
+consensus proof still cause withdrawal, and the majority still reassigns
+stale holders under the existing ownership fences.
+
+A process suspended with SIGSTOP cannot remove its kernel addresses while
+stopped. After SIGCONT it must process the expired consensus proof and
+clean up before safely resuming VIP service. Pre-Vote does not provide
+external fencing of a suspended process or a zero-overlap guarantee
+during suspension.
+
+Actual leader loss still requires an election. A reachable majority can
+pass Pre-Vote and elect a replacement once the old leader is no longer
+fresh. The `has_leader`, `local_healthy`, `consensus_fresh`, applied-state,
+and ownership-fence gates remain unchanged; Pre-Vote never authorizes a
+VIP to remain bound through a failed gate. It also does not restore votes
+or history forgotten on a diskless restart, or replace the cluster
+incarnation fence.
 
 ## 6. Crash and stop safety
 
@@ -296,10 +346,14 @@ sequenceDiagram
   Main->>Raft: start_raft()
   Main->>Reconcile: spawn reconcile loop
   Reconcile->>OS: every 250 ms, bind/unbind idempotently from committed state
-  Main->>Main: supervise SIGINT / SIGTERM and critical service tasks
-  Main->>Reconcile: abort reconcile first
+  Main->>Main: supervise stop/restart signals and critical tasks
+  Main->>Reconcile: stop reconcile and health publishing
   Main->>LocalVip: unbind_all(all configured VIPs)
   LocalVip->>OS: ip addr del only VIPs this process tracked as bound
+  opt Clean stop and successful cleanup
+    Main->>Raft: commit unhealthy and await local apply
+    Main->>Raft: acknowledge resulting release generations
+  end
   Main->>Raft: shutdown submit server, network, and raft
 ```
 
@@ -342,19 +396,28 @@ Steady state:
 
 Shutdown:
 
-- `main.rs` aborts the reconcile loop first so cleanup does not race with a rebind.
+- `main.rs` stops reconciliation and health publishing before cleanup,
+  preventing rebinds or new healthy reports during handoff.
 - The submit listener is a critical task. Bind failure, unexpected completion, or task failure
   stops the composition root; shutdown joins the service tasks and returns lifecycle errors.
-- Accepted submit clients, the Raft accept/reconnect/inbound task tree, and Raft's formation, epoch,
-  activation, and stale-survivor control loops are owned and supervised. Unexpected completion,
+- Accepted submit clients, the Raft accept/reconnect/inbound task tree,
+  runtime admission and stale-survivor control loops are owned and supervised. Unexpected completion,
   error, or panic stops the daemon; cancellation aborts and joins the children before listener and
   runtime shutdown.
 - `unbind_all` runs before submit/network/Raft shutdown.
+- On a clean stop with successful cleanup, `src/handoff.rs` commits an
+  unhealthy report, waits for local application and acknowledges the
+  resulting release generations within one `submit_timeout_ms` budget.
+  Missing quorum or proof leaves peers on the stale-holder fallback.
+  Failed cleanup or a fatal task error never publishes shutdown releases.
+- `SIGINT` / `SIGTERM` request a clean stop. `SIGHUP` / `SIGQUIT` use the
+  cleanup path and exit with status 1 for `Restart=on-failure`; configs
+  are read by the new process, not reloaded in place.
 - `unbind_all` bounds each delete to 250 ms, retries it at most three times, attempts every tracked
   VIP, and returns an error if any cleanup remains exhausted. The sample systemd unit's
   `KillMode=mixed` keeps its graceful SIGTERM away from teardown-time children while retaining a
   cgroup-wide SIGKILL at `TimeoutStopSec`.
-- Health probes, notify hooks, `ip`, and `arping` share one bounded Linux process-group runner. The
+- Health probes, notify hooks, `ip`, `arping` and `ndptool` share one bounded Linux process-group runner. The
   guard sends SIGKILL to the group on normal completion, timeout, or future cancellation, and the
   direct child is reaped within a fixed bound. This prevents shell descendants and inherited output
   pipes from escaping shutdown.
@@ -375,10 +438,19 @@ require manual cleanup.
 
 ## 7. Transport and auth
 
-keepAfloatD uses two small TCP+JSON protocols: one for Raft peer RPC and one for follower-to-leader submit forwarding. Both require authentication with the cluster's shared secret.
+keepAfloatD uses two TCP listeners: one for Raft RPC and status, and one for
+follower-to-leader submit forwarding. Both require the same fixed binary mutual
+HMAC-SHA256 handshake before length-prefixed JSON. The shared key is never sent.
+JSON remains plaintext. Admission records have a connection- and
+challenge-bound MAC; ordinary Raft and status records still require a
+trusted network or an authenticated encrypted tunnel.
 
 `src/connection_admission.rs` supplies the shared two-stage semaphore gate used by both listeners:
 one permit bounds work before authentication and a separate permit bounds accepted work afterward.
+
+The submit listener forwards admitted release acknowledgements. Health
+progress uses the admission-management channel instead. The following
+sequence shows release forwarding to a remote leader:
 
 ```mermaid
 sequenceDiagram
@@ -389,56 +461,83 @@ sequenceDiagram
   participant PeerNet as raft/network.rs
   participant Followers as Other raft followers
 
-  Follower->>Submit: submit_request(req)
-  Submit->>Follower: local raft.client_write -> ForwardToLeader
-  Submit->>LeaderSubmit: framed JSON SubmitEnvelope(secret, req)
-  LeaderSubmit->>LeaderSubmit: validate secret and node_id
+  Follower->>Submit: submit VipReleased with current admission
+  Submit->>LeaderSubmit: C: initiator hello with fresh nonce
+  LeaderSubmit-->>Submit: S: responder hello with fresh nonce, proof(2)
+  Submit->>Submit: verify proof(2) over C and S
+  Submit->>LeaderSubmit: proof(1)
+  LeaderSubmit->>LeaderSubmit: verify proof(1) over C and S
+  LeaderSubmit-->>Submit: proof(3)
+  Submit->>Submit: verify proof(3) before sending JSON
+  Submit->>LeaderSubmit: signed ReleaseEnvelope(genesis, request)
+  LeaderSubmit->>LeaderSubmit: verify record MAC, exact boots, genesis and admission
   LeaderSubmit->>LeaderRaft: raft.client_write(req)
   LeaderRaft->>PeerNet: append and replicate
+  Note over PeerNet,Followers: New Raft connection: mutual HMAC, then preflight unless cached
   PeerNet->>Followers: Raft RPC over framed JSON
   Followers-->>LeaderRaft: responses / acks
-  LeaderSubmit-->>Submit: SubmitResponse(ok)
+  LeaderSubmit-->>Submit: signed SubmitResponse with committed log ID
+  Submit->>Submit: verify response MAC and current authority
+  Note over Submit,Followers: JSON is plaintext; release records have a connection-bound MAC
+  Note over PeerNet,Followers: Ordinary Raft and status records have no record MAC
 ```
 
 Raft peer transport (`src/raft/network.rs` and `src/raft/network/*`):
 
 - module boundaries:
   - `network.rs`: peer links, reconnects, outbound preflight, and RPC exchange
-  - `network/client.rs`: OpenRaft outbound client traits and whole-snapshot envelopes
+  - `network/client.rs`: OpenRaft outbound client traits, Pre-Vote negotiation and envelopes,
+    and whole-snapshot envelopes
   - `network/server.rs`: listener admission, authentication, and inbound task supervision
   - `network/inbound.rs`: authenticated inbound dispatch and preflight enforcement
-  - `network/wire.rs`: bounded frames, secrets, incarnation flags, config preflight, and V2
-    compatibility checks
-  - `network/status.rs`: authenticated status responses and short-lived capability probes
+  - `network/request.rs`: typed operation envelopes and matching response-tag checks
+  - `network/wire.rs`: bounded frames, shared HMAC handshake calls, incarnation flags, config
+    preflight, and V2 compatibility checks
+  - `network/status.rs`: status responses and short-lived capability probes after mutual
+    authentication; the status JSON itself has no MAC
 
 - handshake:
-  - 8-byte BE `node_id`
-  - 4-byte BE secret length
-  - secret bytes
-  - 1-byte semantics/incarnation flag: `0` legacy/no incarnation, `1` legacy/incarnation,
-    `2` V2/no incarnation, `3` V2/incarnation
-  - flags `1` and `3` are followed by the 16-byte BE cluster incarnation
+  - the shared protocol described below uses listener discriminator `1` for Raft and status
+  - each hello binds its sender and intended recipient IDs, fresh nonce, capability flags and
+    optional cluster incarnation; the responder ID must match the configured destination
+  - Raft connections advertise their current incarnation when known and their current V2
+    semantics flag; status discovery may omit the incarnation and uses a clear V2 hello bit
+    so discovery remains separate from Raft-dispatch compatibility checks
+  - every connection, including reconnects and short-lived status probes, uses fresh nonces
 - first framed exchange on a new outbound stream:
   - `ClusterStatusRequest` advertises the sender's optional versioned config fingerprint and
     cancellation-safe reader capability
-  - `ClusterStatusResponse` advertises the receiver's fingerprint, capability, and replicated
-    enforcement flag
+  - `ClusterStatusResponse` advertises the receiver's fingerprint, capabilities including
+    `supports_pre_vote`, and replicated enforcement flag
   - a concrete mismatch closes the stream before any Raft frame is dispatched
   - the connect + handshake + preflight operation has a five-second outer bound
-  - before identity activation, a reconnect to a peer already authenticated and preflighted as
-    legacy may repeat only the authenticated handshake; this avoids making quorum recovery depend
-    on a legacy Raft actor answering a status RPC during an election
-  - identity activation drops those legacy streams, and every following reconnect must complete
-    the fingerprint preflight
+  - before identity activation, a peer previously preflighted with a missing config identity
+    may reconnect using that cached result, but still completes a fresh mutual handshake;
+    this retained compatibility path avoids a status-RPC dependency during quorum recovery
+  - identity activation drops those missing-identity streams, and every following reconnect
+    must complete the fingerprint preflight; neither path accepts the old authentication format
 - framed RPC payloads:
   - 4-byte BE frame length
-  - JSON body
+  - JSON object with exactly one operation key: `status`, `pre_vote`,
+    `append_entries`, `install_snapshot`, `vote`, `admission`, or
+    `admission_control`
+  - requests and responses use the same key; a mismatched reply closes
+    the stream even if its inner payload has a compatible shape
+  - unknown, duplicate or multiple operation keys, unwrapped messages
+    and malformed selected payloads fail without alternate decoding
+  - payloads decode directly into concrete types, preserving full-width
+    integers such as 128-bit cluster epochs
+  - tags identify operations but do not authenticate or encrypt records;
+    admission and management payloads carry separate connection- and
+    challenge-bound MACs
 - concurrency model:
   - each outbound peer link is `Mutex<Option<TcpStream>>`
   - a slow peer does not block every other peer
   - the listener admits at most 32 unauthenticated and 64 authenticated connection tasks
-  - eight connections per configured peer bound both phases together; peers sharing a canonical
-    source IP share their combined quota, preserving capacity for other source addresses
+  - each configured peer contributes eight slots independently to each
+    phase; peers sharing a canonical source IP combine their quotas
+  - entering the authenticated pool releases the pre-authentication
+    slot; saturation of either pool rejects new work without queuing
   - authenticated inbound frame bodies share a 128 MiB pre-allocation byte budget
   - unknown source IPs are rejected before task admission; after the handshake, the claimed peer
     id must match the source IP advertised for that peer
@@ -448,7 +547,8 @@ Raft peer transport (`src/raft/network.rs` and `src/raft/network/*`):
     an advertised source address cannot be bound across address families
 - failure handling:
   - any I/O or timeout failure drops only that peer stream
-  - handshake reads and response writes have five-second deadlines
+  - the complete mutual handshake has one five-second deadline, including partial reads and
+    writes; response writes retain their separate five-second deadline
   - idle authenticated streams expire after the greater of five seconds and twice the heartbeat
     interval; once the first byte arrives, one five-second deadline covers the rest of the prefix
     and body, so trickled bytes never restart the budget
@@ -458,117 +558,169 @@ Raft peer transport (`src/raft/network.rs` and `src/raft/network/*`):
     its unread response could be consumed by the next Raft RPC
   - inbound response writers require one nonblocking TCP write to accept the complete length prefix
     and payload; a short write closes the stream instead of resuming the body after an await
-  - current readers advertise cancellation-safe stream ownership and may reuse a connection; this
-    capability is negotiated independently from the older V2 failover-semantics handshake bit
-  - legacy streams are reused only when state acquisition, dispatch, and the single nonblocking write complete inside
-    80% of one heartbeat interval
-  - a later legacy response is dropped before close, so the old reader's competing timeout cannot
-    retain either a partial frame or a complete late response for the next RPC
+  - current readers advertise cancellation-safe stream ownership in status JSON and may reuse
+    a connection; inbound response timing still uses that JSON assertion independently from
+    the authenticated hello flags
+  - the retained cancellation-unsafe response path reuses a stream only when state acquisition,
+    dispatch, and the single nonblocking write complete inside 80% of one heartbeat interval
+  - a later response on that path is dropped before close, so a reader's competing timeout cannot
+    retain either a partial frame or a complete late response for the next RPC; this is not
+    legacy authentication support
   - background reconnect loops retry on short fixed intervals
   - RPC calls honor OpenRaft `hard_ttl` with a minimum timeout floor
   - diskless catch-up caps each unary AppendEntries payload at 32 log entries, preventing an
     expensive replay batch from repeatedly exceeding the heartbeat-derived RPC deadline
 
+Pre-Vote exchange (`src/raft/network/client.rs`, `src/raft/network/inbound.rs`):
+
+- Each attempt opens a fresh connection to a configured peer, binds to
+  the local advertised Raft address, sends the existing shared-secret
+  handshake, and completes the status preflight on that same connection.
+  It neither reuses the replication stream nor trusts a cached capability
+  or the ordinary reconnect path's legacy preflight shortcut.
+- Protocol version 3 requires `supports_pre_vote: true`. The client
+  sends `{"pre_vote": <VoteRequest>}` and accepts only the matching
+  `{"pre_vote": <VoteResponse>}` envelope, returning the peer's actual
+  response, including a denial, to OpenRaft.
+- Missing or false Pre-Vote support is an error, never a synthetic
+  grant. Unknown targets, failed authentication, timeouts, disconnects,
+  malformed or mismatched responses, and rejected preflights also fail.
+  There is no legacy Pre-Vote fallback or mixed-version operation.
+- Before checking capability support, the client rechecks current
+  incarnation, failover-semantics activation, and configuration-identity
+  policy against the completed preflight. Inbound Pre-Vote passes the
+  same source/peer identity, secret, semantics, configuration, and
+  incarnation gates as other non-status Raft RPCs before dispatch.
+  Status remains available for discovery of incompatible peers, but its
+  response does not bypass those RPC fences. Missing incarnations retain
+  the existing blank-node compatibility rule; concrete mismatches fail.
+- Dispatch decodes the operation envelope once. A `pre_vote` request
+  calls `Raft::pre_vote` only; malformed or hybrid operation envelopes
+  cannot fall through to the mutating ordinary-vote handler.
+- One timeout covers connection setup, negotiation, and the exchange:
+  OpenRaft's `hard_ttl`, with the existing 50 ms minimum. Preflight also
+  retains its five-second outer bound and 64 KiB status-response cap;
+  Pre-Vote frames use `max_frame_bytes`. The fresh stream is dropped on
+  completion, error, or cancellation, so no unread response can leak into
+  a subsequent replication RPC.
+
 Follower-to-leader submit transport (`src/submit.rs`):
 
-- framed JSON request/response over `client_submit_listen`
+- mutual authentication with listener discriminator `2`, then one signed
+  release request/response over `client_submit_listen`; the exact process
+  boots and current genesis fence the operation
 - fixed 4 KiB request/response frame cap, independent of the Raft snapshot cap
 - at most 32 unauthenticated and 64 authenticated connection tasks; excess sockets and unknown
   source IPs are dropped before a request-sized allocation
-- eight connections per configured peer across both phases; shared source IPs combine their quotas
+- eight connections per configured peer in each phase independently;
+  shared source IPs combine their quotas, and authentication releases
+  the handshake slot when the authenticated pool admits the request
 - outbound forwarding binds to the local advertised submit IP; same-IP peers share the secret's
   trust boundary and cannot be distinguished by source address alone
-- request reads and response writes have five-second deadlines
-- `SubmitEnvelope` carries the required shared secret plus the inner request
-- the leader revalidates both `cluster_secret` and `node_id` membership before calling `raft.client_write`
+- the handshake has one five-second deadline; request reads and response writes have separate
+  five-second deadlines, while `submit_timeout_ms` bounds outbound forwarding including authentication
+- the release envelope binds genesis and request to the authenticated
+  connection with a record MAC; the shared key is never sent
+- after the handshake, the leader rejects cluster-scoped requests, checks request `node_id`
+  membership and its advertised source IP, and requires that ID to equal the authenticated
+  initiator before entering the authenticated connection pool. A current
+  admission session and exact committed voter identities are required
+  before `raft.client_write`; a rejected application is not success.
 - the composition root supervises the listener, so an occupied socket or unexpected listener exit
   fails the daemon instead of silently removing the cluster write path
 
-Authentication:
+Shared handshake (`src/auth.rs`):
 
-- Configuration without a non-empty `cluster_secret` is rejected before the listeners start.
+- Each hello is exactly 110 bytes: `KAFDAUTH`, version `3`, listener, sender role, capabilities,
+  sender ID, intended recipient ID, a fresh 32-byte OS nonce, an epoch-present byte, and a
+  16-byte epoch, a boot-nonce-present byte and a 32-byte boot nonce.
+  Integers are unsigned big-endian; absent optional fields have zero bytes.
+- Hello roles are initiator `1` and responder `2`. Capability bit 0 is failover V2, bit 1 is
+  config identity and bit 2 is cancellation-safe RPC; only capability bytes `6` and `7` are
+  accepted. Wrong versions, listener/role values, flags, destinations and noncanonical epochs
+  fail closed. See [the exact field offsets](docs/authentication.md#fixed-encoding).
+- For the exact initiator hello `C` and responder hello `S`, every proof is the full 32-byte
+  HMAC-SHA256 of `b"keepafloatd-mutual-auth\0" || [3, role] || C || S`, keyed by the configured
+  secret. Every byte of both hellos is bound: both nonces, both identities and intended
+  recipients, both epochs and their presence flags, listener, version, roles and capabilities.
+- The responder sends `S` and proof `2`; the initiator verifies it before sending proof `1`.
+  The responder verifies proof `1`, then sends confirmation proof `3` before dispatch.
+  The initiator verifies proof `3` before sending any status, Raft or submit frame.
+  Distinct proof roles prevent reflection, and listener binding prevents cross-protocol reuse.
+- RustCrypto HMAC verification uses constant-time `verify_slice`. OS entropy failure closes
+  the attempt. Fresh independent nonces resist replay of recorded handshakes without a nonce
+  cache; this does not protect subsequent records from replay.
+- Fixed-size buffers and pre-authentication admission quotas bound handshake memory. One
+  five-second deadline covers the whole exchange, including partial I/O; shorter enclosing
+  connect, probe or RPC budgets still apply. Failure or cancellation discards the connection,
+  and a new attempt never reuses its nonce or proof.
+
+Authentication and security boundary:
+
+- Configure exactly one of `cluster_secret` or `cluster_secret_file`.
+  Every member must resolve the same random secret of 32 to 256 UTF-8
+  bytes without whitespace or controls. File paths may differ per host;
+  relative paths resolve against the YAML directory and are read once
+  at startup. Config Debug output redacts the resolved value.
 - The public example placeholder is also rejected, preventing an unchanged sample from becoming a
   credential shared by unrelated installations.
-- The inbound secret must match exactly on both Raft and submit connections.
+- Both endpoints prove possession of a cluster-wide key without transmitting it, not an
+  exclusive cryptographic identity per node. Roster and source-IP
+  checks bind the claimed node ID; key holders sharing one IP remain in the same trust boundary.
+  Existing Raft payload validation and incarnation fences still apply.
+- There is no encryption. Ordinary Raft and status frames lack
+  post-authentication record integrity, sequencing and replay protection.
+  Admission records separately authenticate their channel, boots and
+  challenge. An active intermediary can relay a valid handshake, then read, modify,
+  inject or replay later JSON, including status fingerprints and capability assertions.
+  Authenticated hello metadata does not authenticate those records. Untrusted paths need an
+  authenticated encrypted VPN, IPsec or mTLS tunnel.
+- Recorded proofs permit offline guessing of weak keys. Use a unique high-entropy random
+  secret; meeting the minimum length alone does not ensure entropy.
+- Both listeners require protocol version 3 and reject earlier versions without
+  negotiation or fallback. Admission is required in addition to authentication.
+  Upgrades require a full-cluster stop, verification that every VIP is released,
+  replacement of all binaries, then restart on the same version. Include offline members
+  before they rejoin. This interrupts VIP service and is not a rolling upgrade.
+- Retained Legacy failover state, missing-fingerprint handling and ordinary submit-payload
+  compatibility all operate after mutual authentication; they cannot admit an old wire peer.
 - DEB and RPM packages install secret-bearing configs as root-owned mode `0600`, preserve locally
   edited config during upgrades, and reapply the restrictive mode in their post-install scripts.
-- This improves safety on trusted segments, but it is not a replacement for mTLS or stronger network isolation.
+- The complete encoding and threat model are in [Mutual cluster authentication](docs/authentication.md).
 
-Cluster formation (`src/raft/formation.rs`, `src/raft/probe.rs`):
+Runtime admission and diskless restart (`src/raft/admission/`,
+`src/runtime_permission/`):
 
-- Formation requires no per-host configuration and no special node. On startup each node starts
-  its transport, then runs auto-formation over a small `ClusterStatusRequest`/`ClusterStatusResponse`
-  probe that rides the same handshake/framing (and `cluster_secret` auth) as Raft RPCs.
-- Every node may form the cluster; two facts keep this safe under the in-memory store:
-  - **Identical-config initialize.** Every node calls `Raft::initialize` with the *same*,
-    cluster-wide identical membership (built from `peers`). OpenRaft documents concurrent
-    `initialize` with the same config as safe (only *different* configs cause split brain; upgraded
-    peers verify that premise with the config-identity preflight). Raft then elects a single leader among the
-    reachable majority. Because no node is special, **any majority can form - or recover - the
-    cluster even if the lowest-id node is permanently gone.** This matters for diskless/PXE nodes
-    that keep no state across reboots: after a full outage, whichever majority comes back reforms
-    the cluster on its own.
-  - **Quorum gate + existing-cluster check.** A node initializes only after a majority of peers
-    (including itself) respond *uninitialized*, so a network partition yields at most one side with
-    a leader, never two. If any peer reports an existing cluster (`initialized` or a known leader),
-    the node declines and joins as a follower via replication - so a blank-rebooted node **rejoins**
-    rather than re-forming.
-  - **Cluster incarnation fence.** The two facts above protect the common cases but leave one gap:
-    if a minority is partitioned away and the majority then *loses its state and reforms* while the
-    minority is still gone, the returning minority would hold stale, possibly higher-term state that
-    Raft's log-recency rule could let win - overwriting the legitimate majority (the in-memory store
-    violates Raft's durable-storage assumption). To close this, the first leader of a freshly formed
-    cluster commits a random `ClusterFormed { cluster_id, failover_semantics,
-    config_identity_enforced }` *incarnation*, which every member carries
-    in the transport handshake. A node holding a *different* concrete incarnation has its Raft RPCs
-    dropped at the dispatch layer (`epochs_compatible`), so a stale survivor can never drive a vote
-    or append against a reformed majority. A blank node carries no incarnation and is always
-    absorbed, so ordinary diskless rejoin is unchanged. For liveness, a leaderless node that probes
-    a *majority* reporting one exact different incarnation on three consecutive one-second polls
-    recognizes itself as the stale survivor and exits for a supervisor restart
-    (`run_cluster_guard` over the pure `raft::guard::ClusterGuard`), returning blank to rejoin via
-    replication. Distinct foreign incarnations are grouped separately and cannot form a false
-    reset quorum. A node can only probe `roster - 1` peers while the quorum is `roster / 2 + 1`,
-    so this self-reset cannot fire in a 1- or 2-node roster; such a survivor stays transport-fenced
-    until an operator restarts it.
-  - **Failover-semantics activation.** Old snapshots and rolling-upgrade clusters default to
-    `Legacy`. An existing cluster commits `EnableFailoverSemanticsV2` only after every configured
-    voter is reachable and advertises V2 support. A freshly formed majority may record V2 in
-    `ClusterFormed` when every reachable voter supports it; an offline legacy voter is then fenced
-    when it returns. Capability discovery uses a legacy-compatible status probe, so old peers can
-    participate before activation. After activation, normal legacy Raft streams are rejected and
-    reconnected with the V2 handshake. Existing Legacy recovery/nopreempt entries migrate
-    conservatively because the old snapshot schema has no ownership evidence; V2 tracking becomes
-    ownership-aware for failures committed after activation.
-  - **Cluster-config identity.** `Config::cluster_config_fingerprint` hashes a manually encoded,
-    versioned canonical form with SHA-256. It includes the sorted peer roster; sorted VIP
-    address/prefix/effective-interface tuples; effective probe staleness and timing;
-    behavior-relevant failover/failback policy; frame cap; and Raft timing. Equivalent direct VLAN
-    sub-interface spelling, IPv4-mapped peer endpoints, and raw staleness values that produce the
-    same whole missed-probe threshold are normalized, as is failback delay when nopreempt ignores it. It
-    excludes the shared secret (compared directly) and every node-local setting. Formation counts
-    only matching concrete fingerprints. An incompatible reachable peer is outside the candidate
-    cluster and cannot downgrade the matching quorum's capabilities. New-to-new concrete
-    mismatches are always rejected during the status preflight before Raft dispatch. An existing
-    cluster commits `EnableConfigIdentityV1` only after all configured voters advertise the same
-    identity; a fresh matching majority can set the flag in `ClusterFormed`. Before activation,
-    missing fingerprints from older binaries remain compatible for rolling upgrade. After
-    a successful legacy preflight, pre-activation reconnects may reuse that authenticated missing
-    identity without another status round trip; this breaks a circular dependency between legacy
-    status dispatch and Raft quorum recovery. After activation, missing identities are rejected and
-    their existing streams are dropped. A node
-    observing one exact foreign fingerprint on a majority for three rounds signals the composition
-    root, which stops reconciliation, unbinds VIPs, shuts down Raft, and exits with status 4.
-    The full peer set is scanned every round; a matching initialized minority cannot short-circuit
-    or bypass that coherent-majority hold-down, and YAML peer order cannot change the decision.
-    Distinct foreign fingerprints never add into a false majority. Status/preflight responses use
-    a dedicated 64-KiB allocation cap independent of the larger Raft/snapshot frame cap.
-- Diskless reality: with no durable log, a full-cluster reboot always reforms from scratch and
-  re-converges within seconds (health and VIP ownership are ephemeral and continuously
-  republished). This is the expected recovery path, not a failure mode. The only event that still
-  requires a specific node is the *very first* formation, which needs any majority to be reachable.
-  A node that kept state across a reform it was absent for is reconciled by the incarnation fence
-  above rather than by a blank reboot.
+- Each process receives an exact physical-ID/256-bit-boot-nonce Raft
+  identity. Follower log reversion is disabled; a new boot joins as a
+  learner rather than resetting the progress of an existing voter.
+- Discovery identifies candidate boots and immutable genesis records.
+  It supplies no permission. Cold formation requires the exact
+  consenting cohort and a configured physical majority.
+- Replacement membership is a committed operation: prepare, learner
+  catch-up, applied acknowledgement, then membership promotion. History
+  and snapshots never restore a process-local admission lease.
+- Renewal is tied to freshly challenged, locally applied progress.
+  Admission-only progress does not alter service health or probe ticks.
+  Real health reports retain their request-start freshness deadline.
+- A supervised runtime drives formation, joining and renewal.
+  Permission expiry permanently seals that process's authority.
+  Cleanup precedes a supervisor restart with a new boot identity.
+- A newly committed genesis activates V2 failover semantics and config
+  identity enforcement together. There is no mixed-version activation
+  path or missing-admission fallback.
+- Restart quarantine protects forgotten physical-member reservations.
+  A separate initial VIP activation fence covers old health proofs and
+  cleanup, including first-generation assignments without a previous
+  holder. Renewal does not restart that fence.
+- Configuration fingerprints and coherent-majority guards remain
+  independent rejection mechanisms. They do not create admission or
+  replace the physical-majority reservation.
+
+See [diskless runtime admission](docs/runtime-admission.md) for the
+protocol boundaries, timing formulas, availability costs and required
+clock/cleanup assumptions. The mechanism does not provide external
+fencing for indefinitely paused hosts or failed kernel cleanup.
 
 ## 8. Configuration model
 
@@ -591,15 +743,17 @@ Model:
 - One file per process.
 - Cluster-wide invariants that must match on every node:
   - `peers`
-  - effective `vips` (including prefix and resolved VLAN sub-interface)
+  - effective `vips` (including prefix and resolved interface name;
+    interface names must match across hosts, not just the network reached)
   - `health.interval_ms`
   - effective missed-probe staleness threshold derived from `health.stale_secs`
   - `failover_delay_secs`
   - `failback`
   - `failback_delay_secs` when `failback: true`
-  - `cluster_secret`
+  - resolved `cluster_secret` (key possession verified by mutual HMAC, outside the fingerprint)
   - `max_frame_bytes`
-  - timing-sensitive tuning
+  - `raft.election_timeout_min_ms`, `raft.election_timeout_max_ms`
+    and `raft.heartbeat_interval_ms`
 - Per-host fields that legitimately differ:
   - `node_id`
   - `raft_listen`
@@ -607,9 +761,16 @@ Model:
   - `health.command`
   - `health.timeout_ms`
   - `submit_timeout_ms`
+  - `address_protocol` (keep stable for crash-orphan cleanup)
+  - `cluster_secret_file` path (resolved contents must still match)
   - `dry_run`
   - `notify`
 - Cluster formation is automatic - see "Cluster formation" above.
+
+Local listen addresses must equal this node's advertised roster entries.
+`eth0.100` and `eth0` plus `vlan: 100` are equivalent effective VIP
+interfaces; `eth0.100` and `ens3.100` are not. Devices must already exist
+when used; keepAfloatD does not create or rename them.
 
 Defaults and normalization at load time:
 
@@ -621,7 +782,9 @@ Defaults and normalization at load time:
 - `submit_timeout_ms` defaults to 2000 ms and bounds both local leader writes and forwarded
   submit attempts.
 - `raft` timing has defaults.
-- VIPs are sorted by address and deduplicated.
+- VIPs are validated before sorting/deduplication. Only identical
+  effective bindings deduplicate; conflicting prefixes or interfaces for
+  one address are rejected.
 - Equivalent direct and `vlan:` sub-interface spelling resolves to one effective VIP identity;
   IPv4-mapped IPv6 socket endpoints resolve to their IPv4 form; `stale_secs` values that produce
   the same whole missed-probe threshold share one identity; and
@@ -630,12 +793,15 @@ Defaults and normalization at load time:
 Rejected at load time:
 
 - empty peers, VIPs, or health command
-- zero or obviously broken probe interval / timeout values
+- zero probe interval/timeout, timeout over ten intervals, or timeout at
+  or above `interval_ms * effective_stale_missed_probes`
 - `health.stale_secs < ceil(interval_ms / 1000)`
 - duplicate peer ids
 - duplicate or cross-role peer endpoints after IPv4-mapped IPv6 canonicalization
 - `node_id` not present in `peers`
-- missing, empty, overlong, or unchanged public-placeholder `cluster_secret`
+- missing/ambiguous secret sources, invalid secret files, or a resolved
+  secret outside the length/character rules or equal to a public placeholder
+- non-unicast VIPs, invalid prefixes/interfaces/VLANs, or conflicting VIPs
 - `max_frame_bytes < 64 KiB` or `max_frame_bytes > 16 MiB`
 - non-positive `submit_timeout_ms`
 
@@ -643,7 +809,8 @@ Tolerated at runtime and turned into behavior instead of config failure:
 
 - health command spawn failure or timeout -> node becomes unhealthy
 - missing peer connectivity -> network errors, elections, or self-fencing
-- missing `arping` success -> bind still succeeds; gratuitous ARP is best-effort
+- failed `arping` / `ndptool` -> logged, bounded background announcement
+  failure; it does not revoke a successfully bound address
 - stale leftover VIP from a previous process -> reclaimed during startup cleanup
 
 Use `config.example.yaml` as the canonical example for real deployments and tests.
@@ -663,8 +830,8 @@ flowchart TD
   steady --> stale[node 2 goes stale]
   subgraph after_stale[After recompute]
     a1[10.0.0.101 -> node 1]
-    a2[10.0.0.102 -> node 3]
-    a3[10.0.0.103 -> node 1]
+    a2[10.0.0.102 -> node 1]
+    a3[10.0.0.103 -> node 3]
   end
 
   after_stale --> quorum_ok[5-node cluster, 2 nodes fail, quorum still exists]
@@ -753,13 +920,19 @@ expiry prevents an isolated leader's blocked health probe or release RPC from re
 VIPs after survivors reassign them (#26). The elapsed-time check is entirely process-local;
 the replicated state machine still uses only committed probe rounds and contains no clock.
 
-The submit-only `HealthUpdateWithProof` wire discriminator cannot be parsed by an older
-server as a replicated `KafRequest`. A capable server converts it to the existing
-`HealthUpdate` and returns the committed log ID. The follower waits for local application
-through that index within the health submit timeout before publishing its request-start
-proof. A rejected or indexless response fences local eligibility before sending an ordinary
-unhealthy fallback; it never retries an ordinary healthy report. Ordinary clients and
-release requests remain compatible with newer servers, and replicated entries are unchanged.
+The runtime publishes `HealthProgress` with its exact boot, immutable
+genesis and a fresh challenge. Its own progress must commit and apply
+locally before fresh physical-majority grants can renew admission.
+`Some(healthy)` carries a real health result; `None` renews runtime
+progress without advancing health ticks. A rejected response is not a
+successful proof. Local VIP eligibility also waits for the initial
+activation fence, even when a health report has already committed.
+
+Release forwarding binds the sender and receiver boots, genesis and
+authenticated connection with a record MAC. It requires current local
+admission and exact committed voter identity. Release acknowledgements
+do not renew the health proof. Earlier physical-ID health payloads are
+not a production fallback when admission fails.
 While renewal validation waits for the state lock, the effect retains its previously accepted
 proof deadline. Only successful validation extends that deadline to the specific new proof.
 A process-local invalidation epoch prevents a rapid invalidation followed by success from

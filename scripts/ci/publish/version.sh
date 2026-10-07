@@ -6,11 +6,20 @@ if [ -z "${PUBLISH_REF:-}" ]; then
   exit 1
 fi
 
-echo "Checking out ${PUBLISH_REF}..."
-git fetch origin --quiet "+refs/heads/*:refs/remotes/origin/*" --tags
-git checkout --quiet "${PUBLISH_REF}"
+if [ -z "${CI_COMMIT_SHA:-}" ]; then
+  echo "CI_COMMIT_SHA is required to identify the tested commit" >&2
+  exit 1
+fi
 
-COMMIT=$(git rev-parse HEAD)
+git fetch origin --quiet "+refs/heads/*:refs/remotes/origin/*" --tags
+COMMIT=$(git rev-parse --verify "refs/remotes/origin/${PUBLISH_REF}^{commit}" 2>/dev/null ||
+  git rev-parse --verify --end-of-options "${PUBLISH_REF}^{commit}")
+if [ "${COMMIT}" != "${CI_COMMIT_SHA}" ]; then
+  echo "PUBLISH_REF must resolve to the tested pipeline commit ${CI_COMMIT_SHA}" >&2
+  exit 1
+fi
+
+git checkout --quiet --detach "${COMMIT}"
 echo "Commit: ${COMMIT}"
 
 YYMM=$(date +%y%m)

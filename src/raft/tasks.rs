@@ -71,6 +71,7 @@ pub(super) async fn stop_supervised_tasks(
 
     let mut failures = Vec::new();
     for task in tasks {
+        crate::stop_budget::checkpoint(timeout);
         match tokio::time::timeout(timeout, task.handle).await {
             Ok(Ok(Ok(()))) => {}
             Ok(Ok(Err(error))) => failures.push(format!("{}: {error:#}", task.name)),
