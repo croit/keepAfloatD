@@ -64,12 +64,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 # Pinned exactly: 0.10 is an alpha; the storage/network trait surface can churn between alphas.
 # The I/O-progress redesign in 0.10 fixes the diskless restart-past-snapshot crash.
-openraft = { version = "=0.10.0-alpha.32", features = ["serde", "type-alias"] }
+openraft = { version = "=0.10.0-alpha.36", features = ["serde", "type-alias"] }
 futures = "0.3"
 # Collision-resistant, versioned identity for cluster-wide configuration invariants.
-sha2 = "0.10"
+sha2 = "0.11"
 # Reviewed HMAC and constant-time tag verification; never implement our own MAC.
-hmac = "0.12"
+hmac = "0.13"
 # Reuse the locked OS-entropy API instead of adding a userspace RNG.
 getrandom = "0.4.3"
 # Linux process-group termination for cancellation-safe health probes.
