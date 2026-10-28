@@ -22,7 +22,10 @@ partition_node "${victim}"
 # The isolated node must self-unbind even though its keepafloatd is still running.
 check "isolated node ${victim} self-releases all VIPs" wait_until 60 node_lacks_all_vips "${victim}"
 check "isolated node keepafloatd still running (self-fenced, not crashed)" node_active "${victim}"
-fence_log="$(kafd_log "${victim}" 60 | grep -iE 'consensus|fresh|self|release|no leader' | tail -3)"
+fence_log="$(kafd_log "${victim}" 60)"
+fence_log="$(printf '%s\n' "${fence_log}" \
+  | awk 'tolower($0) ~ /consensus|fresh|self|release|no leader|removed address|unbound/' \
+  | tail -3)"
 evid "self-fence log on ${victim}:"; evid "${fence_log:-  (none)}"
 
 # Majority (other two) keep all VIPs uniquely held.

@@ -91,7 +91,7 @@ async fn clean_stop_hands_off_before_the_holder_becomes_stale() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn handoff_rejects_busy_admission_without_waiting_for_the_state_lock() {
+async fn handoff_bounds_busy_admission_by_the_shared_submit_deadline() {
     let mut cluster = ClusterFixture::bind(1).await;
     let mut cfg = (*cluster.config(0, &[])).clone();
     cfg.submit_timeout_ms = 50;
@@ -110,18 +110,33 @@ async fn handoff_rejects_busy_admission_without_waiting_for_the_state_lock() {
         .await
     );
     let runtime = controls.runtime();
-    assert!(runtime.current().is_some());
+    let session = runtime.coherent_session().await.unwrap();
     let lock = state.write().await;
     let started = tokio::time::Instant::now();
-    let result = crate::handoff::publish(&cfg, &raft, &state, &runtime, &network).await;
-    assert_eq!(tokio::time::Instant::now(), started);
+    assert!(session.check().unwrap() > started + Duration::from_millis(50));
+    let mut publish = Box::pin(crate::handoff::publish(
+        &cfg, &raft, &state, &runtime, &network,
+    ));
+    assert!(futures::poll!(publish.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_millis(49)).await;
+    assert!(futures::poll!(publish.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    let result = publish.await;
+    assert_eq!(
+        tokio::time::Instant::now() - started,
+        Duration::from_millis(50)
+    );
     drop(lock);
-    assert!(runtime.current().is_some());
+    assert!(session.check().is_ok());
+    runtime.coherent_session().await.unwrap();
     controls.shutdown().await.unwrap();
     network.shutdown().await.unwrap();
     raft.shutdown().await.unwrap();
     let error = format!("{:#}", result.unwrap_err());
-    assert!(error.contains("requires active admission"), "{error}");
+    assert!(
+        error.contains("exceeded the shared submit timeout"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

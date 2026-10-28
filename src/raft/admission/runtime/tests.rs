@@ -303,7 +303,7 @@ async fn management_mutations_require_admission_even_with_a_valid_signature() {
     assert!(runtime.state.read().await.prepared_join.is_none());
 }
 
-async fn admit_driver() -> Arc<RuntimeDriver> {
+pub(super) async fn admit_driver() -> Arc<RuntimeDriver> {
     use crate::raft::admission::ReceivedGrant;
     let runtime = driver();
     tokio::time::advance(runtime.timing.restart_quarantine()).await;

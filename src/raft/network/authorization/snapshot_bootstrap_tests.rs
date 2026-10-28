@@ -179,7 +179,6 @@ fn snapshot(cfg: &Config, prepared: &PreparedJoin, stage: &str) -> SnapshotTrans
         meta: openraft::SnapshotMeta {
             last_log_id: last,
             last_membership: membership.clone(),
-            snapshot_id: "bootstrap-unit".into(),
         },
         data: serde_json::to_vec(&serde_json::json!({
             "genesis": plan.genesis, "cluster_epoch": plan.genesis.epoch,

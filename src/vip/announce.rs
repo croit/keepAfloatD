@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io;
 use std::net::IpAddr;
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -14,16 +15,44 @@ use tracing::instrument::WithSubscriber;
 // Two default-interval packets need longer than an address mutation's budget.
 const ANNOUNCEMENT_TIMEOUT: Duration = Duration::from_secs(3);
 
+type PendingAnnouncements = Arc<Mutex<JoinSet<()>>>;
+
 #[derive(Default)]
 pub(super) struct Announcements {
-    tasks: Mutex<HashMap<IpAddr, JoinSet<()>>>,
+    // Keep one slot per configured VIP so an interrupted waiter cannot orphan its tasks.
+    tasks: Mutex<HashMap<IpAddr, PendingAnnouncements>>,
 }
 
 impl Announcements {
+    #[cfg(test)]
     pub(super) async fn send(&self, iface: &str, ip: IpAddr) {
         let mut command = command(iface, ip);
         self.start(iface, ip, async move {
             crate::process::run_status(&mut command, ANNOUNCEMENT_TIMEOUT).await
+        })
+        .await;
+    }
+
+    pub(super) async fn send_authorized(
+        &self,
+        iface: &str,
+        ip: IpAddr,
+        effect: Arc<super::witness::RetainedEffect>,
+    ) {
+        let mut command = command(iface, ip);
+        self.start(iface, ip, async move {
+            effect
+                .run(crate::process::run_status(
+                    &mut command,
+                    ANNOUNCEMENT_TIMEOUT,
+                ))
+                .await
+                .unwrap_or_else(|| {
+                    Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "announcement permission revoked",
+                    ))
+                })
         })
         .await;
     }
@@ -34,9 +63,9 @@ impl Announcements {
         ip: IpAddr,
         run: impl Future<Output = io::Result<ExitStatus>> + Send + 'static,
     ) {
-        let mut tasks = self.tasks.lock().await;
-        let pending = tasks.entry(ip).or_default();
-        cancel(pending, ip).await;
+        let pending = self.tasks.lock().await.entry(ip).or_default().clone();
+        let mut pending = pending.lock().await;
+        cancel(&mut pending, ip).await;
         let iface = iface.to_owned();
         let kind = if ip.is_ipv4() {
             "gratuitous ARP"
@@ -63,7 +92,9 @@ impl Announcements {
     }
 
     pub(super) async fn cancel(&self, ip: IpAddr) {
-        if let Some(mut pending) = self.tasks.lock().await.remove(&ip) {
+        let pending = self.tasks.lock().await.get(&ip).cloned();
+        if let Some(pending) = pending {
+            let mut pending = pending.lock().await;
             cancel(&mut pending, ip).await;
         }
     }

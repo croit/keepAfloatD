@@ -99,6 +99,28 @@ the earliest permitted VIP activation after a cold start, not a
 readiness signal. Monitoring must still observe successful formation,
 health and VIP activation.
 
+## Health proof and incumbent retention
+
+New VIP acquisition requires a healthy locally applied progress proof,
+live admission, leader visibility and the existing assignment and
+activation fences. The local runtime retains the exact accepting
+certificate deadline with that proof, not a later admission deadline.
+
+After a completed bind, that exact VIP, interface, prefix and assignment
+generation may survive temporary transport unavailability or missing
+leader visibility. Retention lasts only until the earlier of the
+original health request start plus H and the proof's accepted admission
+deadline. It does not authorize a new bind, address reassertion or late
+completion of an in-flight operation. A valid continuous health renewal
+may refresh the witness; a renewal after expiry cannot revive it.
+
+Local health loss, a bind fault, an observed proof rejection, changed
+assignment or sealed admission revokes retention. An EOF or timeout is
+only absence of new evidence, never a new lease. Admission-only progress,
+release acknowledgements and local probe success cannot renew a health
+witness. Elections longer than the remaining proof lifetime can still
+interrupt VIP service. The takeover and cleanup bounds are unchanged.
+
 ## Operational assumptions
 
 Run only one live process for each configured physical identity. Every

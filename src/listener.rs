@@ -111,15 +111,34 @@ mod tests {
 
     #[tokio::test]
     async fn mismatched_listener_is_rejected_and_released() {
+        use tokio::io::AsyncReadExt;
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let mut peer = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(address))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        {
+            let mut read = std::pin::pin!(peer.read(&mut byte));
+            assert!(futures::poll!(&mut read).is_pending());
+        }
         let configured: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let error = ListenerSource::Bound(listener)
             .bind(configured)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        TcpListener::bind(address).await.unwrap();
+        // Follow the original connection, since the freed port may be reused.
+        let result = tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte))
+            .await
+            .expect("rejected listener must close its queued connection");
+        assert!(
+            matches!(result, Ok(0))
+                || matches!(&result, Err(error) if error.kind() == io::ErrorKind::ConnectionReset),
+            "queued connection was not closed: {result:?}"
+        );
     }
 
     #[tokio::test]

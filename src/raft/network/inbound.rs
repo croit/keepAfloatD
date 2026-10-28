@@ -864,7 +864,6 @@ mod tests {
                 meta: openraft::SnapshotMeta {
                     last_log_id: None,
                     last_membership: membership.clone(),
-                    snapshot_id: "wire-characterization".into(),
                 },
                 data: serde_json::to_vec(&serde_json::json!({ "genesis": genesis, "cluster_epoch": 1, "last_applied": null, "last_membership": membership, "applied_progress": {} })).unwrap(),
             },

@@ -22,7 +22,8 @@
 //! ----------------
 //! An RPC retries a disconnected cached stream once on a fresh, authenticated connection. The
 //! same deadline covers lock acquisition, reconnect and both exchanges. Other errors drop the
-//! stream and leave recovery to the background task, which also detects idle peer closes. Each
+//! stream and leave recovery to the background task, which also detects idle peer closes.
+//! Requests for an obsolete boot leave the replacement boot's cached stream untouched. Each
 //! [`RaftNetworkV2`](openraft::network::v2::RaftNetworkV2) call honours
 //! [`openraft::network::RPCOption::hard_ttl`] via [`tokio::time::timeout`]; this is what turns a
 //! half-open connection into a prompt `Timeout` error instead of an unbounded `read_exact`.
@@ -62,7 +63,7 @@ mod sender_tests;
 #[cfg(test)]
 mod transport_tests;
 
-pub(super) use status::probe_peer_status;
+pub(super) use status::{UnauthenticatedDiscovery, probe_peer_status};
 
 use super::tasks::{CleanExit, SupervisedTask, spawn_supervised_task, stop_supervised_tasks};
 use super::types::{FailoverSemantics, TypeConfig};
@@ -90,6 +91,19 @@ use wire::{
     InFlightRpcStream, connect_with_handshake, connection_requires_config_identity,
     connection_requires_upgrade, read_framed_bounded, write_framed,
 };
+
+/// The destination authenticated under another boot than the one it was addressed as. It
+/// restarted, which is transient for the asker, not a rejection of its request (#40).
+#[derive(Debug)]
+pub(crate) struct DestinationBootChanged(pub(crate) &'static str);
+
+impl std::fmt::Display for DestinationBootChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} destination boot changed", self.0)
+    }
+}
+
+impl std::error::Error for DestinationBootChanged {}
 
 /// Per-peer outbound channel. The `address` is fixed at construction time; only the inner
 /// `TcpStream` is replaced on (re)connect. Locking is exclusive but per-peer.
@@ -488,6 +502,18 @@ impl RaftNetworkImpl {
                 *guard = None;
             }
             drop(state);
+            let remote = *link.remote_replica.read().map_err(|_| {
+                RPCError::Network(NetworkError::from_string(
+                    "peer identity lock poisoned".to_owned(),
+                ))
+            })?;
+            if remote.is_some_and(|replica| replica != target) {
+                // Old and replacement replicas share a physical peer's connection.
+                tracing::debug!(%target, ?remote, "rejecting Raft RPC for another boot");
+                return Err(RPCError::Network(NetworkError::from_string(
+                    "Raft destination boot changed".to_owned(),
+                )));
+            }
             let mut in_flight = InFlightRpcStream::new(guard);
             let mut retried = false;
             loop {
@@ -953,7 +979,6 @@ mod tests {
             meta: SnapshotMeta {
                 last_log_id: None,
                 last_membership: StoredMembershipOf::<TypeConfig>::default(),
-                snapshot_id: "oversize-network-test".into(),
             },
             snapshot: Cursor::new(vec![0; 128]),
         };

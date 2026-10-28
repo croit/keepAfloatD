@@ -188,10 +188,14 @@ assert_cluster_secret_consistent() {
 # keepafloatd service control (per node).
 # ---------------------------------------------------------------------------
 kafd_active()  {
-  local ip="${1:?}"
+  local ip="${1:?}" status
   # Preserve SSH/query failures, but normalize systemd's ordinary non-zero "inactive" status into
   # readable evidence so leader checks can ignore a stopped voter without accepting stale logs.
-  node_sh "${ip}" "systemctl is-active keepafloatd@$(instance_for_ip "${ip}") 2>/dev/null || true"
+  node_sh "${ip}" "systemctl is-active keepafloatd@$(instance_for_ip "${ip}") 2>/dev/null || true" || {
+    status=$?
+    evidence_failure service.active-read "$ip" "$status"
+    return "$status"
+  }
 }
 node_active()  { [[ "$(kafd_active "${1:?}")" == "active" ]]; }                # predicate
 all_daemons_active() {
@@ -260,17 +264,70 @@ replace_keepafloatd_binary() {  # replace_keepafloatd_binary <node> <node-local 
     test \"\$running\" = \"\$installed\"
   "
 }
-# Hard kill (SIGKILL) - leaves the VIP orphaned on the kernel (no graceful unbind), simulating a
-# silent death. We SIGKILL then `systemctl stop`: the unit has Restart=on-failure/RestartSec=1, so a
-# bare SIGKILL is resurrected by systemd in ~1s (the node would never actually be "gone" and its VIP
-# never stales out). `stop` after the process is already dead marks the unit inactive WITHOUT running
-# the graceful unbind, so the node stays down and the orphan VIP remains - the intended fault.
+# Crash scenarios need kernel orphans, so suppress supervision only while injecting the crash.
+crash_systemd_unit() (
+  local unit="${1:?}" directory override original restored status owned=0 directory_owned=0 stopping=0
+  directory="/run/systemd/system/${unit}.d"
+  override="${directory}/zzzz-keepafloatd-test-crash.conf"
+  original="$(systemctl show --property=Restart --property=ExecStopPost "${unit}")" || exit 1
+  systemctl is-active --quiet "${unit}" || exit 1
+  restore_supervision() {
+    status=$?
+    trap - EXIT
+    if (( stopping )); then systemctl stop "${unit}" || status=1; fi
+    if (( owned )); then
+      exec 3>&-
+      rm -- "${override}" || status=1
+    fi
+    if (( directory_owned )); then rmdir -- "${directory}" || status=1; fi
+    if (( owned )); then
+      systemctl daemon-reload || status=1
+      restored="$(systemctl show --property=Restart --property=ExecStopPost "${unit}")" || status=1
+      [[ "${restored}" == "${original}" ]] || status=1
+    fi
+    if (( status )); then printf 'crash injection or supervision restoration failed: %s\n' "${unit}" >&2; fi
+    exit "${status}"
+  }
+  trap restore_supervision EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  if [[ ! -e "${directory}" && ! -L "${directory}" ]]; then
+    mkdir -- "${directory}" || exit 1
+    directory_owned=1
+  fi
+  [[ -d "${directory}" && ! -L "${directory}" ]] || exit 1
+  [[ ! -e "${override}" && ! -L "${override}" ]] || exit 1
+  umask 077
+  set -C
+  exec 3> "${override}" || exit 1
+  owned=1
+  set +C
+  printf '[Service]\nRestart=no\nExecStopPost=\n' >&3 || exit 1
+  exec 3>&-
+  systemctl daemon-reload || exit 1
+  restored="$(systemctl show --property=Restart --value "${unit}")" || exit 1
+  [[ "${restored}" == no ]] || exit 1
+  restored="$(systemctl show --property=ExecStopPost --value "${unit}")" || exit 1
+  [[ -z "${restored}" ]] || exit 1
+  stopping=1
+  systemctl kill --kill-who=all --signal=SIGKILL "${unit}" || exit 1
+  systemctl stop "${unit}" || exit 1
+  stopping=0
+  ! systemctl is-active --quiet "${unit}" || exit 1
+  restored="$(systemctl show --property=ActiveState --value "${unit}")" || exit 1
+  [[ "${restored}" == inactive || "${restored}" == failed ]] || exit 1
+  restored="$(systemctl show --property=MainPID --value "${unit}")" || exit 1
+  [[ "${restored}" == 0 ]] || exit 1
+  restored="$(systemctl show --property=ControlPID --value "${unit}")" || exit 1
+  [[ "${restored}" == 0 ]] || exit 1
+)
+
 kafd_kill() {
-  local ip="${1:?}" inst unit
+  local ip="${1:?}" inst
   inst="$(instance_for_ip "${ip}")" || return 1
-  unit="$(shell_quote "keepafloatd@${inst}")"
-  node_sh "${ip}" "systemctl kill -s SIGKILL ${unit} && \
-    systemctl stop ${unit} && ! systemctl is-active --quiet ${unit}"
+  [[ "${inst}" =~ ^[a-zA-Z0-9_.-]+$ ]] || return 1
+  node_sh "${ip}" "$(declare -f crash_systemd_unit); crash_systemd_unit $(shell_quote "keepafloatd@${inst}.service")"
 }
 
 # Strip ANSI and pull last N journal lines for a node's instance.
@@ -332,24 +389,51 @@ file_event_count() {  # file_event_count <ip> <path> <extended-regex>
 # Batched cluster snapshot: query each node ONCE (in parallel) for the VIPs it holds, into
 # the global associative array _SNAP_VIPS_ON[ip]=" v1 v2 ...". One sweep replaces N×M calls.
 declare -A _SNAP_VIPS_ON=()
+declare -A _SNAP_READS=()
+_SNAP_COMPLETE=0
 snapshot_vips() {
   _SNAP_VIPS_ON=()
-  local ip pids=() failed=0 output token
+  _SNAP_READS=()
+  _SNAP_COMPLETE=0
+  local ip index status pids=() failed=0 output token
   local td; td="$(mktemp -d)"
   for ip in "${NODE_IPS[@]}"; do
-    ( node_sh "${ip}" "set -o pipefail; ip -o -4 addr show dev ${IFACE} 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | tr '\n' ' '" > "${td}/${ip}" 2>/dev/null ) &
+    (
+      started="$(date +%s)" || exit 1
+      read_status=0
+      node_sh "${ip}" "set -o pipefail; ip -o -4 addr show dev ${IFACE} | awk '{print \$4}' | cut -d/ -f1 | tr '\n' ' '" \
+        > "${td}/${ip}" 2>"${td}/${ip}.stderr" || read_status=$?
+      finished="$(date +%s)" || exit 1
+      printf '%s %s %s\n' "$started" "$finished" "$read_status" > "${td}/${ip}.timing"
+      exit "$read_status"
+    ) &
     pids+=("$!")
   done
-  for pid in "${pids[@]}"; do wait "${pid}" 2>/dev/null || failed=1; done
+  for index in "${!pids[@]}"; do
+    ip="${NODE_IPS[$index]}"
+    if wait "${pids[$index]}"; then :; else
+      status=$?
+      evidence_failure vip-snapshot.read "$ip" "$status"
+      failed=1
+    fi
+    if [[ -f "${td}/${ip}.timing" ]]; then
+      _SNAP_READS["$ip"]="$(<"${td}/${ip}.timing")"
+    fi
+    if [[ -s "${td}/${ip}.stderr" ]]; then
+      printf 'VIP snapshot stderr: node=%s\n' "$ip" >&2
+      cat "${td}/${ip}.stderr" >&2
+    fi
+  done
   if [[ "${failed}" -ne 0 ]]; then rm -rf "${td}"; return 1; fi
   for ip in "${NODE_IPS[@]}"; do
     output="$(<"${td}/${ip}")"
     for token in ${output}; do
       [[ "${token}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
-        || { rm -rf "${td}"; return 1; }
+        || { evidence_failure vip-snapshot.address "$ip" 1; rm -rf "${td}"; return 1; }
     done
     _SNAP_VIPS_ON["${ip}"]=" ${output} "
   done
+  _SNAP_COMPLETE=1
   rm -rf "${td}"
 }
 
@@ -404,14 +488,89 @@ all_vips_uniquely_held() {  # refreshes snapshot
   done
 }
 
+report_vip_ownership_failure() {
+  local phase="${1:?}" ip vip observation started finished status
+  printf 'VIP ownership failure: phase=%s\n' "$phase" >&2
+  for ip in "${NODE_IPS[@]}"; do
+    observation="${_SNAP_READS[$ip]:-}"
+    if [[ "$observation" =~ ^[0-9]+\ [0-9]+\ [0-9]+$ ]]; then
+      read -r started finished status <<< "$observation"
+      printf 'VIP observation: node=%s controller_started_s=%s controller_finished_s=%s status=%s\n' \
+        "$ip" "$started" "$finished" "$status" >&2
+    else
+      printf 'VIP observation: node=%s timing=unavailable\n' "$ip" >&2
+    fi
+  done
+  if [[ "$_SNAP_COMPLETE" == 1 ]]; then
+    for vip in "${VIPS[@]}"; do
+      printf 'VIP observation: vip=%s holder=%s\n' "$vip" "$(holder_for_vip "$vip")" >&2
+    done
+  else
+    printf 'VIP observation: ownership=unreadable\n' >&2
+  fi
+}
+
+holds_unique_vips_for() {
+  local duration="${1:?}" phase="${2:-stability}"
+  if holds_for "$duration" all_vips_uniquely_held; then return 0; fi
+  # Keep the failed sample: another read could already show a recovered handoff.
+  report_vip_ownership_failure "$phase"
+  return 1
+}
+
+monotonic_ns() {
+  python3 -c 'import time; print(time.monotonic_ns())'
+}
+
+wait_for_unique_vips_stable() {
+  local budget="${1:?}" duration="${2:?}" phase="${3:-convergence}"
+  local deadline stable_since="" now vip holder complete
+  now="$(monotonic_ns)" || { report_vip_ownership_failure "$phase.clock"; return 1; }
+  deadline=$((now + budget * 1000000000))
+  while true; do
+    if ! snapshot_vips; then
+      report_vip_ownership_failure "$phase"
+      return 1
+    fi
+    complete=1
+    for vip in "${VIPS[@]}"; do
+      holder="$(holder_for_vip "$vip")"
+      case "$holder" in
+        duplicate:*) report_vip_ownership_failure "$phase"; return 1;;
+        none) complete=0;;
+      esac
+    done
+    now="$(monotonic_ns)" || { report_vip_ownership_failure "$phase.clock"; return 1; }
+    if (( now > deadline )); then
+      report_vip_ownership_failure "$phase.deadline"
+      return 1
+    fi
+    if (( complete )); then
+      [[ -n "$stable_since" ]] || stable_since="$now"
+      (( now - stable_since >= duration * 1000000000 )) && return 0
+    else
+      stable_since=""
+    fi
+    if (( now >= deadline )); then
+      report_vip_ownership_failure "$phase.deadline"
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 # During a release-acknowledged handoff, a brief ownerless interval is safe but a duplicate is
 # never safe. Use this only for transition windows; steady-state checks must still require one
 # holder through all_vips_uniquely_held/assert_unique_holders.
 no_vip_is_duplicate() {
   snapshot_vips || return 1
-  local vip
+  local vip holder
   for vip in "${VIPS[@]}"; do
-    [[ "$(holder_for_vip "${vip}")" != duplicate:* ]] || return 1
+    holder="$(holder_for_vip "${vip}")"
+    [[ "$holder" != duplicate:* ]] || {
+      evidence_failure vip-snapshot.duplicate cluster 1 "vip=$vip" "holders=${holder#duplicate:}"
+      return 1
+    }
   done
 }
 
@@ -1051,7 +1210,9 @@ sentinel_recover() { node_sh "${1:?}" "rm -f /run/keepafloatd-unhealthy"; }
 
 timed_node_command() {
   local ip="${1:?}" command="${2:?}" inst context boot invocation started extra
-  inst="$(instance_for_ip "${ip}")" || return 1
+  inst="$(instance_for_ip "${ip}")" || {
+    evidence_failure timed-command.instance "$ip" "$?"; return 1;
+  }
   context="$(node_sh "${ip}" "
     set -euo pipefail
     invocation=\$(systemctl show --property=InvocationID --value $(shell_quote "keepafloatd@${inst}"))
@@ -1062,11 +1223,15 @@ started = time.monotonic_ns() // 1000
 print(boot, sys.argv[1], started)' \"\$invocation\")
     bash -c $(shell_quote "${command}") >&2
     printf '%s\\n' \"\$context\"
-  ")" || return 1
-  read -r boot invocation started extra <<< "${context}" || return 1
+  ")" || { evidence_failure timed-command.read "$ip" "$?"; return 1; }
+  read -r boot invocation started extra <<< "${context}" || {
+    evidence_failure timed-command.context "$ip" "$?"; return 1;
+  }
   [[ "${boot}" =~ ^[a-f0-9]{32}$ && "${invocation}" =~ ^[a-f0-9]{32}$ &&
     "${started}" =~ ^[0-9]+$ && -z "${extra}" &&
-    "${context}" == "${boot} ${invocation} ${started}" ]] || return 1
+    "${context}" == "${boot} ${invocation} ${started}" ]] || {
+    evidence_failure timed-command.context "$ip" 1; return 1;
+  }
   printf '%s\n' "${context}"
 }
 

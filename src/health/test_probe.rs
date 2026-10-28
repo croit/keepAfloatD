@@ -7,7 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::unix::AsyncFd;
+use tokio::net::unix::pipe;
 use tokio::task::JoinHandle;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -15,7 +15,8 @@ const DEADLINE: Duration = Duration::from_secs(2);
 
 pub(super) struct Probe {
     path: PathBuf,
-    reader: AsyncFd<File>,
+    reader: pipe::Receiver,
+    witness: File,
     task: Option<JoinHandle<bool>>,
     group: Option<i32>,
 }
@@ -43,9 +44,12 @@ impl Probe {
             .custom_flags(libc::O_NONBLOCK)
             .open(&path)
             .unwrap();
+        // Reads go straight to the FIFO, as the liveness check must not answer from cached readiness.
+        let witness = reader.try_clone().unwrap();
         let mut probe = Self {
             path,
-            reader: AsyncFd::new(reader).unwrap(),
+            reader: pipe::Receiver::from_file(reader).unwrap(),
+            witness,
             task: None,
             group: None,
         };
@@ -91,18 +95,17 @@ impl Probe {
 
     fn try_read_byte(&self) -> io::Result<Option<u8>> {
         let mut byte = [0];
-        self.reader
-            .get_ref()
+        (&self.witness)
             .read(&mut byte)
             .map(|n| (n != 0).then_some(byte[0]))
     }
 
     async fn read_byte(&self) -> io::Result<Option<u8>> {
         loop {
-            let mut ready = self.reader.readable().await?;
-            match ready.try_io(|_| self.try_read_byte()) {
-                Ok(result) => return result,
-                Err(_) => continue,
+            self.reader.readable().await?;
+            match self.reader.try_io(|| self.try_read_byte()) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return result,
             }
         }
     }

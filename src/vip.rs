@@ -15,8 +15,9 @@
 //! -------------------
 //! [`run_reconcile_loop`] reads the committed fenced assignment state without holding the
 //! state-machine read guard across system commands. Binding requires the local node to be the
-//! committed holder *and* for the previous holder fence to be satisfied. Losing local health,
-//! losing consensus freshness, losing leader visibility or losing ownership all force an unbind.
+//! committed holder *and* for the previous holder fence to be satisfied. New effects require a
+//! leader and an acquisition permit. A completed binding may survive transport loss until its
+//! accepted proof expires; health loss, authority rejection and ownership changes revoke it.
 
 mod announce;
 mod command;
@@ -29,6 +30,7 @@ mod startup;
 pub(crate) mod takeover;
 #[cfg(test)]
 mod test_support;
+mod witness;
 
 pub(crate) use reconcile::RECONCILE_TICK;
 pub use reconcile::run_reconcile_loop;
@@ -112,7 +114,13 @@ pub struct LocalVip {
     #[cfg(test)]
     bind_starts: Mutex<HashMap<IpAddr, usize>>,
     #[cfg(test)]
+    bind_invocations: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
     next_announcement: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    #[cfg(test)]
+    next_unbind: Mutex<HashMap<IpAddr, tokio::sync::oneshot::Receiver<()>>>,
+    #[cfg(test)]
+    next_bind_result_hook: std::sync::Mutex<Option<test_support::BindResultHook>>,
     ownership_marker: ownership::OwnershipMarker,
     runner: Arc<dyn command::CommandRunner>,
     #[cfg(test)]
@@ -148,7 +156,13 @@ impl LocalVip {
             #[cfg(test)]
             bind_starts: Mutex::new(HashMap::new()),
             #[cfg(test)]
+            bind_invocations: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
             next_announcement: Mutex::new(None),
+            #[cfg(test)]
+            next_unbind: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            next_bind_result_hook: std::sync::Mutex::new(None),
             ownership_marker: ownership::OwnershipMarker::new(address_protocol, runner),
         })
     }
@@ -170,13 +184,41 @@ impl LocalVip {
     /// (link down/up, NetworkManager, `ip addr flush`, DHCP renew) instead of skipping it because
     /// the in-memory set still says we hold it. Gratuitous ARP fires only on a genuine first bind
     /// so re-assertion does not spam the segment.
+    #[cfg(test)]
     pub async fn bind(&self, iface: &str, ip: IpAddr, prefix: u8) -> anyhow::Result<()> {
+        let started = std::sync::atomic::AtomicBool::new(false);
+        if self
+            .bind_kernel(iface, ip, prefix, || async { true }, &started)
+            .await?
+            == Some(true)
+        {
+            self.announce(iface, ip).await;
+        }
+        Ok(())
+    }
+
+    async fn bind_kernel<F: std::future::Future<Output = bool> + Send>(
+        &self,
+        iface: &str,
+        ip: IpAddr,
+        prefix: u8,
+        authorized: impl Fn() -> F,
+        mutation_started: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Result<Option<bool>> {
+        if !authorized().await {
+            return Ok(None);
+        }
         #[cfg(test)]
         {
+            self.bind_invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.bind_starts.lock().await.entry(ip).or_default() += 1;
         }
         let was_pending = self.pending_first_bind.read().await.contains(&ip);
         let first_bind = was_pending || !self.bound.read().await.contains(&ip);
+        if !authorized().await {
+            return Ok(None);
+        }
         // Record ownership *before* the syscall so SIGTERM followed by vip_task.abort() still leaves
         // the address recorded for unbind_all to reclaim; otherwise
         // the child could finish attaching the address while the dropped future never inserted it,
@@ -185,6 +227,10 @@ impl LocalVip {
         if first_bind {
             self.pending_first_bind.write().await.insert(ip);
         }
+        if !authorized().await {
+            return Ok(None);
+        }
+        mutation_started.store(true, std::sync::atomic::Ordering::SeqCst);
         if self.dry_run {
             #[cfg(test)]
             {
@@ -198,11 +244,13 @@ impl LocalVip {
                 }
                 *self.bind_completions.lock().await.entry(ip).or_default() += 1;
             }
-            self.pending_first_bind.write().await.remove(&ip);
+            if !self.finish_bind(ip, first_bind, &authorized).await {
+                return Ok(None);
+            }
             if first_bind {
                 tracing::info!(target: "keepafloatd::vip", "dry-run: would bind {ip}/{prefix} on {iface}");
             }
-            return Ok(());
+            return Ok(Some(first_bind));
         }
         if let Err(error) = self.ownership_marker.replace(ip).await {
             if should_clear_tracking_after_bind_failure(first_bind) {
@@ -219,6 +267,9 @@ impl LocalVip {
             return Err(error);
         }
 
+        if !authorized().await {
+            return Ok(None);
+        }
         let mut address_command = Command::new("ip");
         address_command
             .args(bind_command_arguments(ip, prefix, iface))
@@ -247,12 +298,35 @@ impl LocalVip {
             // existing marker so a later crash still attributes and reclaims that address.
             return Err(bind_error);
         }
+        if !self.finish_bind(ip, first_bind, &authorized).await {
+            return Ok(None);
+        }
         if first_bind {
-            self.announce(iface, ip).await;
-            self.pending_first_bind.write().await.remove(&ip);
             tracing::info!(target: "keepafloatd::vip", "bound {ip}/{prefix} on {iface}");
         }
-        Ok(())
+        Ok(Some(first_bind))
+    }
+
+    async fn finish_bind<F: std::future::Future<Output = bool> + Send>(
+        &self,
+        ip: IpAddr,
+        first_bind: bool,
+        authorized: impl Fn() -> F,
+    ) -> bool {
+        loop {
+            if !authorized().await {
+                return false;
+            }
+            if !first_bind {
+                return true;
+            }
+            if let Ok(mut pending) = self.pending_first_bind.try_write() {
+                pending.remove(&ip);
+                return true;
+            }
+            // Revalidate after contention without holding tracking while awaiting applied state.
+            drop(self.pending_first_bind.write().await);
+        }
     }
 
     async fn is_confirmed_bound(&self, ip: IpAddr) -> bool {
@@ -261,6 +335,7 @@ impl LocalVip {
 
     /// Start an owned background neighbor announcement. Failure is logged but never changes
     /// ownership; unbind cancels the command before removing the address.
+    #[cfg(test)]
     async fn announce(&self, iface: &str, ip: IpAddr) {
         if self.dry_run {
             return;
@@ -278,10 +353,49 @@ impl LocalVip {
         self.announcements.send(iface, ip).await;
     }
 
+    async fn announce_authorized(
+        &self,
+        iface: &str,
+        ip: IpAddr,
+        effect: Arc<witness::RetainedEffect>,
+    ) {
+        if self.dry_run || !effect.check_live() {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(completed) = self.next_announcement.lock().await.take() {
+            self.announcements
+                .start(iface, ip, async move {
+                    effect
+                        .run(async {
+                            completed.await.map_err(std::io::Error::other)?;
+                            Ok(std::process::ExitStatus::from_raw(0))
+                        })
+                        .await
+                        .unwrap_or_else(|| {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "announcement permission revoked",
+                            ))
+                        })
+                })
+                .await;
+            return;
+        }
+        self.announcements.send_authorized(iface, ip, effect).await;
+    }
+
     /// Remove the address if it was previously added by this [`LocalVip`] instance on this host.
     /// `prefix` must match the prefix the address was bound with so the kernel del matches.
     pub async fn unbind(&self, iface: &str, ip: IpAddr, prefix: u8) -> anyhow::Result<()> {
         self.announcements.cancel(ip).await;
+        #[cfg(test)]
+        {
+            let pause = self.next_unbind.lock().await.remove(&ip);
+            if let Some(pause) = pause {
+                let _ = pause.await;
+            }
+        }
         if !self.bound.read().await.contains(&ip) {
             return Ok(());
         }
@@ -298,6 +412,7 @@ impl LocalVip {
                     .await
             })
             .await?;
+            tracing::info!(target: "keepafloatd::vip", "removed address {ip}/{prefix} on {iface}");
             self.ownership_marker.delete(ip).await?;
             tracing::info!(target: "keepafloatd::vip", "unbound {ip}/{prefix} on {iface}");
         }
@@ -418,6 +533,120 @@ pub(crate) const SHUTDOWN_VIP_BUDGET: std::time::Duration =
 
 #[cfg(test)]
 mod tests {
+    async fn isolated_address_removal_test(test_name: &str) -> bool {
+        if std::env::var("KEEPAFLOATD_VIP_REMOVAL_TEST").as_deref() == Ok(test_name) {
+            return false;
+        }
+        let child = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--nocapture", "--color=never"])
+                .env("KEEPAFLOATD_VIP_REMOVAL_TEST", test_name)
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("isolated address removal test timed out")
+        .unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains(&format!("test {test_name} ... ok"))
+        );
+        true
+    }
+
+    #[tokio::test]
+    async fn unbind_address_removal_is_logged_before_failed_marker_cleanup() {
+        if isolated_address_removal_test(
+            "vip::tests::unbind_address_removal_is_logged_before_failed_marker_cleanup",
+        )
+        .await
+        {
+            return;
+        }
+        for deleted in [true, false] {
+            for (address, prefix) in [("192.0.2.99", 32), ("2001:db8::99", 128)] {
+                let (logs, _guard) =
+                    crate::warning_limit::test_support::LogCapture::start("keepafloatd::vip=info");
+                let local = LocalVip::new(false);
+                let address: IpAddr = address.parse().unwrap();
+                local.bound.write().await.insert(address);
+                local
+                    .force_unbind_results(
+                        ("test0", address, prefix),
+                        vec![Ok(ExitStatus::from_raw(if deleted { 0 } else { 2 << 8 }))],
+                    )
+                    .await;
+                if !deleted {
+                    local
+                        .force_unbind_probe_results(
+                            address,
+                            vec![Ok(delete_probe_output(true, b""))],
+                        )
+                        .await;
+                }
+                local
+                    .force_marker_delete_results(
+                        address,
+                        vec![Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "marker deletion denied",
+                        ))],
+                    )
+                    .await;
+                assert!(local.unbind("test0", address, prefix).await.is_err());
+                let output = logs.text();
+                let removal = format!("removed address {address}/{prefix} on test0");
+                assert_eq!(output.matches(&removal).count(), 1, "{output}");
+                assert!(!output.contains("unbound "), "{output}");
+                assert_eq!(local.bound_addrs().await, vec![address]);
+                local.commands.assert_finished();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unbind_address_removal_is_not_logged_while_address_remains() {
+        if isolated_address_removal_test(
+            "vip::tests::unbind_address_removal_is_not_logged_while_address_remains",
+        )
+        .await
+        {
+            return;
+        }
+        for (address, prefix) in [("192.0.2.99", 32), ("2001:db8::99", 128)] {
+            let (logs, _guard) =
+                crate::warning_limit::test_support::LogCapture::start("keepafloatd::vip=info");
+            let local = LocalVip::new(false);
+            let address: IpAddr = address.parse().unwrap();
+            local.bound.write().await.insert(address);
+            local
+                .force_unbind_results(
+                    ("test0", address, prefix),
+                    vec![Ok(ExitStatus::from_raw(2 << 8))],
+                )
+                .await;
+            local
+                .force_unbind_probe_results(
+                    address,
+                    vec![Ok(delete_probe_output(true, b"address remains present"))],
+                )
+                .await;
+            assert!(local.unbind("test0", address, prefix).await.is_err());
+            let output = logs.text();
+            assert!(!output.contains("removed address "), "{output}");
+            assert!(!output.contains("unbound "), "{output}");
+            assert_eq!(local.bound_addrs().await, vec![address]);
+            local.commands.assert_finished();
+        }
+    }
+
     #[tokio::test]
     async fn command_characterization_retains_tracking_until_marker_absence() {
         for (address, prefix) in [("192.0.2.99", 24), ("2001:db8::99", 64)] {

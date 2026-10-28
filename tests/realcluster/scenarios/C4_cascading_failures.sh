@@ -8,7 +8,7 @@ source "$(dirname "$0")/../scenario.sh"
 scenario_start "rotating kill/restart keeps unique live service and reclaims every orphan"
 
 
-rounds=6
+rounds="${REALCLUSTER_CASCADING_ROUNDS}"
 not_served=0
 for r in $(seq 1 "${rounds}"); do
   idx=$(( (r - 1) % 3 ))
@@ -38,7 +38,8 @@ for r in $(seq 1 "${rounds}"); do
 done
 
 check "every VIP gained exactly one live holder across all ${rounds} rounds" test "${not_served}" -eq 0
-check "unique ownership remains stable at end" holds_for 5 all_vips_uniquely_held
+# Activation permits health publication; its resulting handoff can still be in flight.
+check "unique ownership remains stable at end" wait_for_unique_vips_stable 30 5 "cascading-final-round-${rounds}"
 check "all restarted daemons remain active at end" holds_for 5 all_daemons_active
 check "all VIPs remain reachable at end" all_vips_pingable
 check "single agreed leader at end" wait_until 30 single_agreed_leader

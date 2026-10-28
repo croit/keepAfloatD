@@ -2,6 +2,25 @@ use super::*;
 use openraft::async_runtime::WatchReceiver;
 use std::sync::atomic::Ordering;
 
+fn refresh_proof(freshness: &ConsensusFreshness, controls: &crate::raft::RaftControlTasks) {
+    static INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let runtime = controls.runtime();
+    let index = INDEX.fetch_add(1, Ordering::SeqCst);
+    let log_id = openraft::testing::log_id::<crate::raft::types::TypeConfig>(
+        1,
+        runtime.local_replica(),
+        index,
+    );
+    let progress = crate::raft::admission::runtime::VerifiedProgress::for_test(
+        &runtime,
+        tokio::time::Instant::now(),
+        log_id,
+        Some(true),
+    )
+    .unwrap();
+    freshness.record_applied(progress).unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn failed_bind_closes_the_local_health_gate() {
     for failure in ["exit", "spawn", "timeout", "marker", "reassert"] {
@@ -9,9 +28,29 @@ async fn failed_bind_closes_the_local_health_gate() {
     }
 }
 
-async fn assert_bind_fault(failure: &str) {
+#[tokio::test(start_paused = true)]
+async fn failed_bind_logs_preserve_nested_io_error() {
+    for failure in ["spawn", "timeout"] {
+        let output = assert_bind_fault(failure).await;
+        let line = output
+            .lines()
+            .find(|line| line.contains("VIP bind failed; node remains unhealthy until restart"))
+            .expect("bind fault must emit its diagnostic");
+        assert!(line.contains("address=192.0.2.99"), "{failure}: {line}");
+        assert!(
+            line.contains("operation=address_replace"),
+            "{failure}: {line}"
+        );
+        assert!(line.contains("bind unavailable"), "{failure}: {line}");
+    }
+}
+
+async fn assert_bind_fault(failure: &str) -> String {
     use std::os::unix::process::ExitStatusExt;
     let _lock = LOCK.lock().await;
+    let (logs, _guard) = crate::warning_limit::test_support::LogCapture::start(
+        "keepafloatd::vip::reconcile::worker=error",
+    );
     let (cfg, raft, network, state, mut controls) = cluster().await;
     let table = Arc::new(cfg.sorted_vips());
     let addr = table[0].0.addr;
@@ -28,10 +67,6 @@ async fn assert_bind_fault(failure: &str) {
                 Ok(std::process::ExitStatus::from_raw(0)),
             )
             .await;
-        local
-            .bind(&table[0].1, addr, table[0].0.prefix)
-            .await
-            .unwrap();
         local
             .force_unbind_results(
                 (&table[0].1, addr, table[0].0.prefix),
@@ -61,6 +96,7 @@ async fn assert_bind_fault(failure: &str) {
                 )
                 .await;
         }
+        "reassert" => (),
         _ => {
             local
                 .force_next_bind_result(
@@ -72,7 +108,7 @@ async fn assert_bind_fault(failure: &str) {
     }
     let healthy = Arc::new(LocalHealth::new(true));
     let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     let mut reconcile = Box::pin(run_reconcile_loop(
         cfg,
         raft.clone(),
@@ -83,6 +119,20 @@ async fn assert_bind_fault(failure: &str) {
         freshness,
         1,
     ));
+    if failure == "reassert" {
+        assert!(futures::poll!(reconcile.as_mut()).is_pending());
+        assert!(
+            local.is_confirmed_bound(addr).await,
+            "reassert fixture must first complete an admitted binding"
+        );
+        local
+            .force_next_bind_result(
+                (&bound_iface, addr, bound_vip.prefix),
+                Ok(std::process::ExitStatus::from_raw(1 << 8)),
+            )
+            .await;
+        tokio::time::advance(RECONCILE_TICK).await;
+    }
     tokio::time::timeout(std::time::Duration::from_millis(100), async {
         loop {
             assert!(futures::poll!(reconcile.as_mut()).is_pending());
@@ -105,6 +155,7 @@ async fn assert_bind_fault(failure: &str) {
         faulted,
         "{failure}: failed VIP binding must make the holder unhealthy"
     );
+    logs.text()
 }
 
 #[tokio::test(start_paused = true)]
@@ -143,7 +194,7 @@ async fn failed_selective_cleanup_stays_tracked_until_global_fencing_retries_it(
         .force_marker_delete_results(addr, vec![Ok(std::process::ExitStatus::from_raw(0))])
         .await;
     let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     let mut reconcile = Box::pin(run_reconcile_loop(
         cfg,
         raft.clone(),
@@ -169,7 +220,7 @@ async fn failed_selective_cleanup_stays_tracked_until_global_fencing_retries_it(
         .get_mut(&addr)
         .unwrap()
         .holder = 2;
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     assert!(futures::poll!(reconcile.as_mut()).is_pending());
     assert_eq!(local.remaining_forced_unbind_results().await, 1);
     assert!(
@@ -215,7 +266,7 @@ async fn global_fencing_still_cleans_every_vip_after_selective_revocation() {
         let tail = table[1].0.addr;
         let local = LocalVip::new(true);
         let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
-        freshness.record_success(tokio::time::Instant::now());
+        refresh_proof(&freshness, &controls);
         let healthy = Arc::new(LocalHealth::new(true));
         let mut reconcile = Box::pin(run_reconcile_loop(
             cfg,
@@ -243,7 +294,7 @@ async fn global_fencing_still_cleans_every_vip_after_selective_revocation() {
             .get_mut(&tail)
             .unwrap()
             .holder = 2;
-        freshness.record_success(tokio::time::Instant::now());
+        refresh_proof(&freshness, &controls);
         assert!(futures::poll!(reconcile.as_mut()).is_pending());
         assert_eq!(local.bound_addrs().await, [first]);
 
@@ -254,12 +305,12 @@ async fn global_fencing_still_cleans_every_vip_after_selective_revocation() {
             "unhealthy" => {
                 healthy.observe_probe(false);
                 tokio::time::advance(std::time::Duration::from_nanos(1)).await;
-                freshness.record_success(tokio::time::Instant::now());
+                refresh_proof(&freshness, &controls);
             }
             _ => {
                 freshness.invalidate();
                 if fence == "coalesced" {
-                    freshness.record_success(tokio::time::Instant::now());
+                    refresh_proof(&freshness, &controls);
                 }
             }
         }
@@ -305,7 +356,7 @@ async fn new_revocations_during_cleanup_are_not_lost() {
     let tail = table[2].0.addr;
     let local = LocalVip::new(true);
     let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     let mut reconcile = Box::pin(run_reconcile_loop(
         cfg,
         raft.clone(),
@@ -333,7 +384,7 @@ async fn new_revocations_during_cleanup_are_not_lost() {
         .get_mut(&tail)
         .unwrap()
         .holder = 2;
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     assert!(futures::poll!(reconcile.as_mut()).is_pending());
     state
         .write()
@@ -343,7 +394,7 @@ async fn new_revocations_during_cleanup_are_not_lost() {
         .unwrap()
         .holder = 2;
     tokio::time::advance(std::time::Duration::from_nanos(1)).await;
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     assert!(futures::poll!(reconcile.as_mut()).is_pending());
     drop(block_cleanup);
     assert!(futures::poll!(reconcile.as_mut()).is_pending());
@@ -416,8 +467,27 @@ async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
         .await;
     // Pause the first address result after bound/pending tracking and marker installation.
     let first_result = local.pause_bind_result((&table[0].1, first, table[0].0.prefix));
+    let second = table[1].0.addr;
+    local
+        .force_next_bind_result(
+            (&table[1].1, second, table[1].0.prefix),
+            Ok(std::process::ExitStatus::from_raw(0)),
+        )
+        .await;
+    let second_result = local.pause_bind_result((&table[1].1, second, table[1].0.prefix));
+    local
+        .force_unbind_results(
+            (&table[1].1, second, table[1].0.prefix),
+            vec![Ok(std::process::ExitStatus::from_raw(0))],
+        )
+        .await;
+    local
+        .force_marker_delete_results(second, vec![Ok(std::process::ExitStatus::from_raw(0))])
+        .await;
+    let (finish_cleanup, cleanup) = tokio::sync::oneshot::channel();
+    local.next_unbind.lock().await.insert(first, cleanup);
     let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     let mut reconcile = Box::pin(run_reconcile_loop(
         cfg,
         raft.clone(),
@@ -439,8 +509,11 @@ async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
     })
     .await
     .unwrap();
-    // The next VIP can begin its captured operation, but cannot finish while this gate is held.
-    let next_operation = local.bind_starts.lock().await;
+    assert_eq!(
+        local.bind_attempts(second).await,
+        1,
+        "the second VIP must independently enter its pending bind"
+    );
     drop(first_result);
     assert!(futures::poll!(reconcile.as_mut()).is_pending());
     assert!(
@@ -459,12 +532,13 @@ async fn failed_ambiguous_bind_remains_fenced_after_advancing_to_another_vip() {
         .get_mut(&first)
         .unwrap()
         .holder = 2;
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
+    drop(finish_cleanup);
     assert!(futures::poll!(reconcile.as_mut()).is_pending());
     let cleaned = !local.bound_addrs().await.contains(&first)
         && !local.pending_first_bind.read().await.contains(&first);
     drop(reconcile);
-    drop(next_operation);
+    drop(second_result);
     controls.shutdown().await.unwrap();
     network.shutdown().await.unwrap();
     raft.shutdown().await.unwrap();
@@ -507,7 +581,7 @@ async fn revoked_retained_tail_is_cleaned_during_an_unchanged_slow_prefix_effect
     }
     let local = LocalVip::new(true);
     let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_secs(1)));
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     let task = tokio::spawn(run_reconcile_loop(
         cfg,
         raft.clone(),
@@ -557,7 +631,7 @@ async fn revoked_retained_tail_is_cleaned_during_an_unchanged_slow_prefix_effect
         .get_mut(&tail)
         .unwrap()
         .holder = 2;
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     let tail_cleaned = tokio::time::timeout(std::time::Duration::from_millis(100), async {
         while local.bound_addrs().await.contains(&tail) {
             tokio::time::advance(std::time::Duration::from_millis(1)).await;
@@ -615,7 +689,7 @@ async fn revoked_in_flight_bind_is_cleaned_before_advancing_to_another_vip() {
     let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_millis(
         500,
     )));
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     let task = tokio::spawn(run_reconcile_loop(
         cfg,
         raft.clone(),
@@ -640,7 +714,7 @@ async fn revoked_in_flight_bind_is_cleaned_before_advancing_to_another_vip() {
         .get_mut(&first)
         .unwrap()
         .holder = 2;
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     let first_cleaned = !local.bound_addrs().await.contains(&first);
     let completed = local
@@ -705,7 +779,7 @@ async fn stable_renewals_preserve_slow_effects_and_reach_every_vip() {
         let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_millis(
             500,
         )));
-        freshness.record_success(tokio::time::Instant::now());
+        refresh_proof(&freshness, &controls);
         let task = tokio::spawn(run_reconcile_loop(
             cfg,
             raft.clone(),
@@ -718,7 +792,7 @@ async fn stable_renewals_preserve_slow_effects_and_reach_every_vip() {
         ));
         for _ in 0..12 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            freshness.record_success(tokio::time::Instant::now());
+            refresh_proof(&freshness, &controls);
         }
         let completions = local.bind_completions.lock().await.clone();
         let all_reasserted = table
@@ -734,7 +808,7 @@ async fn stable_renewals_preserve_slow_effects_and_reach_every_vip() {
             .holder = 2;
         for _ in 0..8 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            freshness.record_success(tokio::time::Instant::now());
+            refresh_proof(&freshness, &controls);
         }
         let tail_released = !local.bound_addrs().await.contains(&last);
         task.abort();
@@ -753,7 +827,7 @@ async fn stable_renewals_preserve_slow_effects_and_reach_every_vip() {
     }
 }
 
-fn cluster_config() -> Arc<Config> {
+pub(super) fn cluster_config() -> Arc<Config> {
     // This single-node fixture has no remote peers or submit server, so no caller needs its port.
     let cfg: Config = serde_yaml::from_str(
         "node_id: 1\nraft_listen: '127.0.0.1:0'\nclient_submit_listen: '127.0.0.1:0'\n\
@@ -766,7 +840,7 @@ fn cluster_config() -> Arc<Config> {
     Arc::new(cfg)
 }
 
-async fn cluster() -> (
+pub(super) async fn cluster() -> (
     Arc<Config>,
     KafRaft,
     Arc<crate::raft::RaftNetworkImpl>,
@@ -800,7 +874,7 @@ async fn publish_probe(
     }
 }
 
-async fn cluster_from_config(
+pub(super) async fn cluster_from_config(
     cfg: Arc<Config>,
 ) -> (
     Arc<Config>,
@@ -930,7 +1004,7 @@ async fn same_holder_recovery_cleans_up_acknowledges_and_rebinds() {
     let local = LocalVip::new(true);
     local.bind("lo", vip, 32).await.unwrap();
     let freshness = Arc::new(ConsensusFreshness::for_probe_cadence(1_000, 1));
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     let task = tokio::spawn(run_reconcile_loop(
         cfg.clone(),
         raft.clone(),
@@ -1045,7 +1119,7 @@ async fn repeated_proof_renewals_do_not_restart_the_pending_takeover_delay() {
     let freshness = Arc::new(ConsensusFreshness::new(std::time::Duration::from_millis(
         300,
     )));
-    freshness.record_success(tokio::time::Instant::now());
+    refresh_proof(&freshness, &controls);
     let deadline = tokio::time::Instant::now()
         + takeover_lifetime(freshness.lifetime(), cfg.sorted_vips().len())
         + RECONCILE_TICK * 2;
@@ -1061,7 +1135,7 @@ async fn repeated_proof_renewals_do_not_restart_the_pending_takeover_delay() {
     ));
     let mut acquired = false;
     while tokio::time::Instant::now() < deadline {
-        freshness.record_success(tokio::time::Instant::now());
+        refresh_proof(&freshness, &controls);
         assert!(futures::poll!(reconcile.as_mut()).is_pending());
         acquired |= local.bound_addrs().await.contains(&vip);
         tokio::time::advance(std::time::Duration::from_millis(80)).await;

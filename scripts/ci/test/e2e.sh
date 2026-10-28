@@ -6,7 +6,13 @@ export KEEPAFLOATD_IMAGE="${KEEPAFLOATD_IMAGE:-${IMAGE_TAG:?IMAGE_TAG is require
 bash ./tests/e2e/scripts/address-commands-test.sh
 bash ./tests/e2e/scripts/resource-evidence-test.sh
 bash ./tests/e2e/scripts/log-checkpoint-test.sh
-bash ./tests/e2e/scripts/scenario-runner-test.sh
+E2E_OBSERVE_COMMANDS=0 bash ./tests/e2e/scripts/scenario-runner-test.sh
+bash ./tests/e2e/scripts/command-observer-test.sh
+
+# Observe the failing shard without changing daemon deadlines or scenario checks.
+if [ "${E2E_SUITE:-all}" = core ] && [ "${E2E_SHARD_INDEX:-}" = 8 ]; then
+  export E2E_OBSERVE_COMMANDS=1
+fi
 
 # Separate jobs keep cold-start safety pauses within the runner's job budget.
 case "${E2E_SUITE:-all}" in

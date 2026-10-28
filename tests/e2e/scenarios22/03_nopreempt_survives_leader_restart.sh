@@ -58,6 +58,7 @@ restarted_effects_ready() {
 assert_nopreempt_after_restart() {
   local service="${1:?service required}" previous_boot="${2:?previous boot required}"
   local incumbent="${3:?incumbent required}" budget deadline observation_deadline now
+  local checkpoint="${4:?pre-restart log checkpoint required}"
   local restart_seen_boot='' restart_admitted_at=''
   budget="$(startup_budget_seconds 30 "${service}")" || return 1
   deadline=$(($(restart_observation_now) + budget))
@@ -84,6 +85,7 @@ assert_nopreempt_after_restart() {
     ((now < observation_deadline)) || break
     sleep 0.2
   done
+  assert_vip_continuity_after "${checkpoint}" "${incumbent}" "${VIP}"
 }
 
 # Make the first holder nopreempt. Restarting that diskless node must restore the replicated policy
@@ -97,6 +99,7 @@ wait_until 15 vip_moved_from "${VIP}" "${original}" || {
 set_node_healthy "${original}"
 replacement="$(holder_for_vip "${VIP}")"
 
+original_restart_checkpoint="$(log_checkpoint)"
 kill_service "${original}" KILL
 wait_for_service_exit "${original}" 10
 wait_until 20 vip_held_by "${VIP}" "${replacement}" || {
@@ -107,7 +110,8 @@ wait_until 20 vip_held_by "${VIP}" "${replacement}" || {
 original_boot="$(node_boot_replica "${original}")"
 start_service "${original}"
 wait_for_service_running "${original}" 10
-assert_nopreempt_after_restart "${original}" "${original_boot}" "${replacement}" || {
+assert_nopreempt_after_restart "${original}" "${original_boot}" "${replacement}" \
+  "${original_restart_checkpoint}" || {
   dump_cluster_diagnostics
   exit 1
 }
@@ -156,9 +160,11 @@ survivor="$(holder_for_vip "${VIP}")"
 log "VIP survivor is ${survivor} after $((SECONDS - handoff_started))s"
 
 leader_boot="$(node_boot_replica "${old_leader_svc}")"
+leader_restart_checkpoint="$(log_checkpoint)"
 start_service "${old_leader_svc}"
 wait_for_service_running "${old_leader_svc}" 10
-assert_nopreempt_after_restart "${old_leader_svc}" "${leader_boot}" "${survivor}" || {
+assert_nopreempt_after_restart "${old_leader_svc}" "${leader_boot}" "${survivor}" \
+  "${leader_restart_checkpoint}" || {
   dump_cluster_diagnostics
   exit 1
 }

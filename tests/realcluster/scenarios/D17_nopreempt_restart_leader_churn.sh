@@ -114,7 +114,8 @@ kafd_kill "${old_leader_ip}"
 survivors_agree_on_new_leader() {
   local ip leader agreed=""
   for ip in $(nodes_except "${old_leader_ip}"); do
-    leader="$(leader_seen_by_since "${ip}" "${fault_since}")"
+    leader="$(leader_seen_by_since "${ip}" "${fault_since}")" || return 1
+    [[ "$leader" != none ]] || return 1
     replica_is_configured "$leader" || return 1
     [[ "$leader" != "$old_leader_replica" && "$(replica_physical_id "$leader")" != "$old_leader_id" ]] || return 1
     [[ -z "${agreed}" || "${agreed}" == "${leader}" ]] || return 1

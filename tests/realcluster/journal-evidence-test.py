@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import unittest
@@ -33,9 +34,10 @@ def vip_event(action, vip=VIP, iface=IFACE):
     return f"INFO keepafloatd::vip: {action} {vip}/32 on {iface}"
 
 
-def cycle(index, stamp):
+def cycle(index, stamp, legacy=False):
+    snapshot_id = f"snapshot_id: snapshot-T1-N{REPLICA}.{index}, " if legacy else ""
     return [record("INFO openraft::core::raft_core: sm::StateMachine command done: "
-                   f"BuildSnapshotDone: {{snapshot_id: snapshot-T1-N{REPLICA}.{index}, "
+                   f"BuildSnapshotDone: {{{snapshot_id}"
                    f"last_log:T1-N{REPLICA}.{index}, last_membership: {{}}}}", stamp),
             record("INFO openraft::engine::handler::log_handler: purge log, "
                    f"last_purged: None, purge_upto: T1-N{REPLICA}.{index-1000}", stamp+1)]
@@ -126,6 +128,60 @@ class EvidenceTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.check('activation', [policy, bad], '999999999', '1')
 
+    def test_leader_cli_distinguishes_pending_from_invalid_transition(self):
+        for raw, status, output in [('', 2, ''), ('INFO election started\n', 2, ''),
+                                    ('raft current leader is now None\n', 0, 'none\n'),
+                                    ('raft current leader is now Some(1)\n', 1, '')]:
+            with self.subTest(raw=raw):
+                result = subprocess.run(
+                    [sys.executable, '-B', spec.origin, 'leader-text'],
+                    input=raw, text=True, capture_output=True, timeout=2, check=False,
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(result.stdout, output)
+                if status == 1:
+                    self.assertIn('invalid scenario evidence', result.stderr)
+                else:
+                    self.assertEqual(result.stderr, '')
+
+    def test_election_poll_rejects_pending_and_failed_reads(self):
+        for scenario in ['D6_leader_kill', 'D17_nopreempt_restart_leader_churn']:
+            source = Path(__file__).with_name('scenarios').joinpath(scenario + '.sh').read_text()
+            poll = re.search(r'(?ms)^survivors_agree_on_new_leader\(\) \{.*?^\}', source).group()
+            for mode in ['pending', 'transport', 'none', 'good']:
+                with self.subTest(scenario=scenario, mode=mode):
+                    body = '''
+set -u
+old_leader_replica=old
+old_leader_id=1
+old_leader_ip=old-node
+leader_ip=old-node
+fault_since=now
+nodes_except() { printf 'node-a\\nnode-b\\n'; }
+leader_seen_by_since() {
+  case "$mode" in
+    pending) return 2;;
+    transport) printf 'new-replica\\n'; return 255;;
+    none) printf 'none\\n';;
+    good) printf 'new-replica\\n';;
+  esac
+}
+replica_is_configured() {
+  if [[ "$1" == new-replica ]]; then return 0; fi
+  printf 'unexpected identity validation\\n' >&2
+  return 1
+}
+replica_physical_id() { printf '2\\n'; }
+'''
+                    result = subprocess.run(
+                        ['bash', '-c', 'mode="$1"\n' + body + '\n' + poll
+                         + '\nif survivors_agree_on_new_leader; then exit 0; else exit 1; fi',
+                         'election-poll-fixture', mode],
+                        text=True, capture_output=True, timeout=2, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0 if mode == 'good' else 1, result.stderr)
+                    self.assertEqual(result.stderr, '')
+
     def test_pending_cli_is_distinct_from_invalid_journal(self):
         policy = record('INFO keepafloatd::raft: runtime admission timing quarantine_ms=13000 vip_activation_ms=79000 startup_safety_wait_ms=92000')
         for raw, expected in [('', 2), ('{', 1), (json.dumps(policy), 0),
@@ -213,6 +269,21 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(self.check("snapshots", rows), 0)
         rows = cycle(4999, 200) + cycle(4999, 300)
         self.assertEqual(self.check("snapshots", rows), 1)
+
+    def test_snapshot_cycles_accept_legacy_metadata_and_deduplicate_log_ids(self):
+        rows = cycle(4999, 200, legacy=True) + cycle(9999, 300, legacy=True)
+        self.assertEqual(self.check("snapshots", rows), 2)
+        rows = cycle(4999, 200, legacy=True) + cycle(4999, 300) + cycle(9999, 400)
+        self.assertEqual(self.check("snapshots", rows), 2)
+
+    def test_deferred_or_empty_snapshot_is_not_a_completed_cycle(self):
+        for metadata in ["None", "{last_log:None, last_membership: {}}"]:
+            rows = cycle(4999, 200)
+            rows[0]["MESSAGE"] = (
+                "INFO openraft::core::raft_core: sm::StateMachine command done: "
+                f"BuildSnapshotDone: {metadata}: worker")
+            with self.subTest(metadata=metadata):
+                self.assertEqual(self.check("snapshots", rows), 0)
 
     def test_snapshot_window_may_start_before_the_first_event(self):
         self.assertEqual(self.check("snapshots", []), 0)

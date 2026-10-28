@@ -210,6 +210,53 @@ message="$(wait_for_log_any_after "${checkpoint}" 0 'expected event' 2>&1)" || s
 }
 printf 'PASS exhausted wait retains its failure and diagnostic\n'
 
+reset_fixture
+checkpoint="$(log_checkpoint)"
+expect 0 'unchanged complete logs prove continuity' \
+  assert_vip_continuity_after "${checkpoint}" alpha '192.0.2.1'
+expect 1 'no new log lines cannot match an empty-line regex' \
+  cluster_logs_contain_after "${checkpoint}" '^$'
+
+alpha_log+=$'\n2000-01-01T00:00:01.000000001Z unbound 192.0.2.1/32 on eth0\n2000-01-01T00:00:01.000000002Z bound 192.0.2.1/32 on eth0'
+expect 1 'a transient delete and rebind is not continuity' \
+  assert_vip_continuity_after "${checkpoint}" alpha '192.0.2.1'
+
+reset_fixture
+checkpoint="$(log_checkpoint)"
+alpha_log+=$'\n2000-01-01T00:00:01.000000001Z removed address 192.0.2.1/32 on eth0'
+expect 1 'removal before marker cleanup is visible' \
+  assert_vip_continuity_after "${checkpoint}" alpha '192.0.2.1'
+
+reset_fixture
+checkpoint="$(log_checkpoint)"
+alpha_log+=$'\n2000-01-01T00:00:01.000000001Z bound 192.0.2.10/32 on eth0'
+beta_log+=$'\n2000-01-01T00:00:01.000000002Z unbound 192.0.2.1/32 on eth0'
+expect 0 'another address or holder does not match the survivor' \
+  assert_vip_continuity_after "${checkpoint}" alpha '192.0.2.1'
+expect 1 'service labels do not become positive event matches' \
+  cluster_logs_contain_after "${checkpoint}" '^alpha'
+
+broken_service=beta
+expect 1 'partial logs cannot prove continuity even without events' \
+  assert_vip_continuity_after "${checkpoint}" alpha '192.0.2.1'
+
+reset_fixture
+checkpoint="$(log_checkpoint)"
+alpha_id=a2
+expect 1 'replacement cannot prove continuity' \
+  assert_vip_continuity_after "${checkpoint}" alpha '192.0.2.1'
+
+reset_fixture
+checkpoint="$(log_checkpoint)"
+alpha_log=''
+expect 1 'rotation cannot prove continuity' \
+  assert_vip_continuity_after "${checkpoint}" alpha '192.0.2.1'
+
+reset_fixture
+checkpoint="$(log_checkpoint)"
+expect 1 'unknown survivor cannot prove continuity' \
+  assert_vip_continuity_after "${checkpoint}" gamma '192.0.2.1'
+
 if [[ -n "$(ls -A "${scratch}")" ]]; then
   printf 'FAIL checkpoint helpers leaked temporary files\n' >&2
   exit 1

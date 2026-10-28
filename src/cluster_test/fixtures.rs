@@ -45,6 +45,39 @@ pub(super) fn startup_budget(cfg: &Config) -> Duration {
     timing.startup_vip_delay().unwrap() + timing.consumer_use() * 2
 }
 
+pub(super) async fn isolated_test(test_name: &str) -> bool {
+    if std::env::var("KEEPAFLOATD_ISOLATED_TEST").as_deref() == Ok(test_name) {
+        tokio::time::pause();
+        return false;
+    }
+
+    // Other tests' forked children can retain our listeners until exec closes their copies.
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture", "--color=never"])
+            .env("KEEPAFLOATD_ISOLATED_TEST", test_name)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+            .wait_with_output(),
+    )
+    .await
+    .expect("isolated cluster test timed out")
+    .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{test_name}: {stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!("test {test_name} ... ok")),
+        "child did not run {test_name}: {stdout}\n{stderr}"
+    );
+    true
+}
+
 #[tokio::test(start_paused = true)]
 async fn virtual_wait_checks_the_deadline_boundary_and_bounds_failure() {
     let start = tokio::time::Instant::now();
@@ -216,12 +249,25 @@ async fn stopped_node_listener_is_not_stolen_by_another_nodes_outbound_port() {
         .unwrap();
     let client = outbound.connect(peer.local_addr().unwrap()).await.unwrap();
     let (accepted, _) = peer.accept().await.unwrap();
-    let restarted = ListenerSource::Configured
-        .bind(stopped)
-        .await
-        .expect("another node's outgoing port must not occupy the stopped listener");
+    // A concurrent spawn can retain the closed listener until its child execs or exits.
+    let restarted = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match ListenerSource::Configured.bind(stopped).await {
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .expect("another node's outgoing port must not occupy the stopped listener")
+    .expect("reopen the released listener");
     assert_eq!(restarted.local_addr().unwrap(), stopped);
-    assert_eq!(client.local_addr().unwrap().port(), stopped.port());
+    assert_eq!(
+        client.local_addr().unwrap(),
+        SocketAddr::new(running.ip(), stopped.port()),
+    );
     assert_eq!(accepted.peer_addr().unwrap(), client.local_addr().unwrap());
 }
 

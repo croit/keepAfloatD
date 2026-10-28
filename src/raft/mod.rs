@@ -87,17 +87,39 @@ pub async fn start_raft(
     cfg: Arc<Config>,
     vip_list: Arc<Vec<(VipAddr, String)>>,
     listener: crate::listener::ListenerSource,
-) -> anyhow::Result<(
+) -> anyhow::Result<StartedRaft> {
+    let raft_cfg = Arc::new(build_openraft_config(&cfg)?);
+    let timing = crate::runtime_permission::LeaseTiming::for_config(&cfg, cfg.vips.len())?;
+    start_raft_runtime(cfg, vip_list, listener, raft_cfg, timing).await
+}
+
+pub type StartedRaft = (
     KafRaft,
     Arc<RaftNetworkImpl>,
     Arc<tokio::sync::RwLock<KafStorageState>>,
     mpsc::UnboundedReceiver<FatalReason>,
     mpsc::UnboundedReceiver<String>,
     RaftControlTasks,
-)> {
-    let raft_cfg = build_openraft_config(&cfg)?;
-    let raft_cfg = Arc::new(raft_cfg);
+);
 
+#[cfg(test)]
+pub(crate) async fn start_raft_for_test(
+    cfg: Arc<Config>,
+    vip_list: Arc<Vec<(VipAddr, String)>>,
+    listener: crate::listener::ListenerSource,
+    timing: crate::runtime_permission::LeaseTiming,
+) -> anyhow::Result<StartedRaft> {
+    let raft_cfg = Arc::new(build_openraft_config(&cfg)?);
+    start_raft_runtime(cfg, vip_list, listener, raft_cfg, timing).await
+}
+
+async fn start_raft_runtime(
+    cfg: Arc<Config>,
+    vip_list: Arc<Vec<(VipAddr, String)>>,
+    listener: crate::listener::ListenerSource,
+    raft_cfg: Arc<openraft::Config>,
+    timing: crate::runtime_permission::LeaseTiming,
+) -> anyhow::Result<StartedRaft> {
     // openraft 0.10 takes the log-storage and state-machine halves as two separate values (no
     // `Adaptor`). Both share one volatile in-memory state; `state_ref` is the third handle used by
     // the transport (epoch fencing) and the VIP reconciliation loop.
@@ -107,7 +129,6 @@ pub async fn start_raft(
         cfg.failback,
         cfg.effective_failback_delay_ticks(),
     );
-    let timing = crate::runtime_permission::LeaseTiming::for_config(&cfg, cfg.vips.len())?;
     tracing::info!(
         quarantine_ms = timing.restart_quarantine().as_millis(),
         vip_activation_ms = (timing.startup_vip_delay()? - timing.restart_quarantine()).as_millis(),

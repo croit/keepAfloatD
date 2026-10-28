@@ -117,12 +117,18 @@ Four independent mechanisms force this node off a VIP:
   Release still requires proven address and marker cleanup. The fault stays
   active even when service probes succeed: repair the interface, permissions
   or other reported cause, then restart the daemon to re-enter placement.
-- **Consensus freshness is lost:** if a health or release submit cannot be committed, the local
-  `consensus_fresh` gate flips to `false` immediately. This node will unbind all VIPs even if it
-  still has a stale local idea of the leader.
-  A negative health-submit acknowledgement, such as a rejection during
-  leader election, does not turn the service probe into an unhealthy
-  report. Local fencing still applies; the next probe retries the submit.
+- **Verified authority is lost:** an expired health proof, explicit
+  rejection or revoked runtime admission withdraws local VIPs.
+  A transport interruption or temporarily missing leader stops new
+  acquisitions, but does not immediately remove an already completed,
+  healthy binding. That exact binding may remain only until the earlier
+  of its original health-proof deadline and the admission deadline
+  accepted with that proof. Failed requests, admission-only renewals and
+  successful local probes do not extend that deadline. Retention does
+  not permit address reassertion or completion of an in-flight bind.
+  Recovery after expiry requires a new verified acquisition; a late
+  reply cannot revive the old permission. Failed publication does not
+  turn a successful service probe into an unhealthy report.
 - **Ownership changes:** while the previous holder keeps publishing fresh probes, the replacement
   waits for its committed `VipReleased` acknowledgement before binding, including when those probes
   explicitly report `healthy: false`. A nonzero kernel delete is accepted only when an exact-host
@@ -166,13 +172,15 @@ and the interface-wide DAD settings are unchanged.
 If a holder dies or is partitioned before it can publish `healthy: false`, survivors keep
 committing probe rounds while that node's committed round stops advancing. Once the lag exceeds the
 configured stale window, the old holder is removed from eligibility and the VIP is reassigned.
-Because the isolated node also loses `consensus_fresh` as soon as submits fail, it self-fences and
-releases the VIP instead of keeping a stale bind alive indefinitely. Consensus proof also
+The isolated node stops acquiring or reasserting addresses when submits become
+unavailable. Its completed bindings remain bounded by their existing proof, never
+by continued local probe success. Consensus proof
 expires after the effective probe-staleness window plus half an activation-holdoff
 round even if the next health check or release request is blocked. That bounded margin
 allows normal probe-renewal jitter when the stale window equals one probe interval;
 expiry cancels reconciliation work and withdraws local VIPs while leaving the daemon
-running. A new successful health submit permits reconciliation again. Release acknowledgements
+running if runtime admission remains valid. A new verified healthy submit permits
+fresh acquisition, but cannot revive an expired binding witness. Release acknowledgements
 do not extend this health proof. The proof is timed from request start, so a delayed
 acknowledgement cannot extend it (#26).
 
@@ -303,16 +311,14 @@ the export manifest, and its self-test proves that removing any source entry fai
 `cargo test` does not spin up multiple real processes on real interfaces, but the core ownership,
 handoff and exclusivity rules are exercised directly in unit tests.
 
-For CI smoke coverage, the repository also ships a dry-run multi-node harness:
-
-```bash
-cargo build --release
-bash scripts/ci/e2e-dry-run.sh
-```
-
-It starts three local daemon processes with temporary configs, validates deterministic VIP
-distribution, forces a health-driven rebalance, and verifies graceful `SIGTERM` takeover without
-touching real host addresses.
+The legacy local helper `scripts/ci/e2e-dry-run.sh` is not compatible
+with this release. It generates the removed `bootstrap` setting and a
+secret shorter than the current minimum, so its daemons fail configuration
+validation. It is retained for future repair, not as supported smoke
+coverage or evidence of a successful test run. Use the Docker Compose
+suite below for multi-process failover tests. Its isolated bridge uses
+real kernel VIP operations inside disposable containers, not dry-run
+simulation on the host.
 
 ## Running E2E tests
 
@@ -349,7 +355,7 @@ The E2E fixtures live under `tests/e2e/`:
 - `configs22/` contains the isolated one-VIP timing/nopreempt configuration
 - `configs26/` contains one deliberately mismatched node for config-identity fencing
 - `scripts/health.sh` is the toggleable local probe used to flip one node unhealthy
-- `scenarios/` contains the 24 failover and hardening scenarios (steady state, holder death,
+- `scenarios/` contains the 26 failover and hardening scenarios (steady state, holder death,
   leader death, local
   unhealthy, minority partition, graceful SIGINT, restart/rejoin, full-outage majority recovery,
   concurrent cold start, returning nodes joining a survivor, and survivor rejoin after a leadership
@@ -361,6 +367,17 @@ The E2E fixtures live under `tests/e2e/`:
   validation with mixed inline/file secrets.
 - `scenarios22/` covers delayed explicit failover and recovered-nopreempt orphan fallback
 - `scenarios26/` proves a mismatched node exits VIP-less and rejoins after exact repair
+
+The continuity scenarios `03_kill_leader` and
+`scenarios22/03_nopreempt_survives_leader_restart` use generated profiles
+`configs-continuity` and `configs22-continuity`, respectively. Election
+timeouts are 400 to 800 ms and the heartbeat interval is 250 ms. Health
+settings, failover delay and the 6.5-second health freshness bound remain
+unchanged. These profiles test continuity through a short election, not
+retention after proof expiry. The same-holder, unique-holder and no-removal
+assertions remain mandatory. Restart checks inspect the complete log
+window as well as current addresses, so an unbind and rebind between polls
+cannot pass. Other scenarios keep their original profile.
 
 The reusable [real-cluster harness](tests/realcluster/README.md) contains 35 scenarios, including
 full-restart and legacy-wire rejection contracts in the retained D15/D16 slots. Its scenario code, assertions,

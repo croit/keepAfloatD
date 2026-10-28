@@ -8,10 +8,26 @@ use std::collections::BTreeSet;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::Instant;
 
+mod authentication;
+mod config_discovery;
 mod renewal_progress;
+
+async fn isolated_restart(case: &str) -> bool {
+    let test_name = format!("cluster_test::restart::{case}");
+    fixtures::isolated_test(&test_name).await
+}
+
+#[tokio::test]
+async fn restarted_healthy_voter_preserves_service_until_activation() {
+    if isolated_restart("restarted_healthy_voter_preserves_service_until_activation").await {
+        return;
+    }
+    super::health_proof::activation::assert_restart_activation_preserves_service().await;
+}
 
 struct Node {
     cfg: Arc<Config>,
+    timing: crate::runtime_permission::LeaseTiming,
     raft: KafRaft,
     network: Arc<RaftNetworkImpl>,
     state: Arc<RwLock<KafStorageState>>,
@@ -22,12 +38,23 @@ struct Node {
 
 impl Node {
     async fn start(cfg: Arc<Config>, listener: ListenerSource) -> Self {
+        let timing =
+            crate::runtime_permission::LeaseTiming::for_config(&cfg, cfg.vips.len()).unwrap();
+        Self::start_with_timing(cfg, listener, timing).await
+    }
+
+    async fn start_with_timing(
+        cfg: Arc<Config>,
+        listener: ListenerSource,
+        timing: crate::runtime_permission::LeaseTiming,
+    ) -> Self {
         let (raft, network, state, fatal, network_failure, controls) =
-            crate::raft::start_raft(cfg.clone(), Arc::new(Vec::new()), listener)
+            crate::raft::start_raft_for_test(cfg.clone(), Arc::new(Vec::new()), listener, timing)
                 .await
                 .unwrap();
         Self {
             cfg,
+            timing,
             raft,
             network,
             state,
@@ -39,6 +66,10 @@ impl Node {
 
     fn replica(&self) -> ReplicaId {
         self.controls.runtime().local_replica()
+    }
+
+    fn startup_budget(&self) -> Duration {
+        self.timing.startup_vip_delay().unwrap() + self.timing.consumer_use() * 2
     }
 
     fn assert_running(&mut self) {
@@ -237,7 +268,7 @@ async fn stable_membership(
 
 async fn wait_stable(nodes: &mut [Node], expected_genesis: Option<&Genesis>) -> Genesis {
     let voters = nodes.iter().map(Node::replica).collect();
-    let budget = startup_budget(&nodes[0].cfg);
+    let budget = nodes[0].startup_budget();
     assert!(
         advance_until(budget, async || {
             stable_membership(nodes, &voters, expected_genesis).await
@@ -253,7 +284,7 @@ async fn publish_history(node: &Node) -> openraft::alias::LogIdOf<crate::raft::T
     let mut publish = Box::pin(runtime.submit_health(&node.network, true));
     let mut committed = None;
     assert!(
-        advance_until(startup_budget(&node.cfg), async || {
+        advance_until(node.startup_budget(), async || {
             if let std::task::Poll::Ready(result) = futures::poll!(publish.as_mut()) {
                 committed = Some(result.unwrap().1);
                 true
@@ -275,7 +306,7 @@ async fn publish_history_with_retry(
     let mut committed = None;
     let mut last_error = None;
     assert!(
-        advance_until(startup_budget(&node.cfg), async || {
+        advance_until(node.startup_budget(), async || {
             match futures::poll!(publish.as_mut()) {
                 std::task::Poll::Ready(Ok((_, log))) => {
                     committed = Some(log);
@@ -302,7 +333,7 @@ async fn survive_renewal(nodes: &mut [Node], genesis: &Genesis) {
         .collect();
     let previous_expiry = *deadlines.iter().max().unwrap();
     let voters = nodes.iter().map(Node::replica).collect();
-    let timing = crate::runtime_permission::LeaseTiming::for_config(&nodes[0].cfg, 0).unwrap();
+    let timing = nodes[0].timing;
     assert!(
         advance_until(timing.consumer_use() * 2, async || {
             if !stable_membership(nodes, &voters, Some(genesis)).await
@@ -332,8 +363,12 @@ async fn survive_renewal(nodes: &mut [Node], genesis: &Genesis) {
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn follower_restart_reuses_address_but_not_boot_and_preserves_genesis() {
+    if isolated_restart("follower_restart_reuses_address_but_not_boot_and_preserves_genesis").await
+    {
+        return;
+    }
     let mut nodes = initial_nodes().await;
     let result = std::panic::AssertUnwindSafe(async {
         let genesis = wait_stable(&mut nodes, None).await;
@@ -395,8 +430,11 @@ async fn follower_restart_reuses_address_but_not_boot_and_preserves_genesis() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn complete_restart_forms_a_new_genesis_without_persisted_state() {
+    if isolated_restart("complete_restart_forms_a_new_genesis_without_persisted_state").await {
+        return;
+    }
     let mut nodes = initial_nodes().await;
     let result = std::panic::AssertUnwindSafe(async {
         let previous = wait_stable(&mut nodes, None).await;
@@ -429,12 +467,54 @@ async fn complete_restart_forms_a_new_genesis_without_persisted_state() {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn clean_follower_restart_bootstraps_from_a_forced_snapshot_after_membership_change() {
-    let mut nodes = initial_nodes().await;
+    if isolated_restart(
+        "clean_follower_restart_bootstraps_from_a_forced_snapshot_after_membership_change",
+    )
+    .await
+    {
+        return;
+    }
+    let wall_started = std::time::Instant::now();
+    let virtual_started = Instant::now();
+    let phase = |name| {
+        eprintln!(
+            "snapshot restart wall={:?} virtual={:?}: {name}",
+            wall_started.elapsed(),
+            virtual_started.elapsed(),
+        );
+    };
+    phase("starting initial nodes");
+    // No kernel VIP effects run here; keep complete admission cycles without long polling waits.
+    let timing = crate::runtime_permission::LeaseTiming::new(
+        Duration::from_secs(10),
+        crate::vip::RECONCILE_TICK,
+    )
+    .unwrap();
+    let mut cluster = ClusterFixture::bind(3).await;
+    let mut nodes = Vec::new();
+    for index in 0..3 {
+        nodes.push(
+            Node::start_with_timing(cluster.config(index, &[]), cluster.take_raft(index), timing)
+                .await,
+        );
+    }
+    eprintln!(
+        "snapshot timing: consumer={:?} quarantine={:?}",
+        timing.consumer_use(),
+        timing.restart_quarantine(),
+    );
+    phase("initial nodes started");
     let result = std::panic::AssertUnwindSafe(async {
         let genesis = wait_stable(&mut nodes, None).await;
+        phase("initial membership stable");
         for force_snapshot in [false, true] {
+            phase(if force_snapshot {
+                "snapshot round"
+            } else {
+                "first restart round"
+            });
             let leader = nodes[0]
                 .raft
                 .metrics()
@@ -461,16 +541,19 @@ async fn clean_follower_restart_bootstraps_from_a_forced_snapshot_after_membersh
                 .collect();
             let writer_id = nodes[writer].cfg.node_id;
             let history = publish_history(&nodes[writer]).await;
+            phase("history published");
             let old_boot = nodes[follower].replica();
             let cfg = nodes[follower].cfg.clone();
-            let budget = startup_budget(&cfg);
+            let budget = timing.startup_vip_delay().unwrap() + timing.consumer_use() * 2;
             tokio::time::timeout(budget, nodes[follower].stop())
                 .await
                 .expect("clean follower shutdown must finish within its budget");
+            phase("follower stopped");
 
             let mut compacted = None;
             if force_snapshot {
                 nodes[writer].raft.trigger().snapshot().await.unwrap();
+                phase("snapshot triggered");
                 assert!(
                     advance_until(budget, async || {
                         for &(index, boot) in &survivor_boots {
@@ -487,6 +570,7 @@ async fn clean_follower_restart_bootstraps_from_a_forced_snapshot_after_membersh
                     "leader must finish a snapshot containing the committed history"
                 );
                 let prefix = compacted.unwrap();
+                phase("snapshot built");
                 nodes[writer]
                     .raft
                     .trigger()
@@ -511,12 +595,16 @@ async fn clean_follower_restart_bootstraps_from_a_forced_snapshot_after_membersh
                     .await,
                     "snapshot-covered prefix must be unavailable for ordinary log replay"
                 );
+                phase("snapshot prefix purged");
             }
 
-            let replacement =
-                tokio::time::timeout(budget, Node::start(cfg.clone(), ListenerSource::Configured))
-                    .await
-                    .expect("fresh follower must start within its budget");
+            let replacement = tokio::time::timeout(
+                budget,
+                Node::start_with_timing(cfg.clone(), ListenerSource::Configured, timing),
+            )
+            .await
+            .expect("fresh follower must start within its budget");
+            phase("fresh follower started");
             let new_boot = replacement.replica();
             assert_eq!(new_boot.physical_id, old_boot.physical_id);
             assert_ne!(new_boot.boot_nonce, old_boot.boot_nonce);
@@ -529,6 +617,7 @@ async fn clean_follower_restart_bootstraps_from_a_forced_snapshot_after_membersh
             }
             nodes[follower] = replacement;
             wait_stable(&mut nodes, Some(&genesis)).await;
+            phase("replacement membership stable");
             for &(index, boot) in &survivor_boots {
                 nodes[index].assert_running();
                 assert_eq!(nodes[index].replica(), boot);
@@ -568,12 +657,15 @@ async fn clean_follower_restart_bootstraps_from_a_forced_snapshot_after_membersh
                 assert_eq!(installed.node_health.get(&writer_id), Some(&true));
             }
             survive_renewal(&mut nodes, &genesis).await;
+            phase("renewal survived");
         }
     })
     .catch_unwind()
     .await;
+    phase("stopping all nodes");
     for node in &mut nodes {
         node.stop().await;
+        phase("node stopped");
     }
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);

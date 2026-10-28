@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc};
 
+pub(super) mod activation;
+
 const PROXY_SECRET: &str = "cluster-test-secret-01234567890123";
 const PROXY_NONCE: [u8; 32] = [7; 32];
 
@@ -714,6 +716,63 @@ struct ControlledPublisher {
 }
 
 #[tokio::test(start_paused = true)]
+async fn runtime_verified_probe_enforces_activation_and_original_deadline() {
+    use crate::health_publication::{Publisher, RuntimePublisher, record_probe};
+    let mut cluster = ClusterFixture::bind(1).await;
+    let cfg = cluster.config(0, &[]);
+    let (raft, network, _state, _fatal, _failure, mut controls) = crate::raft::start_raft(
+        cfg.clone(),
+        Arc::new(cfg.sorted_vips()),
+        cluster.take_raft(0),
+    )
+    .await
+    .unwrap();
+    let runtime = controls.runtime();
+    let publisher = RuntimePublisher::new(runtime.clone(), network.clone());
+    assert!(
+        advance_until(startup_budget(&cfg), async || {
+            publisher.activation_ready().await
+        })
+        .await
+    );
+    let proof = publisher.publish(true).await.unwrap();
+    let freshness = crate::consensus_freshness::ConsensusFreshness::new(Duration::from_secs(3));
+    record_probe(&freshness, false, proof.clone());
+    assert!(
+        !freshness.is_fresh(),
+        "closed activation fence accepted first proof"
+    );
+    record_probe(&freshness, true, proof.clone());
+    assert!(freshness.is_fresh());
+    record_probe(&freshness, false, proof.clone());
+    assert!(
+        !freshness.is_fresh(),
+        "closed activation fence retained prior proof"
+    );
+    tokio::time::advance(freshness.lifetime()).await;
+    record_probe(&freshness, true, proof);
+    assert!(
+        !freshness.is_fresh(),
+        "late reply manufactured a new lifetime"
+    );
+    let fresh = publisher.publish(true).await.unwrap();
+    record_probe(&freshness, true, fresh.clone());
+    assert!(freshness.is_fresh());
+    let unhealthy = publisher.publish(false).await.unwrap();
+    record_probe(&freshness, true, unhealthy);
+    assert!(!freshness.is_fresh(), "unhealthy progress authorized a VIP");
+    runtime.shutdown();
+    record_probe(&freshness, true, fresh);
+    assert!(
+        !freshness.is_fresh(),
+        "sealed authority accepted an old proof"
+    );
+    controls.shutdown().await.unwrap();
+    network.shutdown().await.unwrap();
+    raft.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn daemon_terminal_admission_expiry_cleans_an_acquired_vip_without_rebinding() {
     let mut cluster = ClusterFixture::bind(1).await;
     let address = ip4(192, 0, 2, 96);
@@ -897,6 +956,15 @@ impl crate::health_publication::Publisher for Arc<ControlledPublisher> {
                 self.events.send("completed")?;
                 Ok(proof)
             }
+            3 => {
+                anyhow::ensure!(healthy, "transport loss must not publish unhealthy");
+                self.events.send("unavailable")?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "transport closed before the next health reply",
+                )
+                .into())
+            }
             _ => {
                 let proof = self.runtime.publish(healthy).await?;
                 self.completed.fetch_add(1, Ordering::SeqCst);
@@ -918,6 +986,145 @@ async fn runtime_rejected_health_publication_releases_with_backup_and_recovers()
 #[tokio::test(start_paused = true)]
 async fn runtime_blocked_health_publication_fences_before_completion_and_recovers() {
     assert_runtime_health_fencing(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_transport_loss_keeps_completed_healthy_vip_before_old_deadline() {
+    assert_runtime_transport_continuity(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn runtime_transport_loss_expires_while_applied_state_is_locked() {
+    assert_runtime_transport_continuity(true).await;
+}
+
+async fn assert_runtime_transport_continuity(block_state: bool) {
+    let mut cluster = ClusterFixture::bind(1).await;
+    let address = ip4(192, 0, 2, 99);
+    let vips = [VipConfig {
+        address: VipAddr::host(address),
+        interface: "lo".into(),
+        vlan: None,
+    }];
+    let cfg = cluster.config(0, &vips);
+    let table = Arc::new(cfg.sorted_vips());
+    let local = LocalVip::new(true);
+    let local_health = Arc::new(crate::health::LocalHealth::new(false));
+    let freshness = Arc::new(
+        crate::consensus_freshness::ConsensusFreshness::for_probe_cadence(
+            cfg.health.interval_ms,
+            cfg.health.effective_stale_missed_probes(),
+        ),
+    );
+    let (raft, network, state, _fatal, _failure, mut controls) =
+        crate::raft::start_raft(cfg.clone(), table.clone(), cluster.take_raft(0))
+            .await
+            .unwrap();
+    let (events, mut received) = mpsc::unbounded_channel();
+    let publisher = Arc::new(ControlledPublisher {
+        runtime: crate::health_publication::RuntimePublisher::new(
+            controls.runtime(),
+            network.clone(),
+        ),
+        mode: std::sync::atomic::AtomicU8::new(0),
+        blocked: Semaphore::new(0),
+        events,
+        completed: AtomicU64::new(0),
+    });
+    let health = tokio::spawn(crate::health_publication::run_with_probe(
+        cfg.clone(),
+        local_health.clone(),
+        freshness.clone(),
+        publisher.clone(),
+        ControlledProbe::new(true),
+    ));
+    let reconcile = tokio::spawn(crate::vip::run_reconcile_loop(
+        cfg.clone(),
+        raft.clone(),
+        state.clone(),
+        local.clone(),
+        table.clone(),
+        local_health.clone(),
+        freshness.clone(),
+        cfg.node_id,
+    ));
+    assert!(
+        advance_until(startup_budget(&cfg), async || {
+            local.bound_addrs().await.contains(&address)
+        })
+        .await,
+        "fixture never completed the admitted bind"
+    );
+    let completed = publisher.completed.load(Ordering::SeqCst);
+    let before_loss = tokio::time::Instant::now();
+    publisher.mode.store(3, Ordering::SeqCst);
+    assert!(
+        advance_until(
+            Duration::from_millis(cfg.health.interval_ms * 2),
+            async || { received.try_recv() == Ok("unavailable") }
+        )
+        .await
+    );
+    let attempts = local.bind_attempts(address).await;
+    for _ in 0..3 {
+        tokio::time::advance(crate::vip::RECONCILE_TICK).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let remained_bound = local.bound_addrs().await.contains(&address);
+    let attempts_after = local.bind_attempts(address).await;
+    let elapsed = before_loss.elapsed();
+    let healthy = local_health.is_healthy();
+    let completed_after = publisher.completed.load(Ordering::SeqCst);
+    let held_state = if block_state {
+        Some(state.write().await)
+    } else {
+        None
+    };
+    tokio::time::advance(freshness.lifetime()).await;
+    let expired_and_removed = advance_until(crate::vip::RECONCILE_TICK * 2, async || {
+        !local.bound_addrs().await.contains(&address)
+    })
+    .await;
+    let attempts_after_expiry = local.bind_attempts(address).await;
+    health.abort();
+    reconcile.abort();
+    assert!(health.await.unwrap_err().is_cancelled());
+    assert!(reconcile.await.unwrap_err().is_cancelled());
+    drop(held_state);
+    local
+        .unbind_all(&table, None, true, crate::vip::release_notify_state(true))
+        .await
+        .unwrap();
+    controls.shutdown().await.unwrap();
+    network.shutdown().await.unwrap();
+    raft.shutdown().await.unwrap();
+    assert!(
+        elapsed < freshness.lifetime(),
+        "fixture outlived the old proof"
+    );
+    assert!(healthy);
+    assert_eq!(
+        completed_after, completed,
+        "fault injection renewed the proof"
+    );
+    assert!(
+        remained_bound,
+        "transport loss removed a healthy completed VIP before its old proof expired"
+    );
+    assert_eq!(
+        attempts_after, attempts,
+        "retention must not reassert the VIP"
+    );
+    assert!(
+        expired_and_removed,
+        "proof expiry must clean up without reading applied state"
+    );
+    assert_eq!(
+        attempts_after_expiry, attempts,
+        "expired retention must not acquire again"
+    );
 }
 
 async fn assert_runtime_health_fencing(block_reply: bool) {

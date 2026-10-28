@@ -10,7 +10,7 @@ export COMPOSE_PROJECT_NAME="keepafloatd-e2e-issue22"
 export ARTIFACT_DIR="${ROOT_DIR}/e2e-artifacts/compose22"
 export E2E_VIPS="10.50.0.100"
 export KEEPAFLOATD_E2E_CONFIG_DIR="configs22"
-export KEEPAFLOATD_RUST_LOG="${KEEPAFLOATD_RUST_LOG:-info,keepafloatd::vip::takeover=debug}"
+export KEEPAFLOATD_RUST_LOG="${KEEPAFLOATD_RUST_LOG:-info,keepafloatd::vip::takeover=debug,keepafloatd::consensus_freshness=debug,keepafloatd::vip::reconcile::worker=debug}"
 
 # shellcheck source=tests/e2e/scripts/lib.sh
 . "${ROOT_DIR}/tests/e2e/scripts/lib.sh"
@@ -25,6 +25,11 @@ run_scenario() {
   local scenario_path="${1:?scenario path required}"
   local scenario_name status=0
   scenario_name="$(basename "${scenario_path}" .sh)"
+  local KEEPAFLOATD_E2E_CONFIG_DIR=configs22
+  if [[ "${scenario_name}" == 03_nopreempt_survives_leader_restart ]]; then
+    KEEPAFLOATD_E2E_CONFIG_DIR=configs22-continuity
+  fi
+  export KEEPAFLOATD_E2E_CONFIG_DIR
   local artifact_dir="${ARTIFACT_DIR}/${scenario_name}"
   local run_log="${artifact_dir}/scenario.out"
   mkdir -p "${artifact_dir}"
@@ -50,16 +55,20 @@ run_scenario() {
 }
 
 cmd="${1:-all}"
-trap 'down_cluster' EXIT
-if [[ "${cmd}" == "all" ]]; then
-  for scenario in "${SCENARIO_DIR}"/[0-9][0-9]_*.sh; do
-    run_scenario "${scenario}"
-  done
-elif [[ -f "${SCENARIO_DIR}/${cmd}.sh" ]]; then
-  run_scenario "${SCENARIO_DIR}/${cmd}.sh"
-elif [[ -f "${cmd}" ]]; then
-  run_scenario "${cmd}"
+if [[ "${cmd}" == help || "${cmd}" == --help || "${cmd}" == -h ]]; then
+  printf 'usage: %s [all|scenario-name]\n' "${0##*/}"
 else
-  printf 'usage: %s [all|scenario-name]\n' "${0##*/}" >&2
-  exit 2
+  trap 'down_cluster' EXIT
+  if [[ "${cmd}" == "all" ]]; then
+    for scenario in "${SCENARIO_DIR}"/[0-9][0-9]_*.sh; do
+      run_scenario "${scenario}"
+    done
+  elif [[ -f "${SCENARIO_DIR}/${cmd}.sh" ]]; then
+    run_scenario "${SCENARIO_DIR}/${cmd}.sh"
+  elif [[ -f "${cmd}" ]]; then
+    run_scenario "${cmd}"
+  else
+    printf 'usage: %s [all|scenario-name]\n' "${0##*/}" >&2
+    exit 2
+  fi
 fi

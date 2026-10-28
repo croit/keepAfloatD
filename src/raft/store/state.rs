@@ -284,10 +284,8 @@ impl KafStorageState {
     /// `last_applied`.
     ///
     /// Shared by `build_snapshot` and `get_current_snapshot` so the snapshot payload and metadata
-    /// are produced identically in both paths. The `snapshot_id` is derived from the full
-    /// `last_applied` log id (`<leader>-<index>` via its `Display`), not the index alone, so two
-    /// snapshots taken at the same index in different terms get distinct ids - openraft uses the id
-    /// for snapshot identity and de-dup.
+    /// are produced identically in both paths. OpenRaft identifies snapshots by their full
+    /// `last_log_id`, including the leader term and node identity.
     pub(super) fn snapshot_at(
         &self,
         last_applied: LogIdOf<TypeConfig>,
@@ -301,7 +299,6 @@ impl KafStorageState {
         let meta: SnapshotMetaOf<TypeConfig> = SnapshotMeta {
             last_log_id: Some(last_applied),
             last_membership: self.last_membership.clone(),
-            snapshot_id: format!("snapshot-{last_applied}"),
         };
 
         Ok(openraft::Snapshot {

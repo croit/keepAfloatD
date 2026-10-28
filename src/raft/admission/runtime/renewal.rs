@@ -2,8 +2,6 @@
 
 use super::*;
 use crate::raft::admission::{AppliedHealthProgress, HealthProgress};
-use crate::raft::types::TypeConfig;
-use openraft::alias::LogIdOf;
 use tokio::sync::MutexGuard;
 
 impl RuntimeDriver {
@@ -14,20 +12,23 @@ impl RuntimeDriver {
     ) -> anyhow::Result<T> {
         tokio::time::timeout(self.timing.renewal_round_budget(), work)
             .await
-            .map_err(|_| anyhow::anyhow!("{phase} phase timed out"))?
+            .map_err(|error| {
+                anyhow::Error::new(error).context(format!("{phase} phase timed out"))
+            })?
     }
 
     async fn renewal_lock(&self) -> anyhow::Result<MutexGuard<'_, ()>> {
         tokio::time::timeout(self.timing.renewal_round_budget(), self.round.lock())
             .await
-            .map_err(|_| anyhow::anyhow!("admission round lock timed out"))
+            .map_err(|error| anyhow::Error::new(error).context("admission round lock timed out"))
     }
 
     pub(super) async fn renew(
         &self,
         network: &RaftNetworkImpl,
         healthy: Option<bool>,
-    ) -> anyhow::Result<(Instant, LogIdOf<TypeConfig>)> {
+    ) -> anyhow::Result<VerifiedProgress> {
+        let started = Instant::now();
         self.within_admission(async {
             let _round = self.renewal_lock().await?;
             self.bounded_phase("renewal", async {
@@ -53,7 +54,11 @@ impl RuntimeDriver {
                     request_nonce: round.request().request_nonce,
                     genesis: session.context().genesis.clone(),
                 };
-                let discovery = self.discover(network, self.rpc_budget()).await?;
+                let discovery = if healthy.is_some() {
+                    self.discover_for_health(network, self.rpc_budget()).await?
+                } else {
+                    self.discover(network, self.rpc_budget()).await?
+                };
                 let response = self
                     .route(
                         network,
@@ -70,9 +75,24 @@ impl RuntimeDriver {
                 };
                 self.wait_progress(&applied).await?;
                 round.bind_progress(&applied)?;
-                let grants = self.grants(network, &round, &discovery.boots).await?;
-                self.install(&mut round, &grants, None).await?;
-                Ok((round.request_started(), log_id))
+                let grants = if healthy.is_some() {
+                    self.grants_for_health(network, &round, &discovery.boots)
+                        .await?
+                } else {
+                    self.grants(network, &round, &discovery.boots).await?
+                };
+                if grants.len() <= self.cfg.peers.len() / 2 {
+                    return Err(crate::consensus_freshness::failure::unavailable(
+                        "reachable admission grants lack a physical majority",
+                    ));
+                }
+                let installed = self.install(&mut round, &grants, None).await?;
+                Ok(VerifiedProgress::new(
+                    started,
+                    applied,
+                    installed,
+                    self.authority.clone(),
+                )?)
             })
             .await
         })
@@ -97,7 +117,7 @@ impl RuntimeDriver {
                 round.bind_prepared(prepared)?;
                 let discovery = self.discover(network, self.rpc_budget()).await?;
                 let grants = self.grants(network, &round, &discovery.boots).await?;
-                self.install(&mut round, &grants, None).await
+                self.install(&mut round, &grants, None).await.map(|_| ())
             })
             .await
         })

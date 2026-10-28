@@ -1118,7 +1118,6 @@ async fn install_snapshot_empty_last_applied_is_noop_on_log() {
     let meta = SnapshotMeta {
         last_log_id: None,
         last_membership: StoredMembershipOf::<TypeConfig>::default(),
-        snapshot_id: "empty".to_string(),
     };
     restored
         .install_snapshot(&meta, Cursor::new(bytes))
@@ -1131,10 +1130,9 @@ async fn install_snapshot_empty_last_applied_is_noop_on_log() {
 }
 
 /// Two snapshots whose last-applied entry shares an index but was proposed in different terms
-/// must get distinct `snapshot_id`s - openraft uses the id for snapshot identity/de-dup, so an
-/// index-only id would let a stale snapshot masquerade as an already-installed newer one.
+/// must get distinct signatures so a stale snapshot cannot masquerade as a newer one.
 #[tokio::test]
-async fn snapshot_id_distinguishes_same_index_different_term() {
+async fn snapshot_signature_distinguishes_same_index_different_term() {
     let v1 = ip4(10, 0, 0, 1);
 
     let mut a = storage(&[v1], 3);
@@ -1144,14 +1142,14 @@ async fn snapshot_id_distinguishes_same_index_different_term() {
     a.apply_to_state_machine(&[health_entry_term(2, 2, 1, true)])
         .await
         .unwrap();
-    let id_a = a
+    let signature_a = a
         .get_snapshot_builder()
         .await
         .build_snapshot()
         .await
         .unwrap()
         .meta
-        .snapshot_id;
+        .signature();
 
     let mut b = storage(&[v1], 3);
     b.apply_to_state_machine(&[membership_entry(1, &[1])])
@@ -1161,18 +1159,18 @@ async fn snapshot_id_distinguishes_same_index_different_term() {
     b.apply_to_state_machine(&[health_entry_term(5, 2, 1, true)])
         .await
         .unwrap();
-    let id_b = b
+    let signature_b = b
         .get_snapshot_builder()
         .await
         .build_snapshot()
         .await
         .unwrap()
         .meta
-        .snapshot_id;
+        .signature();
 
     assert_ne!(
-        id_a, id_b,
-        "snapshots at the same index in different terms must have distinct ids"
+        signature_a, signature_b,
+        "snapshots at the same index in different terms must have distinct signatures"
     );
 }
 
@@ -1632,7 +1630,7 @@ async fn install_snapshot_rejects_invalid_json_without_mutating_state() {
         .unwrap_err();
 
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    assert!(error.to_string().contains(&snapshot.meta.snapshot_id));
+    assert!(error.to_string().contains("last_log:"));
     assert_eq!(
         restored.state.read().await.cluster_epoch,
         Some(77),

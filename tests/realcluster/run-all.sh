@@ -46,11 +46,15 @@ done
 log "recorded exact baseline config hashes in ${BASELINE_HASHES}"
 
 pass=0; fail=0
-scenario_timeout="${REALCLUSTER_SCENARIO_TIMEOUT:-1800}"
 
 for s in "${scripts[@]}"; do
   name="$(basename "${s%.sh}")"
   log "──────── running ${name} ────────"
+  scenario_timeout="$(scenario_timeout_seconds "$name")" || {
+    log "could not establish outer timeout for ${name}; aborting before scenario mutations"
+    exit 3
+  }
+  log "${name}: outer timeout ${scenario_timeout} seconds"
   capture_scenario_guard || { log "could not capture exact pre-scenario guard for ${name}"; exit 3; }
   scenario_ok=0
   scenario_rc=0
@@ -60,6 +64,8 @@ for s in "${scripts[@]}"; do
   RUNALL_SCENARIO_PGID=""
   if [[ "${scenario_rc}" -eq 0 ]]; then
     scenario_ok=1
+  else
+    log "${name}: exit status ${scenario_rc} (124 indicates the outer timeout)"
   fi
   restore_ok=1
   if ! restore_scenario_guard; then

@@ -227,9 +227,8 @@ async fn expired_session_cannot_authorize_even_a_matching_vote() {
 
 #[tokio::test]
 async fn cached_stream_for_another_boot_cannot_send_raft() {
-    use tokio::io::AsyncReadExt;
     let network = super::tests::test_network(65_536, &[1, 2]);
-    let mut peer = super::tests::attach_loopback_stream(&network, 2).await;
+    let peer = super::tests::attach_loopback_stream(&network, 2).await;
     *network.peers[&2].remote_replica.write().unwrap() = Some(replica(2, 9));
     let error = network
         .send_rpc::<_, serde_json::Value>(
@@ -241,8 +240,60 @@ async fn cached_stream_for_another_boot_cannot_send_raft() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("destination boot changed"));
-    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
-    assert!(network.peers[&2].stream.lock().await.is_none());
+    assert_eq!(
+        peer.try_read(&mut [0]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(network.peers[&2].stream.lock().await.is_some());
+}
+
+#[tokio::test]
+async fn stale_boot_rpc_preserves_the_current_peers_connection() {
+    let network = super::tests::test_network(65_536, &[1, 2]);
+    let mut peer = super::tests::attach_loopback_stream(&network, 2).await;
+    let error = network
+        .send_rpc::<_, serde_json::Value>(
+            replica(2, 9),
+            &super::testing::vote_request(),
+            super::RPCTypes::Vote,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, super::RPCError::Network(_)));
+    assert!(
+        network.peers[&2].stream.lock().await.is_some(),
+        "an obsolete replica RPC discarded the current boot's connection"
+    );
+    let request = super::testing::vote_request();
+    let rpc = network.send_rpc::<_, openraft::raft::VoteResponse<TypeConfig>>(
+        crate::raft::types::test_replica(2),
+        &request,
+        super::RPCTypes::Vote,
+        Duration::from_secs(1),
+    );
+    let server = async {
+        let received = super::wire::read_framed_bounded(&mut peer, 65_536)
+            .await
+            .unwrap();
+        assert_eq!(
+            received,
+            super::request::encode(super::request::Operation::Vote, &request).unwrap()
+        );
+        let response = super::request::encode(
+            super::request::Operation::Vote,
+            &super::testing::vote_response(true),
+        )
+        .unwrap();
+        super::wire::write_framed(&mut peer, &response)
+            .await
+            .unwrap();
+    };
+    let (response, ()) =
+        tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(rpc, server) })
+            .await
+            .expect("the current boot could not reuse its connection");
+    assert!(response.unwrap().vote_granted);
 }
 
 #[tokio::test]
@@ -647,7 +698,6 @@ fn prepared_snapshot(
         meta: openraft::SnapshotMeta {
             last_log_id: Some(log(applied_index)),
             last_membership: stored.clone(),
-            snapshot_id: "prepared".into(),
         },
         data: serde_json::to_vec(&serde_json::json!({
             "genesis": grant.session.context().genesis,
@@ -1048,7 +1098,6 @@ async fn snapshot_body_cannot_substitute_a_different_membership_or_genesis() {
             meta: openraft::SnapshotMeta {
                 last_log_id: None,
                 last_membership: stored.clone(),
-                snapshot_id: "exact".into(),
             },
             data: serde_json::to_vec(&body).unwrap(),
         })

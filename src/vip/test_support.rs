@@ -10,6 +10,7 @@ use std::process::{ExitStatus, Output};
 use tokio::process::Command;
 
 pub(crate) type Target<'a> = (&'a str, IpAddr, u8);
+pub(super) type BindResultHook = Box<dyn FnOnce(&Option<anyhow::Result<Option<bool>>>) + Send>;
 
 fn command(args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> Command {
     let mut command = Command::new("ip");
@@ -26,6 +27,13 @@ fn empty_inventory() -> io::Result<Output> {
 }
 
 impl LocalVip {
+    pub(super) fn after_bind_result(&self, result: &Option<anyhow::Result<Option<bool>>>) {
+        let hook = self.next_bind_result_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(result);
+        }
+    }
+
     pub(crate) async fn force_next_bind_result(
         &self,
         target: Target<'_>,

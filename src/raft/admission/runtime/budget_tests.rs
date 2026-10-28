@@ -45,6 +45,129 @@ async fn admit(runtime: &RuntimeDriver) {
     runtime.install(&mut round, &[grant], None).await.unwrap();
 }
 
+async fn unadmitted_driver_with_unresponsive_peer() -> (
+    Arc<RuntimeDriver>,
+    Arc<RaftNetworkImpl>,
+    tokio::net::TcpListener,
+    Genesis,
+    BTreeSet<ReplicaId>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = crate::raft::types::test_replica(1);
+    let mut cfg = (*super::tests::config()).clone();
+    cfg.node_id = 2;
+    cfg.peers[0].id = 2;
+    cfg.peers.push(crate::config::PeerConfig {
+        id: remote.physical_id,
+        raft_address: listener.local_addr().unwrap().to_string(),
+        client_submit_address: listener.local_addr().unwrap().to_string(),
+    });
+    let cfg = Arc::new(cfg);
+    let (_, _, state) = new_store(Arc::new(vec![]), 3, true, 0);
+    let timing = LeaseTiming::for_config(&cfg, 0).unwrap();
+    let runtime = RuntimeDriver::new(cfg.clone(), state.clone(), timing, Instant::now()).unwrap();
+    let network = Arc::new(RaftNetworkImpl::new(cfg, state, runtime.clone()).unwrap());
+    tokio::time::advance(runtime.timing.restart_quarantine()).await;
+    let targets = BTreeSet::from([remote, runtime.local]);
+    let genesis = discovery::cohort_genesis(&runtime.cfg, targets.clone()).unwrap();
+    (runtime, network, listener, genesis, targets)
+}
+
+#[tokio::test(start_paused = true)]
+async fn strict_health_grants_preserve_rejection_while_another_issuer_times_out() {
+    use crate::consensus_freshness::{FailureKind, failure_kind};
+
+    let (runtime, network, listener, genesis, targets) =
+        unadmitted_driver_with_unresponsive_peer().await;
+    let round = runtime
+        .begin(genesis, AdmissionMode::Renew { progress: None })
+        .unwrap();
+    let started = Instant::now();
+    let error = runtime
+        .grants_for_health(&network, &round, &targets)
+        .await
+        .err()
+        .expect("health grants must preserve the observed local rejection");
+    assert!(
+        error.downcast_ref::<AdmissionDenied>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(failure_kind(&error), FailureKind::Rejected);
+    assert_eq!(
+        Instant::now(),
+        started,
+        "observed rejection must not wait for another issuer"
+    );
+
+    let grants = runtime.grants(&network, &round, &targets).await.unwrap();
+    assert!(
+        grants.is_empty(),
+        "neither a rejected nor timed-out issuer supplied a grant"
+    );
+    assert_eq!(Instant::now() - started, runtime.rpc_budget());
+    assert!(runtime.current().is_none());
+    assert!(runtime.state.read().await.genesis.is_none());
+    runtime.shutdown();
+    drop(listener);
+    network.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn strict_health_route_preserves_rejection_before_a_timed_out_fallback() {
+    use crate::consensus_freshness::{FailureKind, failure_kind};
+
+    let (runtime, network, listener, genesis, targets) =
+        unadmitted_driver_with_unresponsive_peer().await;
+    let progress = |healthy| {
+        ManagementAction::Progress(crate::raft::admission::HealthProgress {
+            node_id: runtime.local.physical_id,
+            replica: runtime.local,
+            healthy,
+            epoch: genesis.epoch,
+            genesis: genesis.clone(),
+            request_nonce: [31; 32],
+        })
+    };
+    for healthy in [Some(true), Some(false)] {
+        let started = Instant::now();
+        let error = runtime
+            .route(&network, progress(healthy), &targets)
+            .await
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<AdmissionDenied>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(failure_kind(&error), FailureKind::Rejected);
+        assert_eq!(
+            Instant::now(),
+            started,
+            "health rejection must not try the blocked fallback"
+        );
+    }
+    for action in [
+        progress(None),
+        ManagementAction::PrepareJoin {
+            genesis: genesis.clone(),
+            operation_nonce: [32; 32],
+        },
+    ] {
+        let started = Instant::now();
+        let error = runtime.route(&network, action, &targets).await.unwrap_err();
+        assert_eq!(failure_kind(&error), FailureKind::Unavailable, "{error:#}");
+        assert_eq!(
+            Instant::now() - started,
+            runtime.rpc_budget(),
+            "admission routing must try the unresponsive peer after local refusal"
+        );
+    }
+    assert!(runtime.current().is_none());
+    assert!(runtime.state.read().await.genesis.is_none());
+    runtime.shutdown();
+    drop(listener);
+    network.shutdown().await.unwrap();
+}
+
 #[tokio::test(start_paused = true)]
 async fn local_grant_state_contention_ends_at_the_rpc_budget() {
     let (runtime, network) = driver();

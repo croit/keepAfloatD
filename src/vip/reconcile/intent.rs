@@ -5,10 +5,10 @@ use crate::raft::store::VipAssignment;
 use std::net::IpAddr;
 
 #[derive(Clone)]
-pub(super) struct EffectIntent {
-    pub(super) assignment: Option<VipAssignment>,
-    pub(super) bind_policy: bool,
-    pub(super) vip: IpAddr,
+pub(in crate::vip) struct EffectIntent {
+    pub(in crate::vip) assignment: Option<VipAssignment>,
+    pub(in crate::vip) bind_policy: bool,
+    pub(in crate::vip) vip: IpAddr,
     node_id: u64,
     gates: BindGates,
     activated_generation: Option<u64>,
@@ -16,7 +16,7 @@ pub(super) struct EffectIntent {
 }
 
 impl EffectIntent {
-    pub(super) fn activated(mut self) -> Self {
+    pub(in crate::vip) fn activated(mut self) -> Self {
         self.activated_generation = self
             .assignment
             .as_ref()
@@ -24,7 +24,7 @@ impl EffectIntent {
         self
     }
 
-    pub(super) fn capture(
+    pub(in crate::vip) fn capture(
         vip: IpAddr,
         node_id: u64,
         gates: BindGates,
@@ -56,7 +56,7 @@ impl EffectIntent {
         }
     }
 
-    pub(super) fn remains_valid(&self, state: &KafStorageState, gates: BindGates) -> bool {
+    pub(in crate::vip) fn remains_valid(&self, state: &KafStorageState, gates: BindGates) -> bool {
         let current = Self::capture(
             self.vip,
             self.node_id,

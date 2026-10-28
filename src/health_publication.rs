@@ -1,20 +1,14 @@
 //! Translate an applied probe into local VIP eligibility.
 
-use crate::consensus_freshness::ConsensusFreshness;
-use tokio::time::Instant;
+use crate::consensus_freshness::{ConsensusFreshness, FailureKind, failure_kind};
 
 use crate::config::{Config, HealthConfig};
 use crate::health::{self, LocalHealth};
+use crate::raft::RaftNetworkImpl;
 pub(crate) use crate::raft::admission::runtime::PublicationReadiness;
 use crate::raft::admission::runtime::RuntimeDriver;
-use crate::raft::{RaftNetworkImpl, TypeConfig};
-use openraft::alias::LogIdOf;
+pub(crate) use crate::raft::admission::runtime::VerifiedProgress as AppliedProbe;
 use std::sync::Arc;
-
-pub(crate) struct AppliedProbe {
-    pub(crate) started: Instant,
-    pub(crate) log_id: LogIdOf<TypeConfig>,
-}
 
 pub(crate) trait Probe: Send + Sync + 'static {
     fn check(&self) -> impl std::future::Future<Output = bool> + Send;
@@ -64,8 +58,9 @@ impl Publisher for RuntimePublisher {
     }
 
     async fn publish(&self, healthy: bool) -> anyhow::Result<AppliedProbe> {
-        let (started, log_id) = self.runtime.submit_health(&self.network, healthy).await?;
-        Ok(AppliedProbe { started, log_id })
+        self.runtime
+            .submit_health_proof(&self.network, healthy)
+            .await
     }
 
     async fn activation_ready(&self) -> bool {
@@ -116,6 +111,9 @@ pub(crate) async fn run_with_probe(
         };
         let previous_ok = local_healthy.observe_probe(failure_dampener.observe(raw_ok));
         let ok = local_healthy.is_healthy();
+        if !ok {
+            consensus_fresh.invalidate();
+        }
         if !raw_ok && ok && failure_dampener.failure_ticks() == 1 {
             tracing::warn!(
                 failover_delay_secs = cfg.failover_delay_secs,
@@ -138,21 +136,22 @@ pub(crate) async fn run_with_probe(
                 continue;
             }
         }
-        match publisher.publish(ok).await {
+        // Renew admission without moving VIPs to a node that cannot activate them yet.
+        let placement_healthy = ok && publisher.activation_ready().await;
+        match publisher.publish(placement_healthy).await {
             Ok(proof) => {
-                tracing::debug!(log_id = %proof.log_id, "health proof applied");
-                record_probe(
-                    &consensus_fresh,
-                    publisher.activation_ready().await,
-                    proof.started,
-                );
+                tracing::debug!(log_id = %proof.log_id(), "health proof applied");
+                record_probe(&consensus_fresh, publisher.activation_ready().await, proof);
                 if bind_fault_reported && !bind_fault_committed && !ok {
                     tracing::info!("bind fault committed as unhealthy");
                     bind_fault_committed = true;
                 }
             }
             Err(e) => {
-                consensus_fresh.invalidate();
+                match failure_kind(&e) {
+                    FailureKind::Unavailable => consensus_fresh.mark_unavailable(),
+                    FailureKind::Rejected => consensus_fresh.invalidate(),
+                }
                 tracing::warn!("health raft submit: {}", e);
             }
         }
@@ -162,39 +161,14 @@ pub(crate) async fn run_with_probe(
 pub(crate) fn record_probe(
     freshness: &ConsensusFreshness,
     activation_ready: bool,
-    started: Instant,
+    proof: AppliedProbe,
 ) {
     if activation_ready {
-        freshness.record_success(started);
+        if let Err(error) = freshness.record_applied(proof) {
+            freshness.invalidate();
+            tracing::debug!(%error, "applied health proof cannot authorize VIP effects");
+        }
     } else {
         freshness.invalidate();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    #[tokio::test(start_paused = true)]
-    async fn activation_fence_blocks_first_and_previously_fresh_proofs() {
-        let freshness = ConsensusFreshness::new(Duration::from_secs(3));
-        record_probe(&freshness, false, Instant::now());
-        assert!(!freshness.is_fresh());
-        record_probe(&freshness, true, Instant::now());
-        assert!(freshness.is_fresh());
-        record_probe(&freshness, false, Instant::now());
-        assert!(!freshness.is_fresh());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn accepted_probe_retains_its_original_challenge_start() {
-        let freshness = ConsensusFreshness::new(Duration::from_secs(3));
-        let started = Instant::now();
-        tokio::time::advance(Duration::from_secs(3)).await;
-        record_probe(&freshness, true, started);
-        assert!(!freshness.is_fresh());
-        record_probe(&freshness, true, Instant::now());
-        assert!(freshness.is_fresh());
     }
 }

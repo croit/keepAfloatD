@@ -4,6 +4,14 @@ FROM ${DOCKER_HUB_MIRROR}/library/debian:trixie-slim@sha256:d7e12182ce18b85b9300
 RUN mkdir -p /opt/keepafloatd-tests/configs /opt/keepafloatd-tests/configs22 /opt/keepafloatd-tests/configs26 /opt/keepafloatd-tests/configs26-equivalent
 
 COPY configs/ /opt/keepafloatd-tests/configs/
+RUN mkdir /opt/keepafloatd-tests/configs-continuity \
+    && for node in a b c; do \
+        sed -e 's/election_timeout_min_ms: 1500/election_timeout_min_ms: 400/' \
+            -e 's/election_timeout_max_ms: 2500/election_timeout_max_ms: 800/' \
+            -e 's/heartbeat_interval_ms: 500/heartbeat_interval_ms: 250/' \
+            "/opt/keepafloatd-tests/configs/${node}.yaml" \
+            >"/opt/keepafloatd-tests/configs-continuity/${node}.yaml"; \
+    done
 RUN cp -a /opt/keepafloatd-tests/configs /opt/keepafloatd-tests/configs-secret-file \
     && sed -n 's/^cluster_secret: "\(.*\)"/\1/p' /opt/keepafloatd-tests/configs/a.yaml \
         >/opt/keepafloatd-tests/configs-secret-file/cluster.secret \
@@ -32,6 +40,14 @@ RUN mkdir /opt/keepafloatd-tests/configs6 \
             >"/opt/keepafloatd-tests/configs6/${node}.yaml"; \
     done
 COPY configs22/ /opt/keepafloatd-tests/configs22/
+RUN mkdir /opt/keepafloatd-tests/configs22-continuity \
+    && for node in a b c; do \
+        sed -e 's/election_timeout_min_ms: 1500/election_timeout_min_ms: 400/' \
+            -e 's/election_timeout_max_ms: 2500/election_timeout_max_ms: 800/' \
+            -e 's/heartbeat_interval_ms: 500/heartbeat_interval_ms: 250/' \
+            "/opt/keepafloatd-tests/configs22/${node}.yaml" \
+            >"/opt/keepafloatd-tests/configs22-continuity/${node}.yaml"; \
+    done
 COPY configs/a.yaml /opt/keepafloatd-tests/configs26/a.yaml
 COPY configs/b.yaml /opt/keepafloatd-tests/configs26/b.yaml
 COPY configs26/c.yaml /opt/keepafloatd-tests/configs26/c.yaml

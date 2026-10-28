@@ -12,7 +12,8 @@ fn success() -> io::Result<ExitStatus> {
 }
 
 async fn finish(announcements: &Announcements, ip: IpAddr) {
-    let mut tasks = announcements.tasks.lock().await.remove(&ip).unwrap();
+    let pending = announcements.tasks.lock().await.get(&ip).cloned().unwrap();
+    let mut tasks = pending.lock().await;
     while let Some(result) = tasks.join_next().await {
         result.unwrap();
     }
@@ -134,7 +135,11 @@ async fn pending_announcements_do_not_block_other_addresses() {
     assert!(!first.is_closed());
     announcements.cancel(address()).await;
     first.closed().await;
-    assert!(announcements.tasks.lock().await.is_empty());
+    let slots: Vec<_> = announcements.tasks.lock().await.values().cloned().collect();
+    assert_eq!(slots.len(), 2);
+    for pending in slots {
+        assert!(pending.lock().await.is_empty());
+    }
     announcements.cancel(address()).await;
 }
 
@@ -177,6 +182,123 @@ async fn replacement_cancels_the_previous_command_before_starting() {
         })
         .await;
     finish(&announcements, address()).await;
+}
+
+#[tokio::test]
+async fn cancelling_one_announcement_does_not_hold_the_other_vips_lock() {
+    let announcements = Announcements::default();
+    announcements
+        .start("test0", address(), std::future::pending())
+        .await;
+    let first = announcements.cancel(address());
+    tokio::pin!(first);
+    assert!(futures::poll!(&mut first).is_pending());
+    let other = announcements.cancel("2001:db8::100".parse().unwrap());
+    tokio::pin!(other);
+    assert!(
+        futures::poll!(&mut other).is_ready(),
+        "joining one announcement must not delay another VIP's expiry cleanup"
+    );
+    first.await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupted_cancel_keeps_announcement_joinable_for_cleanup() {
+    let announcements = Announcements::default();
+    let (started, ready) = oneshot::channel();
+    let (lifetime, pending) = oneshot::channel::<()>();
+    announcements
+        .start("test0", address(), async move {
+            started.send(()).unwrap();
+            pending.await.unwrap();
+            success()
+        })
+        .await;
+    tokio::time::timeout(Duration::from_secs(1), ready)
+        .await
+        .expect("announcement never started")
+        .unwrap();
+
+    let mut first = Box::pin(announcements.cancel(address()));
+    assert!(futures::poll!(&mut first).is_pending());
+    drop(first);
+    assert!(
+        !lifetime.is_closed(),
+        "fixture must interrupt cancellation before the announcement is dropped"
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), announcements.cancel(address()))
+        .await
+        .expect("cleanup could not finish the interrupted announcement cancellation");
+    assert!(
+        lifetime.is_closed(),
+        "cleanup returned before the interrupted announcement was dropped"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn interrupted_replacement_keeps_previous_announcement_joinable() {
+    let announcements = Announcements::default();
+    let (started, ready) = oneshot::channel();
+    let (lifetime, pending) = oneshot::channel::<()>();
+    announcements
+        .start("test0", address(), async move {
+            started.send(()).unwrap();
+            pending.await.unwrap();
+            success()
+        })
+        .await;
+    tokio::time::timeout(Duration::from_secs(1), ready)
+        .await
+        .expect("announcement never started")
+        .unwrap();
+
+    let (replacement_lifetime, replacement_pending) = oneshot::channel::<()>();
+    let mut replacement = Box::pin(announcements.start("test0", address(), async move {
+        replacement_pending.await.unwrap();
+        success()
+    }));
+    assert!(futures::poll!(&mut replacement).is_pending());
+    drop(replacement);
+    assert!(replacement_lifetime.is_closed());
+    assert!(
+        !lifetime.is_closed(),
+        "fixture must interrupt replacement before the old announcement is dropped"
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), announcements.cancel(address()))
+        .await
+        .expect("cleanup could not finish the interrupted replacement");
+    assert!(
+        lifetime.is_closed(),
+        "interrupted replacement orphaned the old announcement"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_start_and_cancel_reuse_one_slot_per_address() {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let announcements = Announcements::default();
+        let mut original = None;
+        for _ in 0..4 {
+            announcements
+                .start("test0", address(), async { success() })
+                .await;
+            finish(&announcements, address()).await;
+            announcements.cancel(address()).await;
+            let slots = announcements.tasks.lock().await;
+            assert_eq!(slots.len(), 1);
+            let slot = slots.get(&address()).unwrap();
+            if let Some(original) = &original {
+                assert!(Arc::ptr_eq(original, slot));
+            }
+            original = Some(slot.clone());
+        }
+        announcements.cancel("2001:db8::100".parse().unwrap()).await;
+        assert_eq!(announcements.tasks.lock().await.len(), 1);
+    })
+    .await
+    .expect("repeated announcement cleanup did not finish");
 }
 
 #[tokio::test]
@@ -253,7 +375,11 @@ async fn unexpected_task_failure_is_observed_on_cleanup() {
     while !handle.is_finished() {
         tokio::task::yield_now().await;
     }
-    announcements.tasks.lock().await.insert(address(), tasks);
+    announcements
+        .tasks
+        .lock()
+        .await
+        .insert(address(), Arc::new(Mutex::new(tasks)));
     announcements
         .cancel(address())
         .with_subscriber(subscriber)

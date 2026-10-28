@@ -164,7 +164,8 @@ What lives in the replicated state machine or snapshot:
 What is derived locally but not replicated:
 
 - `local_healthy`: the latest result from this process's own probe task
-- `consensus_fresh`: whether this node can still submit health or release updates through Raft
+- `consensus_fresh`: whether a verified healthy proof permits new VIP acquisition
+- completed binding witnesses: exact assignment and bounded health/admission proof
 - `has_leader`: observed from local Raft metrics
 - `LocalVip.bound`: the set of VIPs this process itself attached
 - the local boot identity, admission certificate, expiry and issuer reservations
@@ -230,8 +231,10 @@ Plain-language algorithm:
 11. At the local effect boundary, the first bind must cross that fence. Once this process has safely
     bound the still-assigned VIP, a generation-scoped local activation proof prevents recovery of
     the recorded previous holder from revoking it. The proof is cleared on any unbind path and
-    never carries into another generation; all leader, health, consensus-freshness, holder, and
-    activation-tick gates still apply. If the previous holder releases after that first bind, the
+    never carries into another generation. New effects retain all leader,
+    health, consensus-freshness, holder and activation-tick gates;
+    bounded incumbent retention uses its separate completed witness.
+    If the previous holder releases after that first bind, the
     incumbent emits one more generation-scoped ARP/NA announcement so removal of a crash orphan cannot
     leave neighbors using the old holder's MAC.
 
@@ -259,15 +262,20 @@ That redistribution happens on every node after it has applied the same committe
 
 ## 5. Failover triggers
 
-A VIP stays bound on this node only while local gates, committed ownership, and leadership visibility all remain true at the same time.
+Acquisition requires local gates, committed ownership and leader visibility.
+A completed binding can survive temporary leader or transport loss only while
+its exact assignment, local health and original proof remain valid.
 
 ```mermaid
 stateDiagram-v2
   [*] --> Unbound
   Unbound --> Bound: leader exists && local_healthy && consensus_fresh && committed owner && fence open
   Bound --> Unbound: local health fails or times out
-  Bound --> Unbound: consensus_fresh becomes false
-  Bound --> Unbound: leader lost
+  Bound --> Retained: transport unavailable or leader lost
+  Retained --> Bound: continuous verified health proof and leader restored
+  Retained --> Unbound: proof expires or is revoked
+  Retained --> Unbound: health fails or assignment changes
+  Bound --> Unbound: proof expires or is revoked
   Bound --> Unbound: committed ownership moves away
   Bound --> Unbound: SIGINT / shutdown
 ```
@@ -283,7 +291,7 @@ The failover paths are:
   - successful service probes cannot reset this sticky fault; repair the
     cause and restart the process
 - This node stops being allowed to hold the VIP:
-  - no current leader, or
+  - its completed binding proof expires or is revoked, or
   - committed ownership moves to another node, or
   - the replacement fence is not yet open
 - A holder dies silently:
@@ -295,7 +303,14 @@ The failover paths are:
   - only the old holder's committed `VipReleased` opens the fence
   - a failed or unreadable kernel delete cannot be mistaken for a crash
 
-There is also a local self-fencing path for partitions: if this node cannot commit health or release updates anymore, `consensus_fresh` flips false and the VIP is unbound even before the rest of the cluster necessarily marks it stale.
+During a partition, failed transport closes acquisition and reassertion.
+Only a completed binding witness can retain an address, until the earlier
+of the original health request start plus H and the admission deadline
+accepted with that proof. Neither failure nor admission-only progress
+extends that deadline. Explicit rejection, local health loss, changed
+assignment or sealed authority revokes the witness. A proof received
+after expiry cannot revive old effects, even if the expiry worker has
+not yet run. Existing takeover and cleanup fences remain unchanged.
 
 ### Election stability with Pre-Vote
 
@@ -310,8 +325,8 @@ An isolated follower cannot collect that majority and repeatedly attempts
 Pre-Vote without inflating its saved term. When it reconnects to an
 upgraded, healthy majority, those unsuccessful attempts do not force the
 current leader to step down. This protects majority leadership, not the
-isolated follower's VIPs: failed health submissions or expiry of its local
-consensus proof still cause withdrawal, and the majority still reassigns
+isolated follower's VIPs indefinitely: expiry or rejection of its local
+health proof still causes withdrawal, and the majority still reassigns
 stale holders under the existing ownership fences.
 
 A process suspended with SIGSTOP cannot remove its kernel addresses while
@@ -322,9 +337,10 @@ during suspension.
 
 Actual leader loss still requires an election. A reachable majority can
 pass Pre-Vote and elect a replacement once the old leader is no longer
-fresh. The `has_leader`, `local_healthy`, `consensus_fresh`, applied-state,
-and ownership-fence gates remain unchanged; Pre-Vote never authorizes a
-VIP to remain bound through a failed gate. It also does not restore votes
+fresh. Pre-Vote does not grant VIP permission. New acquisition still
+requires leader visibility, local health, verified freshness, applied
+state and ownership fences. Only the separate completed-binding witness
+permits bounded retention during an election. Pre-Vote does not restore votes
 or history forgotten on a diskless restart, or replace the cluster
 incarnation fence.
 
@@ -383,13 +399,20 @@ Startup:
 
 Steady state:
 
-- `run_reconcile_loop` ticks every 250 ms.
+- `run_reconcile_loop` runs an independently cancellable worker per VIP,
+  normally checking its assignment every 250 ms. A slow bind or cleanup
+  for one address cannot hold up another address's proof expiry.
 - Each tick is idempotent: the loop recomputes "should bind?" from:
   - `has_leader`
   - `local_healthy`
   - `consensus_fresh`
   - committed `VipAssignment`
   - previous-holder release / staleness fence
+- A completed binding additionally records an opaque continuity stamp,
+  exact VIP/interface/prefix, assignment generation and local health
+  epoch. Temporary unavailability permits retention only, without
+  reassertion or completion of a pending bind. Hard revocation and
+  deadline cleanup do not depend on a successful later publication.
 - A nonzero steady-state delete is successful only if an exact-host query proves the address is
   already absent. Query failure or a still-present address keeps the VIP tracked and the release
   fence closed.
@@ -895,27 +918,39 @@ Features outside this list require an explicit project-scope decision before imp
 
 ### Process-local consensus proof expiry
 
-The composition root and release publisher share a `ConsensusFreshness` watch. Each
-successful health submit records its request-start instant; failures invalidate it immediately.
+The composition root and release publisher share a `ConsensusFreshness`
+watch. Only locally applied, runtime-verified healthy progress can
+record a production health proof. The proof captures its request-start
+instant, exact boot/genesis and accepting admission deadline. Explicit
+rejection invalidates it; transport unavailability closes acquisition
+without extending an existing completed-binding witness.
 Release acknowledgements do not renew the health proof because they do not refresh the
 node's replicated health tick.
 Its lifetime is `interval_ms * effective_stale_missed_probes` plus half the replicated
 activation-holdoff duration. This permits ordinary probe/RPC jitter at the minimum
-valid stale window. Expiry rechecks the latest proof so a queued renewal cannot lose to
-its previous timer deadline. The VIP adapter cancels
-active reconciliation on invalidation/expiry, withdraws all tracked VIPs, retries failed
-cleanup, and waits for a new proof before restarting binding reconciliation. While fenced,
-it still publishes proven release acknowledgements. On renewal, the adapter validates the
-current VIP effect and every retained bound VIP against newly applied state. An unchanged assignment, binding policy and
-mandatory gates allow the existing effect to finish, including effects longer than a probe
-interval. A changed intent cancels active work and cleans only the affected addresses
-before the rotating cursor advances. Unchanged VIPs stay bound without redundant notify
-events. Selective cleanup remains inside the same proof lifetime guard: expiry,
-invalidation or a closed mandatory gate still withdraws every tracked address, even if
-a fresh proof immediately follows an invalidation. Revocations arriving during cleanup
-are queued before reconciliation resumes. This also covers an already-bound tail VIP
-whose revocation would otherwise wait behind another VIP's slow RPC. Each VIP reads current applied state when its work begins;
-generation and takeover-delay memory survive renewals. This independent
+valid stale window. A renewal accepted before expiry can preserve
+continuity. A renewal arriving after expiry creates a new continuity
+epoch, even before a pending expiry handler runs. The VIP adapter cancels
+active acquisition on unavailability, and invalidation or expiry
+withdraws affected tracked VIPs, retries failed
+cleanup, and waits for a new proof before restarting binding reconciliation.
+After verified removal it may publish a release acknowledgement.
+Each VIP has a separate worker and completed-binding witness. Its
+acquisition permit guards binding, announcements and MASTER hooks;
+its retention permit only preserves an already completed binding.
+Neither permit outlives the proof deadline captured for that operation.
+Fresh evidence can authorize later work without extending an old
+in-flight operation. A changed intent cancels work and cleans the
+affected address. Unchanged VIPs stay bound without redundant notify
+events. Expiry, invalidation or local health loss requires cleanup even
+if recovery arrives before the worker observes the intermediate state.
+Independent workers prevent another VIP's slow effect or cleanup from
+delaying that check. Before each new effect and final bind confirmation,
+applied-state reads wait asynchronously under the original permit
+deadline. A held state lock cannot defer expiry cleanup or the timeout
+of an already started command. Waiting for tracking state requires a
+fresh authorization check before confirming a first bind.
+Generation and takeover-delay memory survive continuous renewals. This independent
 expiry prevents an isolated leader's blocked health probe or release RPC from retaining
 VIPs after survivors reassign them (#26). The elapsed-time check is entirely process-local;
 the replicated state machine still uses only committed probe rounds and contains no clock.
@@ -948,9 +983,11 @@ activated generation, or a first-ever assignment needs no additional wait. Assig
 restored after an ownerless interval still wait, because an absent previous-holder field
 does not prove that an old kernel released the address. This state is process-local and
 volatile; restart conservatively starts a new wait after startup cleanup.
-The allowance is one reconciliation tick plus two existing bounded `ip` command budgets
-per configured VIP (address and ownership marker removal). Safety assumes scheduling and
-kernel effects complete within these practical bounds; failed cleanup is retried and logged.
+The allowance is one reconciliation tick plus the existing bounded
+shutdown cleanup budget per configured VIP, including address and
+ownership-marker deletion, absence verification and retries. Safety
+assumes scheduling and kernel effects complete within these practical
+bounds; failed cleanup is retried and logged.
 
 The private-namespace regression is runnable as root with
 `KEEP_AFLOATD_BIN=/absolute/path/keepafloatd tests/e2e/scripts/isolated-health-proof.sh`.

@@ -177,13 +177,10 @@ mod tests {
             (
                 RaftRequest::Snapshot(SnapshotTransfer {
                     vote: VoteOf::<TypeConfig>::new(7, crate::raft::types::test_replica(2)),
-                    meta: openraft::SnapshotMeta {
-                        snapshot_id: "sample".into(),
-                        ..Default::default()
-                    },
+                    meta: openraft::SnapshotMeta::default(),
                     data: vec![0, 255],
                 }),
-                r#"{"install_snapshot":{"vote":{"leader_id":{"term":7,"node_id":"0000000000000002:2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"},"committed":false},"meta":{"last_log_id":null,"last_membership":{"log_id":null,"membership":{"configs":[],"nodes":{}}},"snapshot_id":"sample"},"data":[0,255]}}"#,
+                r#"{"install_snapshot":{"vote":{"leader_id":{"term":7,"node_id":"0000000000000002:2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a"},"committed":false},"meta":{"last_log_id":null,"last_membership":{"log_id":null,"membership":{"configs":[],"nodes":{}}},"snapshot_id":""},"data":[0,255]}}"#,
             ),
         ];
         for (request, expected) in cases {

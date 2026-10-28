@@ -34,13 +34,7 @@ check "ends uniquely held under asymmetric partition" wait_until 30 all_vips_uni
 
 evid "healing the one-way drop"
 heal_node "${C}"
-safe_healed_cluster() {
-  all_daemons_active &&
-    all_nodes_agree_on_leader &&
-    all_vips_uniquely_held &&
-    all_vips_pingable
-}
 check "safe reachable ownership persists after heal" \
-  wait_until 60 holds_for 5 safe_healed_cluster
+  wait_for_available_cluster
 
 scenario_end

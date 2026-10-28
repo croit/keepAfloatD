@@ -2,12 +2,181 @@
 
 All notable changes to keepafloatd. Versions follow the calendar scheme
 `vYYMM.N` used by the release pipelines. Issue numbers refer to the
-project tracker. `Unreleased` contains draft release notes, not an
-announcement that new artifacts are available.
+project tracker. Release preparation may precede publication; the
+published release pages confirm which artifacts are available.
 
-## Unreleased
+## v2610.1 (2026-10-28)
 
-Changes since `v2609.0`; version and release date are not yet assigned.
+Changes since `v2610.0`.
+
+### Upgrade notes
+
+- Protocol version 3, the configuration format and the packaged
+  systemd unit are unchanged. Upgrading from a release before
+  `v2610.0` still requires the
+  [protocol upgrade procedure](docs/operations.md#protocol-version-3-upgrade).
+- OpenRaft moves from `0.10.0-alpha.32` to `0.10.0-alpha.37`. Snapshot
+  metadata stays readable in both directions. A cluster mixing
+  `v2610.0` and `v2610.1` members was not tested. The tested path is
+  to stop every member, verify that its VIPs are released and start
+  all members on `v2610.1`, as in the
+  [coordinated upgrade](docs/operations.md#coordinated-upgrade-for-retained-holder-fencing)
+  steps. This interrupts VIP service.
+
+### VIP continuity
+
+- Keep a healthy, completed VIP binding through a short leader or
+  transport outage. In `v2610.0` any failed health or release submit
+  withdrew every local VIP. The binding is kept only until the earlier
+  of its health-proof deadline and the admission deadline accepted
+  with that proof, and it is never reasserted or newly acquired without
+  fresh authority. Health loss, an explicit rejection, reassignment and
+  expiry still withdraw the VIP. Elections longer than the remaining
+  proof lifetime can still interrupt service.
+- The binding is also kept while a peer restarts, while a periodic
+  reassert cannot reach the management service, and while another
+  configured member has a wrong cluster secret or a different
+  configuration. Such members never count toward quorum. `MASTER`
+  notifications and neighbor announcements of a VIP that stays
+  authorized still run to completion; notification delivery remains
+  best effort.
+- A rejoining node does not attract a VIP before its activation fence
+  lets it bind that address, so the current holder keeps serving it
+  until the replacement is ready.
+- A graceful stop no longer skips the VIP handoff when admission state
+  is briefly busy. Handoff still needs a working quorum and must finish
+  within `submit_timeout_ms`; otherwise the stale-holder fallback
+  applies.
+- A request addressed to a peer's previous process no longer closes
+  the restarted peer's current Raft connection, which could delay its
+  recovery.
+
+### Dependencies
+
+- Upgrade tokio to 1.54.1 for RUSTSEC-2026-0386.
+- Replace the unmaintained `serde_yaml` with `yaml_serde` 0.10.7 for
+  RUSTSEC-2024-0449. Configuration files are parsed as before.
+
+### Validation and known limits
+
+- The release candidate passed all 37 GitLab jobs on main, including
+  Docker E2E, source-export checks and offline archive builds. Its Rust
+  run passed 990 unit and 28 integration tests with 94.84 percent line
+  coverage. Release publication runs its own checks against the final
+  commit and version-stamped archive.
+- Real-cluster scenarios gained stricter snapshot, leader and
+  ownership evidence checks and isolated crash injection. The full
+  35-scenario live Ceph campaign was not rerun for this version.
+- Earlier VIP address commands that missed their deadline in CI and on
+  the Ceph test stand remain unexplained. A bind timeout latches local
+  FAULT; repair the cause and restart the affected daemon.
+- Runtime admission assumptions and the physical fencing limits listed
+  for `v2610.0` still apply. Native ARM execution and a live campaign
+  of the published artifacts are not established by cross-compilation
+  or Docker CI.
+
+## v2610.0 (2026-10-07)
+
+Changes since `v2609.1`.
+
+### Breaking upgrade requirements
+
+- Protocol version 3 is incompatible with earlier releases. Stop every
+  instance and prevent automatic restart, verify that all managed VIPs
+  and ownership markers are absent, then replace every binary and start
+  all members on the same version and configuration. Include offline
+  members before allowing them to rejoin. This interrupts VIP service;
+  a rolling or mixed-version upgrade is not supported. Follow the
+  [protocol upgrade procedure](docs/operations.md#protocol-version-3-upgrade).
+- Configure exactly one of `cluster_secret` and `cluster_secret_file`.
+  Every member must resolve the same random, cluster-unique secret of
+  32 to 256 UTF-8 bytes without whitespace or control characters.
+  Public placeholders are rejected. Keep secret-bearing files
+  root-owned and mode `0600`; resolve invalid secrets, conflicting VIP
+  bindings and invalid timing settings before starting the new version.
+- Each process now has a fresh boot identity and requires runtime
+  permission from a physical majority before participating in Raft.
+  Restart quarantine and a separate VIP activation fence add startup
+  delay. The shipped three-node, two-VIP examples have a combined
+  minimum safety wait of 208.4 seconds, before election, health and
+  network delays. An active systemd unit is not a readiness signal.
+  See [runtime admission](docs/runtime-admission.md) for calculations
+  and assumptions. No Raft or admission state is persisted to disk.
+
+### Security and recovery
+
+- Replace plaintext-secret exchanges with mutual HMAC-SHA256
+  challenge-response on both listeners. Tagged requests bind peer and
+  boot identities; admission, management and release records have
+  connection-bound MACs. There is no legacy authentication fallback.
+  This is not encryption: ordinary Raft and status records still lack
+  record integrity and sequence-number replay protection. Use an
+  authenticated encrypted tunnel on untrusted networks. See the
+  [authentication boundary](docs/authentication.md).
+- Require physical-majority admission, immutable genesis and committed
+  learner transitions for diskless restarts and rejoining. Expired
+  permission cannot be revived within the same process; run under a
+  supervisor that performs cleanup and restarts failed instances.
+- Add authenticated Pre-Vote to reduce disruption from an isolated
+  follower returning to the cluster. Reconnects, listener errors and
+  repeated rejected connections have bounded retry or warning behavior.
+- Account for complete command, reap and cleanup work before takeover
+  without a release acknowledgement. Failed cleanup never proves that
+  a previous holder has released its VIPs.
+
+### VIP lifecycle and operations
+
+- Latch bind failures as local FAULT, stop reporting healthy eligibility
+  and permit handoff only after verified cleanup. Repair the cause and
+  restart the affected daemon; successful service probes alone do not
+  clear the bind fault.
+- Verify VIP absence independently of interface names, handle graceful
+  shutdown handoff, and clean up before supervised SIGHUP/SIGQUIT
+  restarts. Add `--cleanup-only` and packaged `ExecStopPost` recovery.
+  Never run cleanup-only alongside a live instance.
+- Extend the packaged systemd stop deadline at bounded work checkpoints
+  for large cleanup inventories. A stalled task cannot renew its own
+  deadline. Custom supervisors must support the notification mechanism.
+- Send bounded IPv4 and IPv6 neighbor announcements in the background.
+  Warn when IPv4 secondary-address promotion settings could remove
+  neighboring addresses, without changing those settings automatically.
+- Serialize notification hooks through a bounded queue. Overflow and
+  shutdown cancellation are reported; hooks remain advisory and do not
+  delay address cleanup or provide guaranteed delivery.
+
+### Validation and known limits
+
+- The preparation baseline passed all 37 GitLab jobs, including Docker
+  E2E, source-export checks and offline archive builds. Its Rust run
+  passed 895 unit and 28 integration tests, with 94.82 percent line
+  coverage and the per-file coverage gate. Release publication runs
+  its own checks against the final commit and version-stamped archive.
+- All 35 documented real-cluster scenarios and their required helpers
+  are included in the public export. Inventory, syntax and local
+  harness self-tests passed. The full 35-scenario live Ceph campaign
+  was not rerun for this version. The September campaign below is
+  historical evidence for `v2609.1`, not validation of `v2610.0`.
+- The legacy local helper `scripts/ci/e2e-dry-run.sh` is incompatible
+  with current configuration validation and is not supported smoke
+  coverage for this release. Use the documented Docker Compose suite
+  instead. This limitation does not concern the separate 35-scenario
+  real-cluster harness; the legacy helper's repair is deferred.
+- Genuine leader loss can still withdraw healthy incumbents' VIPs
+  under the existing consensus-freshness gates. The unfinished change
+  to preserve those incumbents is not included. This release does not
+  promise uninterrupted VIP service during leader changes.
+- Runtime admission assumes bounded clock-rate differences, scheduling
+  and address cleanup. It cannot physically fence a suspended machine
+  or a kernel that retains addresses. Deployments requiring protection
+  against those failures need independent fencing and verified cleanup.
+- OpenRaft remains at `0.10.0-alpha.32`. Native ARM execution and a
+  full live-cluster campaign of the final published artifacts are not
+  established by cross-compilation or Docker CI.
+
+## v2609.1 (2026-09-30)
+
+Changes since `v2609.0`. The campaign and upgrade notes in this section
+describe that historical release, not later versions.
 
 ### Fixed
 

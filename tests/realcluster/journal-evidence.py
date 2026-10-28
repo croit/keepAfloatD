@@ -12,7 +12,8 @@ EPOCH_FENCE = ("ERROR keepafloatd::raft::control: stale cluster incarnation conf
 REPLICA = r"[0-9a-f]{16}:[0-9a-f]{64}"
 SNAPSHOT = re.compile(
     r"^INFO openraft::core::raft_core: sm::StateMachine command done: "
-    r"BuildSnapshotDone: \{snapshot_id: ([^,]+), last_log:T[0-9]+-N" + REPLICA + r"\.([0-9]+),"
+    r"BuildSnapshotDone: \{(?:snapshot_id: [^,]+, )?last_log:"
+    r"(T[0-9]+-N" + REPLICA + r"\.([0-9]+)),"
 )
 PURGE = re.compile(
     r"^INFO openraft::engine::handler::log_handler: purge log, .*"
@@ -50,13 +51,15 @@ def leader_transition(lines):
         line = ANSI.sub("", line).strip()
         if "raft current leader is now " in line:
             latest = line.split("raft current leader is now ", 1)[1]
+    if latest is None:
+        raise EvidencePending("a leader transition has not been observed")
     if latest == "None":
         return "none"
     match = re.fullmatch(
         r"Some\(ReplicaId \{ physical_id: ([0-9]{1,20}), boot_nonce: \[([0-9, ]+)\] \}\)", latest or ""
     )
     if not match:
-        raise ValueError("missing or malformed latest leader identity")
+        raise ValueError("malformed latest leader identity")
     physical = int(match[1])
     nonce = match[2].split(", ")
     if physical >= 1 << 64 or len(nonce) != 32 or any(

@@ -117,31 +117,151 @@ example_preserves_environment_credentials() (
 )
 
 hard_kill_is_scoped_and_propagates_failure() (
-  local fixture mode=success
+  local calls=0 mode=success
+  NODE_IPS=(fixture-node)
+  NODE_INSTANCES=(selected)
+  node_sh() {
+    calls=$((calls + 1))
+    [[ "$1" == fixture-node && "$2" == *'crash_systemd_unit keepafloatd@selected.service' ]] || return 64
+    [[ "${mode}" != transport ]]
+  }
+  kafd_kill fixture-node || return 1
+  mode=transport
+  ! kafd_kill fixture-node || return 1
+  calls=0
+  ! kafd_kill unknown-node || return 1
+  NODE_INSTANCES=('../escape')
+  ! kafd_kill fixture-node || return 1
+  [[ "${calls}" -eq 0 ]]
+)
+
+crash_supervisor_fixture() {
   fixture="$(mktemp -d)"
   trap 'rm -rf "${fixture}"' EXIT
   NODE_IPS=(fixture-node)
   NODE_INSTANCES=(selected)
-  node_sh() { eval "$2"; }
-  pkill() { printf 'broad kill\n' >> "${fixture}/bad"; }
+  mkdir "${fixture}/systemd"
+  touch "${fixture}/orphan" "${fixture}/active"
+  printf 'Restart=on-failure\nExecStopPost=cleanup\n' > "${fixture}/settings"
+  export fixture crash_mode=success
+  node_sh() {
+    local script="${2//\/run\/systemd\/system/${fixture}/systemd}"
+    [[ "$1" == fixture-node ]] || return 1
+    bash -c "${script}"
+  }
+  printf() {
+    if [[ "${crash_mode}" == write-failure && "$1" == '[Service]\nRestart=no\nExecStopPost=\n' ]]; then
+      builtin printf '[Service]\nRestart=no\n'
+      return 1
+    fi
+    builtin printf "$@"
+  }
+  export -f printf
   systemctl() {
-    [[ "${*: -1}" == keepafloatd@selected ]] || { touch "${fixture}/bad"; return 1; }
-    printf '%s\n' "$1" >> "${fixture}/calls"
-    case "$1" in
-      kill) [[ "${mode}" != kill-failure ]] ;;
-      stop) [[ "${mode}" != stop-failure ]] ;;
-      is-active) [[ "${mode}" == still-active ]] ;;
-      *) return 1 ;;
+    local operation="$1" unit="${*: -1}" key line
+    printf '%s\n' "${operation}" >> "${fixture}/calls"
+    if [[ "${operation}" == daemon-reload ]]; then
+      if [[ -e "${fixture}/systemd/keepafloatd@selected.service.d/zzzz-keepafloatd-test-crash.conf" ]]; then
+        [[ "${crash_mode}" != reload-failure ]] || return 1
+        [[ "$(<"${fixture}/systemd/keepafloatd@selected.service.d/zzzz-keepafloatd-test-crash.conf")" == \
+          $'[Service]\nRestart=no\nExecStopPost=' ]] || return 1
+        printf 'Restart=no\nExecStopPost=\n' > "${fixture}/settings"
+        [[ "${crash_mode}" != override-ignored ]] ||
+          printf 'Restart=on-failure\nExecStopPost=cleanup\n' > "${fixture}/settings"
+      else
+        [[ "${crash_mode}" != restore-failure ]] || return 1
+        [[ "${crash_mode}" != restore-ignored ]] || return 0
+        printf 'Restart=on-failure\nExecStopPost=cleanup\n' > "${fixture}/settings"
+      fi
+      return 0
+    fi
+    [[ "${unit}" == keepafloatd@selected || "${unit}" == keepafloatd@selected.service ]] || return 64
+    case "${operation}" in
+      show)
+        [[ "${crash_mode}" != show-failure ]] || return 1
+        for key in Restart ExecStopPost MainPID ControlPID ActiveState; do
+          [[ " $* " == *" --property=${key} "* ]] || continue
+          case "${key}" in
+            Restart|ExecStopPost) line="$(grep "^${key}=" "${fixture}/settings")" ;;
+            MainPID) if [[ -e "${fixture}/active" || "${crash_mode}" == remaining-main ]]; then line=MainPID=42; else line=MainPID=0; fi ;;
+            ControlPID) if [[ "${crash_mode}" == remaining-control ]]; then line=ControlPID=43; else line=ControlPID=0; fi ;;
+            ActiveState)
+              if [[ "${crash_mode}" == unknown-state ]]; then line=ActiveState=unknown
+              elif [[ -e "${fixture}/active" ]]; then line=ActiveState=active
+              elif [[ "${crash_mode}" == inactive ]]; then line=ActiveState=inactive
+              else line=ActiveState=failed; fi ;;
+          esac
+          if [[ -z "${line#*=}" && " $* " != *' --value '* ]]; then continue; fi
+          if [[ " $* " == *' --value '* ]]; then printf '%s\n' "${line#*=}"; else printf '%s\n' "${line}"; fi
+        done ;;
+      kill)
+        [[ " $* " == *' --signal=SIGKILL '* && " $* " == *' --kill-who=all '* ]] || return 64
+        [[ "${crash_mode}" != interrupted ]] || kill -TERM "${BASHPID}"
+        [[ "${crash_mode}" != kill-failure ]] || return 1
+        grep -Fxq 'ExecStopPost=' "${fixture}/settings" || rm -f "${fixture}/orphan"
+        grep -Fxq 'Restart=no' "${fixture}/settings" || touch "${fixture}/restarted"
+        rm -f "${fixture}/active" ;;
+      stop)
+        [[ "${crash_mode}" != stop-failure ]] || return 1
+        [[ "${crash_mode}" != still-active ]] || touch "${fixture}/active" ;;
+      is-active) [[ -e "${fixture}/active" ]] ;;
+      *) return 64 ;;
     esac
   }
+  export -f systemctl
+}
+
+crash_retains_orphans_and_restores_supervision() (
+  local fixture
+  crash_supervisor_fixture
+  crash_mode="${1:-success}"
   kafd_kill fixture-node || return 1
-  [[ ! -e "${fixture}/bad" && "$(<"${fixture}/calls")" == $'kill\nstop\nis-active' ]] || return 1
-  for mode in kill-failure stop-failure still-active; do
-    ! kafd_kill fixture-node || return 1
-  done
-  : > "${fixture}/calls"
-  ! kafd_kill unknown-node || return 1
-  [[ ! -s "${fixture}/calls" ]]
+  [[ -e "${fixture}/orphan" && ! -e "${fixture}/active" &&
+    ! -e "${fixture}/restarted" ]] || return 1
+  [[ "$(<"${fixture}/settings")" == $'Restart=on-failure\nExecStopPost=cleanup' ]] || return 1
+  [[ -z "$(find "${fixture}/systemd" -mindepth 1 -print)" ]]
+)
+
+crash_restores_supervision_after_failure() (
+  local fixture crash_mode="${1:?}"
+  crash_supervisor_fixture
+  crash_mode="$1"
+  ! kafd_kill fixture-node >/dev/null 2>&1 || return 1
+  [[ "$(<"${fixture}/settings")" == $'Restart=on-failure\nExecStopPost=cleanup' ]] || return 1
+  [[ -z "$(find "${fixture}/systemd" -mindepth 1 -print)" ]]
+)
+
+crash_preserves_existing_overrides() (
+  local fixture directory
+  crash_supervisor_fixture
+  directory="${fixture}/systemd/keepafloatd@selected.service.d"
+  mkdir "${directory}"
+  printf 'operator content\n' > "${directory}/zzzz-keepafloatd-test-crash.conf"
+  ! kafd_kill fixture-node >/dev/null 2>&1 || return 1
+  [[ "$(<"${directory}/zzzz-keepafloatd-test-crash.conf")" == 'operator content' &&
+    -e "${fixture}/active" ]] || return 1
+  rm "${directory}/zzzz-keepafloatd-test-crash.conf"
+  printf 'operator content\n' > "${directory}/operator.conf"
+  kafd_kill fixture-node || return 1
+  [[ "$(<"${directory}/operator.conf")" == 'operator content' &&
+    ! -e "${directory}/zzzz-keepafloatd-test-crash.conf" ]]
+)
+
+crash_reports_failed_supervision_restore() (
+  local fixture
+  crash_supervisor_fixture
+  crash_mode="${1:?}"
+  ! kafd_kill fixture-node >/dev/null 2>&1
+)
+
+crash_rejects_symlinked_override_directory() (
+  local fixture
+  crash_supervisor_fixture
+  mkdir "${fixture}/operator"
+  ln -s "${fixture}/operator" "${fixture}/systemd/keepafloatd@selected.service.d"
+  ! kafd_kill fixture-node >/dev/null 2>&1 || return 1
+  [[ -L "${fixture}/systemd/keepafloatd@selected.service.d" &&
+    -e "${fixture}/active" && -z "$(find "${fixture}/operator" -mindepth 1 -print)" ]]
 )
 
 d16_activation_evidence_fails_closed() (
@@ -527,6 +647,18 @@ assert "API auth explicitly uses Bash on the management node" api_auth_uses_bash
 assert "API request arguments remain separate" api_request_arguments_remain_separate
 assert "example preserves environment credentials" example_preserves_environment_credentials
 assert "hard kill targets one unit and propagates failures" hard_kill_is_scoped_and_propagates_failure
+assert "hard crash retains orphans and restores supervision" crash_retains_orphans_and_restores_supervision
+assert "hard crash also accepts an inactive stopped unit" crash_retains_orphans_and_restores_supervision inactive
+for crash_failure in write-failure reload-failure override-ignored show-failure kill-failure stop-failure \
+  still-active remaining-main remaining-control unknown-state interrupted; do
+  assert "hard crash restores supervision after ${crash_failure}" \
+    crash_restores_supervision_after_failure "${crash_failure}"
+done
+assert "hard crash preserves existing unit overrides" crash_preserves_existing_overrides
+for crash_failure in restore-failure restore-ignored; do
+  assert "hard crash reports ${crash_failure}" crash_reports_failed_supervision_restore "${crash_failure}"
+done
+assert "hard crash rejects symlinked overrides" crash_rejects_symlinked_override_directory
 assert "D16 rejects legacy framing without rolling old binaries" d16_activation_evidence_fails_closed
 assert "final audit requires a campaign start" final_audit_requires_a_campaign_start
 assert "failed backup removes only its own captures" failed_backup_removes_only_its_own_captures

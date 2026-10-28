@@ -8,6 +8,8 @@ export ROOT_DIR
 . "${ROOT_DIR}/tests/e2e/scripts/lib.sh"
 # shellcheck source=tests/e2e/scripts/report.sh
 . "${ROOT_DIR}/tests/e2e/scripts/report.sh"
+# shellcheck source=tests/e2e/scripts/command-observer.sh
+. "${ROOT_DIR}/tests/e2e/scripts/command-observer.sh"
 
 readonly SCENARIO_DIR="${ROOT_DIR}/tests/e2e/scenarios"
 
@@ -30,6 +32,7 @@ selected_scenarios() {
 }
 
 down_cluster() {
+  command_observer_stop
   compose down -v --remove-orphans
 }
 
@@ -37,6 +40,11 @@ run_scenario() {
   local scenario_path="${1:?scenario path required}"
   local scenario_name
   scenario_name="$(basename "${scenario_path}" .sh)"
+  local KEEPAFLOATD_E2E_CONFIG_DIR="${KEEPAFLOATD_E2E_CONFIG_DIR:-configs}"
+  if [[ "${scenario_name}" == 03_kill_leader ]]; then
+    KEEPAFLOATD_E2E_CONFIG_DIR=configs-continuity
+  fi
+  export KEEPAFLOATD_E2E_CONFIG_DIR
 
   log "starting ${scenario_name}"
   local status=0
@@ -50,9 +58,23 @@ run_scenario() {
   mkdir -p "${artifact_dir}"
 
   if {
-    reset_cluster &&
-      wait_for_startup_state &&
-      bash "${scenario_path}"
+    trap 'command_observer_stop' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if reset_cluster &&
+        command_observer_start "${artifact_dir}" "${scenario_name}" &&
+        wait_for_startup_state &&
+        bash "${scenario_path}"; then
+      status=0
+    else
+      status=$?
+    fi
+    if ! command_observer_stop; then
+      log "command observation failed; inspect its artifacts"
+      (( status != 0 )) || status=1
+    fi
+    trap - EXIT
+    exit "${status}"
   } 2>&1 | tee "${run_log}"; then
     status=0
   else

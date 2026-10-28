@@ -1,9 +1,10 @@
 //! Bounded cold, learner and renewal rounds driven by the supervised daemon task.
 
 use super::*;
+use crate::consensus_freshness::failure::{FailureKind, failure_kind, unavailable};
 use crate::raft::admission::{AdmissionRound, AppliedHealthProgress, ReceivedGrant};
 use crate::raft::types::{KafRequest, TypeConfig};
-use futures::future::join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use openraft::alias::LogIdOf;
 use openraft::async_runtime::WatchReceiver;
 use std::collections::BTreeMap;
@@ -47,6 +48,15 @@ impl RuntimeDriver {
         network: &RaftNetworkImpl,
         healthy: bool,
     ) -> anyhow::Result<(Instant, LogIdOf<TypeConfig>)> {
+        let proof = self.submit_health_proof(network, healthy).await?;
+        Ok((proof.started(), proof.log_id()))
+    }
+
+    pub(crate) async fn submit_health_proof(
+        &self,
+        network: &RaftNetworkImpl,
+        healthy: bool,
+    ) -> anyhow::Result<VerifiedProgress> {
         self.renew(network, Some(healthy)).await
     }
 
@@ -209,7 +219,7 @@ impl RuntimeDriver {
         round: &mut AdmissionRound,
         grants: &[ReceivedGrant],
         bootstrap: Option<PreparedJoin>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<proof::InstalledAdmission> {
         let verified = self
             .core
             .lock()
@@ -237,14 +247,19 @@ impl RuntimeDriver {
                 .get_or_insert(Instant::now());
         }
         if state.admission.is_none() {
-            state.bind_admission(session)?;
+            state.bind_admission(session.clone())?;
             *self
                 .bootstrap_join
                 .lock()
                 .map_err(|_| AdmissionDenied("bootstrap lock poisoned"))? =
                 verified.join_bootstrap().cloned();
         }
-        Ok(())
+        Ok(proof::InstalledAdmission {
+            session,
+            deadline: verified.deadline(),
+            started: round.request_started(),
+            request: round.request().clone(),
+        })
     }
 
     pub(super) async fn grants(
@@ -253,44 +268,72 @@ impl RuntimeDriver {
         round: &AdmissionRound,
         targets: &BTreeSet<ReplicaId>,
     ) -> anyhow::Result<Vec<ReceivedGrant>> {
+        self.collect_grants(network, round, targets, false).await
+    }
+
+    pub(super) async fn grants_for_health(
+        &self,
+        network: &RaftNetworkImpl,
+        round: &AdmissionRound,
+        targets: &BTreeSet<ReplicaId>,
+    ) -> anyhow::Result<Vec<ReceivedGrant>> {
+        self.collect_grants(network, round, targets, true).await
+    }
+
+    async fn collect_grants(
+        &self,
+        network: &RaftNetworkImpl,
+        round: &AdmissionRound,
+        targets: &BTreeSet<ReplicaId>,
+        reject_invalid: bool,
+    ) -> anyhow::Result<Vec<ReceivedGrant>> {
         let request = round.request().clone();
-        let results = join_all(targets.iter().map(|target| async {
-            if *target == self.local {
-                let binding = fresh_nonce()?;
-                let record = SignedAdmission::sign(
-                    self.cfg.cluster_secret.as_deref(),
-                    10,
-                    self.local,
-                    self.local,
-                    binding,
-                    request.clone(),
-                )?;
-                let response = tokio::time::timeout(
-                    self.rpc_budget(),
-                    self.dispatch(self.local, binding, record),
-                )
-                .await
-                .map_err(|_| anyhow::anyhow!("local admission grant timed out"))??;
-                Ok(ReceivedGrant::authenticate(
-                    self.cfg.cluster_secret.as_deref(),
-                    self.local,
-                    self.local,
-                    binding,
-                    &request,
-                    response,
-                )?)
-            } else {
-                network
-                    .admission_rpc(*target, request.clone(), self.rpc_budget())
+        let mut results: FuturesUnordered<_> = targets
+            .iter()
+            .map(|target| async {
+                if *target == self.local {
+                    let binding = fresh_nonce()?;
+                    let record = SignedAdmission::sign(
+                        self.cfg.cluster_secret.as_deref(),
+                        10,
+                        self.local,
+                        self.local,
+                        binding,
+                        request.clone(),
+                    )?;
+                    let response = tokio::time::timeout(
+                        self.rpc_budget(),
+                        self.dispatch(self.local, binding, record),
+                    )
                     .await
-            }
-        }))
-        .await;
+                    .map_err(|error| {
+                        anyhow::Error::new(error).context("local admission grant timed out")
+                    })??;
+                    Ok(ReceivedGrant::authenticate(
+                        self.cfg.cluster_secret.as_deref(),
+                        self.local,
+                        self.local,
+                        binding,
+                        &request,
+                        response,
+                    )?)
+                } else {
+                    network
+                        .admission_rpc(*target, request.clone(), self.rpc_budget())
+                        .await
+                }
+            })
+            .collect();
         let mut grants = Vec::new();
-        for result in results {
+        while let Some(result) = results.next().await {
             match result {
                 Ok(grant) => grants.push(grant),
-                Err(error) => tracing::debug!(%error, "admission issuer did not grant this round"),
+                Err(error) => {
+                    tracing::debug!(%error, "admission issuer did not grant this round");
+                    if reject_invalid && failure_kind(&error) == FailureKind::Rejected {
+                        return Err(error);
+                    }
+                }
             }
         }
         Ok(grants)
@@ -324,7 +367,7 @@ impl RuntimeDriver {
             }
         })
         .await
-        .map_err(|_| anyhow::anyhow!("local progress apply timed out"))?
+        .map_err(|error| anyhow::Error::new(error).context("local progress apply timed out"))?
     }
 
     async fn establish_genesis(&self) -> anyhow::Result<()> {
@@ -420,6 +463,10 @@ impl RuntimeDriver {
         action: ManagementAction,
         peers: &BTreeSet<ReplicaId>,
     ) -> anyhow::Result<ManagementResult> {
+        let health_proof = matches!(
+            &action,
+            ManagementAction::Progress(progress) if progress.healthy.is_some()
+        );
         let mut pending: Vec<_> = peers.iter().copied().collect();
         let mut visited = BTreeSet::new();
         while let Some(peer) = pending.pop() {
@@ -429,7 +476,9 @@ impl RuntimeDriver {
             let response = if peer == self.local {
                 tokio::time::timeout(self.rpc_budget(), self.manage(peer, action.clone()))
                     .await
-                    .map_err(|_| anyhow::anyhow!("local management timed out"))
+                    .map_err(|error| {
+                        anyhow::Error::new(error).context("local management timed out")
+                    })
                     .and_then(|result| result)
             } else {
                 network
@@ -445,11 +494,16 @@ impl RuntimeDriver {
                 }
                 Ok(result) => return Ok(result),
                 Err(error) => {
-                    tracing::debug!(%error, peer = %peer, "management operation deferred")
+                    tracing::debug!(%error, peer = %peer, "management operation deferred");
+                    if health_proof && failure_kind(&error) == FailureKind::Rejected {
+                        return Err(error);
+                    }
                 }
             }
         }
-        anyhow::bail!("no reachable admitted leader completed management operation")
+        Err(unavailable(
+            "no reachable admitted leader completed management operation",
+        ))
     }
 }
 

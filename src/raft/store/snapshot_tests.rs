@@ -112,7 +112,6 @@ fn snapshot_meta(snapshot: &KafSnapshot) -> SnapshotMetaOf<TypeConfig> {
     SnapshotMeta {
         last_log_id: snapshot.last_applied,
         last_membership: snapshot.last_membership.clone(),
-        snapshot_id: "fixture".into(),
     }
 }
 

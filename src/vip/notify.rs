@@ -24,6 +24,8 @@ struct Lifecycle {
 pub(super) struct Notifications {
     lifecycle: Mutex<Lifecycle>,
     failure: watch::Sender<Option<String>>,
+    #[cfg(test)]
+    pub(super) next_authorized_hook: Mutex<Option<Hook>>,
 }
 
 impl Default for Notifications {
@@ -31,6 +33,8 @@ impl Default for Notifications {
         Self {
             lifecycle: Mutex::new(Lifecycle::default()),
             failure: watch::channel(None).0,
+            #[cfg(test)]
+            next_authorized_hook: Mutex::new(None),
         }
     }
 }
@@ -42,6 +46,58 @@ enum Rejected {
 }
 
 impl Notifications {
+    pub(super) async fn send_authorized(
+        &self,
+        script: &str,
+        vip_addr: &str,
+        dry_run: bool,
+        effect: std::sync::Arc<super::witness::RetainedEffect>,
+    ) {
+        if !effect.check_live() {
+            tracing::info!(target: "keepafloatd::vip",
+                "notify skipped, {vip_addr} is no longer held: {script} INSTANCE {vip_addr} MASTER");
+            return;
+        }
+        let script_owned = script.to_owned();
+        let vip_owned = vip_addr.to_owned();
+        let hook: Hook = Box::pin(async move {
+            if dry_run {
+                tracing::info!(target: "keepafloatd::vip",
+                    "dry-run: would notify {script_owned} INSTANCE {vip_owned} MASTER");
+            } else {
+                run_notify_script(
+                    script_owned,
+                    vip_owned,
+                    VipState::Master,
+                    NOTIFY_SCRIPT_TIMEOUT,
+                )
+                .await;
+            }
+        });
+        #[cfg(test)]
+        let hook = self
+            .next_authorized_hook
+            .lock()
+            .await
+            .take()
+            .unwrap_or(hook);
+        let vip_held = vip_addr.to_owned();
+        let guarded = async move {
+            if effect.start(hook).await.is_none() {
+                tracing::info!(target: "keepafloatd::vip",
+                    "MASTER notify for {vip_held} not started: the VIP was released while it waited");
+            }
+        };
+        if dry_run {
+            guarded.await;
+            return;
+        }
+        if let Err(reason) = self.enqueue(Box::pin(guarded)).await {
+            tracing::warn!(target: "keepafloatd::vip", ?reason, capacity = QUEUE_CAPACITY,
+                "notify dropped: {script} INSTANCE {vip_addr} MASTER");
+        }
+    }
+
     pub(super) async fn send(&self, script: &str, vip_addr: &str, state: VipState, dry_run: bool) {
         if dry_run {
             tracing::info!(target: "keepafloatd::vip",

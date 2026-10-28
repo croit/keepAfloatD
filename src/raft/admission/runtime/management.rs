@@ -32,9 +32,9 @@ impl RuntimeDriver {
         let raft = self.raft()?;
         let leader = raft.metrics().borrow_watched().current_leader;
         if leader != Some(self.local) {
-            return leader
-                .map(ManagementResult::Redirect)
-                .ok_or_else(|| anyhow::anyhow!("management has no elected leader"));
+            return leader.map(ManagementResult::Redirect).ok_or_else(|| {
+                crate::consensus_freshness::failure::unavailable("management has no elected leader")
+            });
         }
         session.check()?;
         match action {
@@ -245,7 +245,17 @@ impl RuntimeDriver {
         request: KafRequest,
     ) -> anyhow::Result<LogIdOf<TypeConfig>> {
         self.coherent_session().await?.check()?;
-        let response = raft.client_write(request).await?;
+        let response = match raft.client_write(request).await {
+            Ok(response) => response,
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(_),
+            )) => {
+                return Err(crate::consensus_freshness::failure::unavailable(
+                    "management leader changed during submission",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        };
         match response.data {
             KafResponse::Ok => Ok(response.log_id),
             KafResponse::Rejected(reason) => anyhow::bail!("admission command rejected: {reason}"),

@@ -17,7 +17,11 @@ for vip in "${VIPS[@]}"; do
   original_holders["${vip}"]="$(holder_for_vip "${vip}")"
 done
 assert_unique_holders
-log "current leader is ${old_leader_svc} (id ${old_leader_id}); killing it"
+continuity_checkpoint="$(log_checkpoint)" || {
+  fail "cannot capture pre-failure VIP continuity evidence"
+  exit 1
+}
+log "current leader is ${old_leader_svc} (id ${old_leader_id}); killing it at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 kill_service "${old_leader_svc}" KILL
 wait_for_service_exit "${old_leader_svc}" 10
@@ -43,5 +47,6 @@ for vip in "${VIPS[@]}"; do
     fail "leader loss moved healthy survivor VIP ${vip} from ${before} to ${after}"
     exit 1
   }
+  assert_vip_continuity_after "${continuity_checkpoint}" "${before}" "${vip}"
 done
-log "healthy survivors retained their VIP assignments after leader failover"
+log "healthy survivors retained their VIPs without removal during leader failover"

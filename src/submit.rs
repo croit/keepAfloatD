@@ -195,10 +195,11 @@ pub async fn submit_request(
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(forward))) => {
                 let leader = match forward.leader_id {
                     Some(leader) => leader,
-                    None => raft
-                        .current_leader()
-                        .await
-                        .context("release submit has no leader")?,
+                    None => raft.current_leader().await.ok_or_else(|| {
+                        crate::consensus_freshness::failure::unavailable(
+                            "release submit has no leader",
+                        )
+                    })?,
                 };
                 proof::forward_release(cfg, &authority, leader, req).await?
             }

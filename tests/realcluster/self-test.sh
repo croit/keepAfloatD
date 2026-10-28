@@ -1036,7 +1036,7 @@ d9_parallel_restart_checks_every_child() {
 }
 
 hard_kill_verifies_the_service_stayed_down() {
-  declare -f kafd_kill | grep -q 'systemctl is-active'
+  declare -f crash_systemd_unit | grep -q 'systemctl is-active'
 }
 
 steady_state_rechecks_ownership_after_leader_observation() (

@@ -36,7 +36,8 @@ kafd_stop "${leader_ip}"
 survivors_agree_on_new_leader() {
   local s lid agreed=""
   for s in $(nodes_except "${leader_ip}"); do
-    lid="$(leader_seen_by_since "${s}" "${fault_since}")"
+    lid="$(leader_seen_by_since "${s}" "${fault_since}")" || return 1
+    [[ "$lid" != none ]] || return 1
     replica_is_configured "$lid" || return 1
     [[ "$lid" != "$old_leader_replica" && "$(replica_physical_id "$lid")" != "$old_leader_id" ]] || return 1
     [[ -z "${agreed}" || "${agreed}" == "${lid}" ]] || return 1

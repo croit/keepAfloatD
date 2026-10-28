@@ -19,6 +19,8 @@ move_at=-1
 exit_at=-1
 armed_at=28
 guard_calls=0
+hidden_gap=false
+continuity_calls=0
 restart_observation_now() { printf '%s\n' "${fake_now}"; }
 sleep() { fake_now=$((fake_now + 1)); }
 startup_budget_seconds() { printf '80\n'; }
@@ -38,12 +40,17 @@ assert_no_duplicate_holders() {
   ((overlap_at < 0 || fake_now < overlap_at))
 }
 assert_unique_holders() { assert_no_duplicate_holders && vip_held_by; }
+assert_vip_continuity_after() {
+  [[ "$1 $2 $3" == "checkpoint node-b ${VIP}" ]] || return 1
+  continuity_calls=$((continuity_calls + 1))
+  [[ "$hidden_gap" == false ]]
+}
 dump_cluster_diagnostics() { :; }
 
 declare -F assert_nopreempt_after_restart >/dev/null || {
   fail 'restart oracle does not wait for current-boot activation'; exit 1;
 }
-assert_nopreempt_after_restart node-a "${old_boot}" node-b
+assert_nopreempt_after_restart node-a "${old_boot}" node-b checkpoint
 ((fake_now >= 72 && guard_calls >= 65)) || {
   fail 'observation finished before the activation fence plus six seconds'; exit 1;
 }
@@ -60,7 +67,7 @@ for failure in overlap move exit missing_armed observation_overlap observation_m
     observation_move) move_at=68 ;;
     observation_exit) exit_at=68 ;;
   esac
-  if assert_nopreempt_after_restart node-a "${old_boot}" node-b 2>/dev/null; then
+  if assert_nopreempt_after_restart node-a "${old_boot}" node-b checkpoint 2>/dev/null; then
     fail "accepted ${failure}"; exit 1
   fi
   case "${failure}" in
@@ -70,6 +77,16 @@ for failure in overlap move exit missing_armed observation_overlap observation_m
   esac
   printf 'PASS: rejects %s during wait or observation\n' "${failure}"
 done
+
+fake_now=0; overlap_at=-1; move_at=-1; exit_at=-1; armed_at=28
+hidden_gap=true
+if assert_nopreempt_after_restart node-a "${old_boot}" node-b checkpoint; then
+  fail 'accepted a removal and rebind between address observations'; exit 1
+fi
+[[ "$continuity_calls" == 2 ]] || {
+  fail 'restart oracle did not check both complete continuity windows'; exit 1;
+}
+printf 'PASS: transient removal or incomplete logs fail the continuity check\n'
 
 fake_now=100; restart_seen_boot=''; restart_admitted_at=''
 compose() {

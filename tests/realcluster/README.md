@@ -56,6 +56,13 @@ objects. Use only an explicitly authorized disposable cluster, never a productio
 The runner restores captured configs and binaries, but test users, buckets, objects, and
 evidence can remain. Review the selected scenarios and prepare recovery access first.
 
+Crash injection temporarily disables automatic restart and `ExecStopPost`
+for only the selected instance, preserving kernel orphans for startup
+cleanup assertions. It verifies the effective override before SIGKILL,
+stops the instance, then removes its runtime drop-in and restores the
+original supervision settings. Errors fail the scenario, including a
+failed restoration. Other unit overrides are preserved.
+
 The controller requires Linux, Bash 4+, GNU coreutils (including `timeout` and `base64 -w0`),
 OpenSSH, `jq`, `openssl`, Python 3, and `setsid`. The management node needs Bash, `s3cmd`, `curl`,
 Python 3, and the Ceph administration tools. The nodes need systemd, iproute2, iptables,
@@ -121,6 +128,21 @@ node's monotonic clock. Kernel uniqueness is checked throughout that wait. Missi
 admission is pending; malformed evidence, transport failures, or a changed invocation
 fail the check. Normal failover deadlines and post-activation observation windows
 are unchanged.
+
+The default outer scenario limit is 1800 seconds. C4 adds six times the
+largest current invocation's reported startup safety wait, once for each
+sequential restart. The round count is shared with the scenario; no
+admission formula is copied into the runner. Unreadable or invalid timing
+evidence aborts before C4 captures state or starts a fault. Other scenarios,
+individual failover deadlines and final assertions are unchanged.
+
+`REALCLUSTER_SCENARIO_TIMEOUT` is an optional integer from 1 to 999999
+seconds.
+Setting it explicitly supplies a strict outer limit and disables the C4
+addition, even when that limit is insufficient. Leave it unset for the
+automatic C4 budget. The runner logs the selected limit and any non-zero
+scenario exit status; status 124 identifies an outer timeout. Successful
+restoration cannot turn a timed-out scenario into a pass.
 
 Config restoration attempts every node and reports every failure. A retry can restore
 remaining copies even if an earlier node's copy was already consumed. Missing copies

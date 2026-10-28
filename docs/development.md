@@ -162,6 +162,17 @@ It does not claim that a stopped process can clean its kernel addresses.
 Controlled loopback tests cover saved terms, majority election after
 leader loss, authentication, capability negotiation and rejected RPCs.
 
+The CI shard containing this scenario also collects bounded, read-only
+child-process observations. To request the same capture locally, set
+`E2E_OBSERVE_COMMANDS=1`. The observer uses the existing test-runner image
+inside each test node's PID namespace, with no capabilities, network,
+host mounts or Docker socket. It does not modify daemon deadlines.
+Artifacts record sampled CPU, scheduler and fault counters, actual
+sampling gaps, observer overhead and reattachment after node restarts.
+Polling can miss short-lived children; unavailable or zero counters
+are not evidence of no delay. A passing observed run is a
+non-reproduction, not proof that a previously observed timeout is fixed.
+
 `23_graceful_handoff` stops a follower and a leader in separate fresh
 stacks. Its fixtures use a sixty-second stale window and a thirty-second
 probe failure delay. It requires committed shutdown releases and unique,

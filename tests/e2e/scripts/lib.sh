@@ -684,11 +684,10 @@ cluster_logs_contain() {
   return "${status}"
 }
 
-cluster_logs_contain_after() (
+cluster_logs_after() (
   local checkpoint="${1:?checkpoint required}"
-  local pattern="${2:?pattern required}"
   local log_file filtered_log_file service saved_service cid current_cid
-  local version count signature extra prefix_count status=1 grep_status
+  local version count signature extra prefix_count
 
   log_file="$(mktemp)" || return 1
   filtered_log_file=''
@@ -714,17 +713,40 @@ cluster_logs_contain_after() (
       [[ "${prefix_count}" == "${count}" ]] || return 1
       [[ "$(log_prefix_signature <"${filtered_log_file}")" == "${signature}" ]] || return 1
       tail -n "+$((count + 1))" "${log_file}" >"${filtered_log_file}" || return 1
-      if grep -E -q -- "${pattern}" "${filtered_log_file}"; then
-        status=0
-      else
-        grep_status=$?
-        [[ "${grep_status}" == 1 ]] || return 1
-      fi
+      awk -v service="${service}" '{ print service " | " $0 }' "${filtered_log_file}" || return 1
     done
     if read -r extra; then return 1; fi
   } <<<"${checkpoint}"
-  return "${status}"
+  return 0
 )
+
+cluster_logs_contain_after() {
+  local checkpoint="${1:?checkpoint required}" pattern="${2:?pattern required}" logs
+  logs="$(cluster_logs_after "${checkpoint}")" || return 1
+  [[ -n "${logs}" ]] || return 1
+  logs="$(awk '{ sub(/^[^|]* \| /, ""); print }' <<<"${logs}")" || return 1
+  grep -E -q -- "${pattern}" <<<"${logs}"
+}
+
+assert_vip_continuity_after() {
+  local checkpoint="${1:?checkpoint required}" service="${2:?service required}"
+  local vip="${3:?VIP required}" logs
+  [[ " ${NODES[*]} " == *" ${service} "* ]] || return 1
+  logs="$(cluster_logs_after "${checkpoint}")" || {
+    fail "cannot verify VIP continuity: incomplete container log evidence"
+    return 1
+  }
+  awk -v service="${service}" -v vip="${vip}" '
+    index($0, service " | ") != 1 { next }
+    index($0, "removed address " vip "/") ||
+      index($0, "unbound " vip "/") ||
+      index($0, "bound " vip "/") { changed = 1 }
+    END { exit changed ? 1 : 0 }
+  ' <<<"${logs}" || {
+    fail "VIP ${vip} was removed or newly bound on survivor ${service}"
+    return 1
+  }
+}
 
 # Number of node-log lines matching ${pattern}. Counting occurrences is stable under
 # compose-log reordering, unlike a line-number checkpoint: callers snapshot the count before an

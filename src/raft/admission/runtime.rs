@@ -3,8 +3,10 @@
 mod discovery;
 mod driver;
 mod management;
+mod proof;
 mod recovery;
 mod renewal;
+pub(crate) use proof::VerifiedProgress;
 
 use super::{
     AdmissionController as CoreController, AdmissionDenied, AdmissionFence, AdmissionMode,
@@ -99,6 +101,7 @@ impl RuntimeDriver {
         self.local
     }
 
+    #[cfg(test)]
     pub(crate) fn current(&self) -> Option<AdmissionSession> {
         self.ensure_running().ok()?;
         let state = self.state.try_read().ok()?;
@@ -123,7 +126,7 @@ impl RuntimeDriver {
         Ok(PublicationReadiness::Ready)
     }
 
-    async fn coherent_session(&self) -> anyhow::Result<AdmissionSession> {
+    pub(crate) async fn coherent_session(&self) -> anyhow::Result<AdmissionSession> {
         self.within_admission(async {
             let state = self.state.read().await;
             let session = state
@@ -254,7 +257,9 @@ impl NetworkController for RuntimeDriver {
                 let reserve = self.reserve_grant(&request, binding, Some(deadline));
                 tokio::time::timeout_at(deadline, self.within_admission(reserve))
                     .await
-                    .map_err(|_| anyhow::anyhow!("issuer progress apply timed out"))?
+                    .map_err(|error| {
+                        anyhow::Error::new(error).context("issuer progress apply timed out")
+                    })?
             } else {
                 self.reserve_grant(&request, binding, None).await
             }
@@ -336,10 +341,13 @@ impl RuntimeDriver {
                 .core
                 .lock()
                 .map_err(|_| AdmissionDenied("admission lock poisoned"))?;
-            anyhow::ensure!(
-                deadline.is_none_or(|deadline| Instant::now() < deadline),
-                "issuer progress apply timed out"
-            );
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "issuer progress apply timed out",
+                )
+                .into());
+            }
             return Ok(core.reserve(request, binding, Some(&state))?);
         }
     }

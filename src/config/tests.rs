@@ -1354,3 +1354,6 @@ failover_delay_secs: 5
     assert_eq!(duration_to_probe_rounds_ceil(5, 1_500), 4);
     assert_eq!(duration_to_probe_rounds_ceil(5, 3_000), 2);
 }
+
+#[path = "yaml_compat_tests.rs"]
+mod yaml_compat;

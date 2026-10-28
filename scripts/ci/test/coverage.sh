@@ -6,10 +6,8 @@ set -eu
 WORKDIR="${CI_PROJECT_DIR:-/app}"
 cd "${WORKDIR}"
 
-# Real signal tests need about 64 seconds for admission startup; allow
-# twice that runtime without changing their readiness or shutdown bounds.
-cargo tarpaulin --engine llvm --locked --all-targets --timeout 130 \
-  --out Xml --output-dir coverage
+# Merge both mandatory test groups before enforcing the unchanged coverage floors.
+cargo tarpaulin --config scripts/ci/test/coverage.toml
 ./scripts/ci/test/coverage-per-file-test.sh
 ./scripts/ci/test/coverage-per-file.sh coverage/cobertura.xml
 cp coverage/cobertura.xml "${WORKDIR}/cobertura.xml"

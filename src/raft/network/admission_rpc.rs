@@ -67,7 +67,7 @@ impl super::RaftNetworkImpl {
             .await?;
             anyhow::ensure!(
                 authenticated.peer.replica() == Some(target),
-                "admission destination boot changed"
+                crate::raft::network::DestinationBootChanged("admission")
             );
             let binding = authenticated.binding;
             let record = SignedAdmission::sign(
@@ -100,7 +100,7 @@ impl super::RaftNetworkImpl {
         };
         tokio::time::timeout(budget, exchange)
             .await
-            .map_err(|_| anyhow::anyhow!("admission exchange timed out"))?
+            .map_err(|error| anyhow::Error::new(error).context("admission exchange timed out"))?
     }
 }
 
@@ -198,6 +198,86 @@ mod tests {
                 voters: [test_replica(1), test_replica(2)].into(),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn admission_to_a_restarted_peer_is_unavailable_for_publication() {
+        use crate::consensus_freshness::{FailureKind, failure_kind};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = (*super::super::tests::test_network(65_536, &[1, 2]).config).clone();
+        config.peers[1].raft_address = listener.local_addr().unwrap().to_string();
+        let (_, _, state) = crate::raft::store::new_store(Arc::new(Vec::new()), 3, true, 0);
+        let authority = Arc::new(QuarantinedController {
+            local: test_replica(1),
+            calls: AtomicUsize::new(0),
+        });
+        let network =
+            super::super::RaftNetworkImpl::new(Arc::new(config), state, authority).unwrap();
+        let restarted = ReplicaId {
+            boot_nonce: [8; 32],
+            ..test_replica(2)
+        };
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            crate::auth::server_bound(
+                &mut stream,
+                crate::auth::Peer::for_replica(restarted, None, true),
+                Some("network-test-secret"),
+                crate::auth::Listener::Raft,
+            )
+            .await
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            network.admission_rpc(
+                test_replica(2),
+                request(test_replica(1)),
+                std::time::Duration::from_secs(1),
+            ),
+            server
+        );
+        network.shutdown().await.unwrap();
+        let error = result
+            .err()
+            .expect("a restarted peer cannot grant for its previous boot");
+        assert!(error.to_string().contains("boot changed"), "{error:#}");
+        assert_eq!(
+            failure_kind(&error),
+            FailureKind::Unavailable,
+            "a peer's restart must not invalidate the asker's freshness: {error:#}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_timeout_preserves_elapsed_for_publication_classification() {
+        use crate::consensus_freshness::{FailureKind, failure_kind};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut network = super::super::tests::test_network(65_536, &[1, 2]);
+        Arc::make_mut(&mut network.config).peers[1].raft_address =
+            listener.local_addr().unwrap().to_string();
+        let result = network
+            .admission_rpc(
+                test_replica(2),
+                request(test_replica(1)),
+                std::time::Duration::ZERO,
+            )
+            .await;
+        drop(listener);
+        network.shutdown().await.unwrap();
+        let error = result
+            .err()
+            .expect("an unanswered admission exchange must time out");
+        assert!(
+            error.to_string().contains("admission exchange timed out"),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some(),
+            "admission timeout discarded its typed cause: {error:#}"
+        );
+        assert_eq!(failure_kind(&error), FailureKind::Unavailable);
     }
 
     #[tokio::test]

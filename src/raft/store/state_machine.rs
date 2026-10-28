@@ -369,7 +369,7 @@ impl RaftStateMachine<TypeConfig> for KafStateMachine {
         let snap: KafSnapshot = serde_json::from_slice(&data).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("install_snapshot {}: {e}", meta.snapshot_id),
+                format!("install_snapshot {meta}: {e}"),
             )
         })?;
 

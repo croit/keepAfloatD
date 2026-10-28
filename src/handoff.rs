@@ -18,12 +18,13 @@ pub(crate) async fn publish(
     runtime: &RuntimeDriver,
     network: &RaftNetworkImpl,
 ) -> anyhow::Result<()> {
-    let session = runtime
-        .current()
+    let submit_deadline =
+        tokio::time::Instant::now() + Duration::from_millis(cfg.submit_timeout_ms);
+    let session = tokio::time::timeout_at(submit_deadline, runtime.coherent_session())
+        .await
+        .context("shutdown handoff exceeded the shared submit timeout")?
         .context("shutdown handoff requires active admission")?;
-    let deadline = session
-        .check()?
-        .min(tokio::time::Instant::now() + Duration::from_millis(cfg.submit_timeout_ms));
+    let deadline = session.check()?.min(submit_deadline);
     tokio::time::timeout_at(deadline, async {
         runtime.submit_health(network, false).await?;
         session.check()?;

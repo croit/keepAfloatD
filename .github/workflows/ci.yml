@@ -309,8 +309,25 @@ jobs:
             cobertura.xml
 
   test-e2e:
-    name: test / e2e
+    name: test / e2e (${{ matrix.suite }}, ${{ matrix.shard }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [core]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        shard_count: [17]
+        include:
+          - suite: timing
+            shard: 0
+            shard_count: 1
+          - suite: membership
+            shard: 0
+            shard_count: 1
+    env:
+      E2E_SUITE: ${{ matrix.suite }}
+      E2E_SHARD_INDEX: ${{ matrix.shard }}
+      E2E_SHARD_COUNT: ${{ matrix.shard_count }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -322,7 +339,7 @@ jobs:
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         if: always()
         with:
-          name: keepafloatd-e2e-artifacts
+          name: keepafloatd-e2e-${{ matrix.suite }}-${{ matrix.shard }}
           path: e2e-artifacts/
 
   test-haproxy-article:

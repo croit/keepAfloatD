@@ -293,8 +293,15 @@ async fn occupied_submit_listener_fails_the_composition_root() {
     assert!(error.to_string().contains("submit server"), "{error:#}");
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn single_node_cluster_binds_all_vips_then_releases_on_shutdown() {
+    if fixtures::isolated_test(
+        "cluster_test::single_node_cluster_binds_all_vips_then_releases_on_shutdown",
+    )
+    .await
+    {
+        return;
+    }
     let mut cluster = ClusterFixture::bind(1).await;
     let vips = vec![
         VipConfig {

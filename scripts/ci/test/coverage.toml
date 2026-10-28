@@ -1,0 +1,21 @@
+[remaining]
+engine = "Llvm"
+locked = true
+run-types = ["AllTargets"]
+# Real signal tests need about 64 seconds for admission startup.
+timeout = "130s"
+args = ["--skip", "cluster_test::restart::"]
+
+[restarts]
+engine = "Llvm"
+locked = true
+run-types = ["AllTargets"]
+timeout = "130s"
+skip-clean = true
+implicit-test-threads = true
+args = ["cluster_test::restart::", "--test-threads=1"]
+
+[report]
+out = ["Xml"]
+# Tarpaulin resolves output paths relative to this configuration file.
+output-dir = "../../../coverage"

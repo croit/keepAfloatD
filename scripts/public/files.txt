@@ -42,6 +42,7 @@ scripts/ci/health-gate.sh|scripts/ci/health-gate.sh
 scripts/ci/publish/version.sh|scripts/ci/publish/version.sh
 scripts/ci/test/clippy.sh|scripts/ci/test/clippy.sh
 scripts/ci/test/coverage.sh|scripts/ci/test/coverage.sh
+scripts/ci/test/coverage.toml|scripts/ci/test/coverage.toml
 scripts/ci/test/coverage-per-file.sh|scripts/ci/test/coverage-per-file.sh
 scripts/ci/test/coverage-per-file-test.sh|scripts/ci/test/coverage-per-file-test.sh
 scripts/ci/test/deb-install.sh|scripts/ci/test/deb-install.sh
@@ -66,7 +67,10 @@ src/cluster_test.rs|src/cluster_test.rs
 src/cluster_test/bind_health.rs|src/cluster_test/bind_health.rs
 src/cluster_test/fixtures.rs|src/cluster_test/fixtures.rs
 src/cluster_test/health_proof.rs|src/cluster_test/health_proof.rs
+src/cluster_test/health_proof/activation.rs|src/cluster_test/health_proof/activation.rs
 src/cluster_test/restart.rs|src/cluster_test/restart.rs
+src/cluster_test/restart/authentication.rs|src/cluster_test/restart/authentication.rs
+src/cluster_test/restart/config_discovery.rs|src/cluster_test/restart/config_discovery.rs
 src/cluster_test/restart/renewal_progress.rs|src/cluster_test/restart/renewal_progress.rs
 src/cluster_test/stop_handoff.rs|src/cluster_test/stop_handoff.rs
 src/cluster_test/submit_pressure.rs|src/cluster_test/submit_pressure.rs
@@ -78,6 +82,7 @@ src/config/secret.rs|src/config/secret.rs
 src/config/tests.rs|src/config/tests.rs
 src/config/validation.rs|src/config/validation.rs
 src/config/vip_validation.rs|src/config/vip_validation.rs
+src/config/yaml_compat_tests.rs|src/config/yaml_compat_tests.rs
 src/health.rs|src/health.rs
 src/health_publication.rs|src/health_publication.rs
 src/health/local.rs|src/health/local.rs
@@ -255,6 +260,9 @@ tests/e2e/scripts/log-checkpoint-test.sh|tests/e2e/scripts/log-checkpoint-test.s
 tests/e2e/scripts/scenario-runner-test.sh|tests/e2e/scripts/scenario-runner-test.sh
 tests/e2e/scripts/resource-evidence.sh|tests/e2e/scripts/resource-evidence.sh
 tests/e2e/scripts/resource-evidence-test.sh|tests/e2e/scripts/resource-evidence-test.sh
+tests/e2e/scripts/command-observer.py|tests/e2e/scripts/command-observer.py
+tests/e2e/scripts/command-observer-test.sh|tests/e2e/scripts/command-observer-test.sh
+tests/e2e/scripts/command-observer.sh|tests/e2e/scripts/command-observer.sh
 tests/e2e/scripts/report.sh|tests/e2e/scripts/report.sh
 tests/e2e/scripts/run.sh|tests/e2e/scripts/run.sh
 tests/e2e/scripts/run22.sh|tests/e2e/scripts/run22.sh
@@ -269,10 +277,17 @@ tests/haproxy-e2e/haproxy.rs|tests/haproxy-e2e/haproxy.rs
 tests/haproxy-e2e/node.Dockerfile|tests/haproxy-e2e/node.Dockerfile
 tests/haproxy-e2e/run.sh|tests/haproxy-e2e/run.sh
 src/consensus_freshness.rs|src/consensus_freshness.rs
+src/consensus_freshness/failure.rs|src/consensus_freshness/failure.rs
+src/consensus_freshness/permits.rs|src/consensus_freshness/permits.rs
 src/consensus_freshness/timing_tests.rs|src/consensus_freshness/timing_tests.rs
 src/vip/takeover.rs|src/vip/takeover.rs
 src/vip/reconcile/release_tests.rs|src/vip/reconcile/release_tests.rs
 src/vip/reconcile/intent.rs|src/vip/reconcile/intent.rs
+src/vip/reconcile/worker.rs|src/vip/reconcile/worker.rs
+src/vip/reconcile/continuity_tests.rs|src/vip/reconcile/continuity_tests.rs
+src/vip/witness.rs|src/vip/witness.rs
+src/raft/admission/runtime/proof.rs|src/raft/admission/runtime/proof.rs
+src/raft/admission/runtime/proof/tests.rs|src/raft/admission/runtime/proof/tests.rs
 src/submit/proof.rs|src/submit/proof.rs
 src/submit/proof/tests.rs|src/submit/proof/tests.rs
 tests/e2e/scripts/isolated-health-proof.sh|tests/e2e/scripts/isolated-health-proof.sh

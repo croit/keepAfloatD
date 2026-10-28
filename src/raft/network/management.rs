@@ -112,7 +112,7 @@ pub(in crate::raft::network) async fn dispatch(
         Ok(response)
     })
     .await
-    .map_err(|_| anyhow::anyhow!("management dispatch timed out"))?
+    .map_err(|error| anyhow::Error::new(error).context("management dispatch timed out"))?
 }
 
 impl crate::raft::network::RaftNetworkImpl {
@@ -145,7 +145,7 @@ impl crate::raft::network::RaftNetworkImpl {
             .await?;
             anyhow::ensure!(
                 authenticated.peer.replica() == Some(target),
-                "management destination boot changed"
+                crate::raft::network::DestinationBootChanged("management")
             );
             let mut nonce = [0; 32];
             getrandom::fill(&mut nonce)
@@ -166,7 +166,8 @@ impl crate::raft::network::RaftNetworkImpl {
             write_framed(&mut stream, &body).await?;
             let body = read_framed_bounded(&mut stream, self.config.max_frame_bytes).await?;
             let response: SignedAdmission<ManagementResponse> =
-                decode_payload(&body, Operation::AdmissionControl)?;
+                decode_payload(&body, Operation::AdmissionControl)
+                    .map_err(crate::consensus_freshness::failure::rejected)?;
             verify_response(
                 self.config.cluster_secret.as_deref(),
                 target,
@@ -179,7 +180,7 @@ impl crate::raft::network::RaftNetworkImpl {
         };
         tokio::time::timeout(budget, exchange)
             .await
-            .map_err(|_| anyhow::anyhow!("management exchange timed out"))?
+            .map_err(|error| anyhow::Error::new(error).context("management exchange timed out"))?
     }
 }
 
@@ -564,7 +565,13 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(result.unwrap_err().to_string().contains("boot changed"));
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("boot changed"));
+        assert_eq!(
+            crate::consensus_freshness::failure_kind(&error),
+            crate::consensus_freshness::FailureKind::Unavailable,
+            "a peer's restart must not invalidate the asker's freshness: {error:#}"
+        );
     }
 
     #[tokio::test]

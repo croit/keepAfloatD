@@ -92,6 +92,17 @@ pub(crate) struct FrameBytePermit {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+#[derive(Debug)]
+pub(crate) struct ConnectFailed;
+
+impl std::fmt::Display for ConnectFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("outbound TCP connection failed")
+    }
+}
+
+impl std::error::Error for ConnectFailed {}
+
 /// Connect from the IP advertised for this node instead of relying on the host's route-selected
 /// source. Inbound identity checks can then reject spoofed peer IDs without breaking multihomed
 /// nodes whose default egress address differs from their cluster address.
@@ -112,12 +123,40 @@ pub(crate) async fn connect_from_advertised(
         tokio::net::TcpSocket::new_v6()?
     };
     socket.bind(local)?;
-    Ok(socket.connect(remote).await?)
+    // A blackhole route can surface as InvalidInput before any protocol exchange.
+    socket
+        .connect(remote)
+        .await
+        .map_err(|error| anyhow::Error::new(error).context(ConnectFailed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ConnectionAdmission, connect_from_advertised};
+
+    #[tokio::test]
+    async fn only_tcp_connect_errors_carry_the_transport_marker() {
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let error =
+            connect_from_advertised("127.0.0.1:0", &reserved.local_addr().unwrap().to_string())
+                .await
+                .unwrap_err();
+        assert!(error.downcast_ref::<super::ConnectFailed>().is_some());
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        assert!(error.to_string().contains("TCP connection failed"));
+
+        for remote in ["invalid-address", "[::1]:17100"] {
+            let error = connect_from_advertised("127.0.0.1:0", remote)
+                .await
+                .unwrap_err();
+            assert!(error.downcast_ref::<super::ConnectFailed>().is_none());
+            assert_eq!(
+                crate::consensus_freshness::failure_kind(&error),
+                crate::consensus_freshness::FailureKind::Rejected
+            );
+        }
+    }
 
     #[test]
     fn saturation_is_shed_and_capacity_recovers_after_permits_drop() {

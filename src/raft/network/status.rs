@@ -9,6 +9,17 @@ use crate::connection_admission::connect_from_advertised;
 use openraft::async_runtime::WatchReceiver;
 use std::time::Duration;
 
+#[derive(Debug)]
+pub(in crate::raft) struct UnauthenticatedDiscovery;
+
+impl std::fmt::Display for UnauthenticatedDiscovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("discovery peer did not authenticate")
+    }
+}
+
+impl std::error::Error for UnauthenticatedDiscovery {}
+
 /// Build this node's answer from local Raft state without holding a metrics borrow across await.
 pub(super) async fn answer_cluster_status(
     raft: &KafRaft,
@@ -60,7 +71,8 @@ pub(in crate::raft) async fn probe_peer_status(
             epoch,
             false,
         )
-        .await?;
+        .await
+        .map_err(|error| anyhow::Error::new(error).context(UnauthenticatedDiscovery))?;
         let body = encode(
             Operation::Status,
             &ClusterStatusRequest {
@@ -75,7 +87,40 @@ pub(in crate::raft) async fn probe_peer_status(
         response.replica = authenticated.replica();
         Ok(response)
     };
-    tokio::time::timeout(budget, io)
-        .await
-        .map_err(|_| anyhow::anyhow!("probe to {address} timed out"))?
+    tokio::time::timeout(budget, io).await.map_err(|error| {
+        anyhow::Error::new(error).context(format!("probe to {address} timed out"))
+    })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus_freshness::{FailureKind, failure_kind};
+
+    #[tokio::test(start_paused = true)]
+    async fn status_timeout_preserves_elapsed_for_publication_classification() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let network = super::super::tests::test_network(65_536, &[1, 2]);
+        let result = probe_peer_status(
+            &network.config,
+            &address,
+            2,
+            None,
+            network.config.cluster_config_fingerprint().unwrap(),
+            Duration::ZERO,
+        )
+        .await;
+        drop(listener);
+        network.shutdown().await.unwrap();
+        let error = result.expect_err("an unanswered status exchange must time out");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(
+            error
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some(),
+            "status timeout discarded its typed cause: {error:#}"
+        );
+        assert_eq!(failure_kind(&error), FailureKind::Unavailable);
+    }
 }

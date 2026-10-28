@@ -56,7 +56,7 @@ libndp = ">= 1.8"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml = { package = "yaml_serde", version = "=0.10.7" }
 serde_json = "1"
 anyhow = "1.0.103"
 tracing = "0.1"
@@ -64,7 +64,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 # Pinned exactly: 0.10 is an alpha; the storage/network trait surface can churn between alphas.
 # The I/O-progress redesign in 0.10 fixes the diskless restart-past-snapshot crash.
-openraft = { version = "=0.10.0-alpha.32", features = ["serde", "type-alias"] }
+openraft = { version = "=0.10.0-alpha.37", features = ["serde", "type-alias"] }
 futures = "0.3"
 # Collision-resistant, versioned identity for cluster-wide configuration invariants.
 sha2 = "0.10"
@@ -88,3 +88,8 @@ undocumented_unsafe_blocks = "deny"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# OpenRaft alpha.37's generic RaftCore exceeds Rust's 2 MiB test-thread stack
+# when downstream monomorphizations are completely unoptimized.
+[profile.test]
+opt-level = 1
