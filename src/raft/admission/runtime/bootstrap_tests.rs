@@ -235,3 +235,44 @@ async fn verified_bootstrap_rejects_foreign_applied_genesis() {
     runtime.state.write().await.genesis = Some(foreign);
     assert!(runtime.authorize_raft(test_replica(2)).is_err());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_joining_learner_reports_admission_only_once_promoted_to_voter() {
+    let (runtime, _) = admitted_learner().await;
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let record = reported.clone();
+    runtime.report_status_with(Arc::new(move |status| {
+        record.lock().unwrap().push(status);
+        true
+    }));
+    runtime.report_admission_once_voting();
+    assert!(
+        reported.lock().unwrap().is_empty(),
+        "a learner does not count towards quorum yet"
+    );
+    *runtime.bootstrap_join.lock().unwrap() = None;
+    runtime.report_admission_once_voting();
+    runtime.report_admission_once_voting();
+    assert_eq!(*reported.lock().unwrap(), ["admitted"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_admission_the_supervisor_did_not_take_is_reported_again() {
+    let (runtime, _) = admitted_learner().await;
+    *runtime.bootstrap_join.lock().unwrap() = None;
+    let attempts = Arc::new(Mutex::new(0));
+    let record = attempts.clone();
+    runtime.report_status_with(Arc::new(move |_| {
+        let mut attempts = record.lock().unwrap();
+        *attempts += 1;
+        *attempts > 1
+    }));
+    runtime.report_admission_once_voting();
+    runtime.report_admission_once_voting();
+    runtime.report_admission_once_voting();
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        2,
+        "retried once after the failed send, then done"
+    );
+}

@@ -17,7 +17,7 @@ mkdir -p "${SSH_CTL_DIR}" 2>/dev/null || true
 # Exact config-backup suffixes owned by scenarios and soak. Unknown backups are operator state: the
 # campaign must preserve them, while these names must be absent before capture and after cleanup.
 declare -ag REALCLUSTER_CAMPAIGN_BACKUP_TAGS=(
-  c2 b3-notify d5 d11 d12 d13 d14 d16 d17 d18 d19 d20 d21 d22 d23 d24 soak
+  c2 b3-notify d5 d11 d12 d13 d14 d16 d17 d18 d19 d20 d21 d22 d23 d24 d27 soak
 )
 
 # Extend only known-predecessor fallback waits by the configured cleanup budget.
@@ -228,7 +228,8 @@ node_tcp_listener_owned_only_by_pid() {
 vip_pingable() { mgmt_sh "ping -c1 -W2 ${1:?} >/dev/null 2>&1"; }              # predicate
 kafd_stop()    { local ip="${1:?}"; node_sh "${ip}" "systemctl stop keepafloatd@$(instance_for_ip "${ip}")"; }
 kafd_start()   { local ip="${1:?}"; ensure_cluster_secret_on_node "${ip}" || return 1; node_sh "${ip}" "systemctl reset-failed keepafloatd@$(instance_for_ip "${ip}") 2>/dev/null; systemctl start keepafloatd@$(instance_for_ip "${ip}")"; }
-kafd_restart() { local ip="${1:?}"; ensure_cluster_secret_on_node "${ip}" || return 1; node_sh "${ip}" "systemctl restart keepafloatd@$(instance_for_ip "${ip}")"; }
+# Deliberate restarts reset the unit's start limit, which only guards against timeout loops.
+kafd_restart() { local ip="${1:?}" unit; ensure_cluster_secret_on_node "${ip}" || return 1; unit="keepafloatd@$(instance_for_ip "${ip}")"; node_sh "${ip}" "systemctl reset-failed ${unit} 2>/dev/null; systemctl restart ${unit}"; }
 
 running_keepafloatd_buildid() {
   local ip="${1:?}" inst
@@ -1201,7 +1202,7 @@ set_cluster_scalar() {  # set_cluster_scalar <top-level-yaml-key> <yaml-value>
   [[ "${key}" =~ ^[a-z_]+$ ]] || return 1
   for ip in "${NODE_IPS[@]}"; do
     inst="$(instance_for_ip "${ip}")"; cfg="/etc/keepafloatd/config-${inst}.yaml"
-    node_sh "${ip}" "sed -i '/^${key}:/d' ${cfg}; printf '\\n${key}: ${value}\\n' >> ${cfg}" || return 1
+    node_sh "${ip}" "sed -i '/^${key}:/d' ${cfg}; printf '\\n${key}: ${value}\\n' >> ${cfg}" || return
   done
 }
 

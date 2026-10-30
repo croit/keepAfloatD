@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 mod local;
-pub(crate) use local::{HealthContinuity, LocalHealth};
+pub(crate) use local::{BindFault, HealthContinuity, LocalHealth};
 
 #[cfg(test)]
 mod test_probe;

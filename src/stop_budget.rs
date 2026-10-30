@@ -35,12 +35,15 @@ fn message(stopping: bool, work: Duration) -> io::Result<String> {
 }
 
 fn notify(path: Option<&OsStr>, stopping: bool, work: Duration) -> io::Result<()> {
-    notify_with(path, stopping, work, |address, message| {
-        let socket = UnixDatagram::unbound()?;
-        socket.set_nonblocking(true)?;
-        socket.send_to_addr(message, address)?;
-        Ok(())
-    })
+    notify_with(path, stopping, work, send)
+}
+
+/// Send one notification datagram to the service manager without waiting for it.
+pub(crate) fn send(address: &SocketAddr, message: &[u8]) -> io::Result<()> {
+    let socket = UnixDatagram::unbound()?;
+    socket.set_nonblocking(true)?;
+    socket.send_to_addr(message, address)?;
+    Ok(())
 }
 
 fn notify_with(
@@ -63,7 +66,7 @@ fn notify_with(
     Ok(())
 }
 
-fn socket_address(path: &OsStr) -> io::Result<SocketAddr> {
+pub(crate) fn socket_address(path: &OsStr) -> io::Result<SocketAddr> {
     #[cfg(target_os = "linux")]
     if let Some(name) = path.as_bytes().strip_prefix(b"@") {
         use std::os::linux::net::SocketAddrExt;

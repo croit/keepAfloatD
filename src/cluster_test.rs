@@ -19,9 +19,9 @@ use crate::listener::ListenerSource;
 use crate::raft::KafRequest;
 use crate::vip::LocalVip;
 use crate::{
-    StopReason, finish_daemon_run, record_lifecycle_result, record_optional_failure, run,
-    run_with_listeners, run_with_probe, stop_daemon_task, submit_task_failure,
-    supervision_channel_failure, unexpected_task_failure,
+    StopReason, finish_daemon_run, record_lifecycle_result, record_optional_failure,
+    release_local_vips, run, run_with_listeners, run_with_probe, stop_daemon_task,
+    submit_task_failure, supervision_channel_failure, unexpected_task_failure,
 };
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
@@ -223,6 +223,68 @@ fn daemon_result_preserves_primary_and_shutdown_failures() {
     assert!(diagnostic.contains("submit server failed"));
     assert!(diagnostic.contains("additional daemon shutdown failures"));
     assert!(diagnostic.contains("graceful VIP cleanup: failed"));
+}
+
+#[test]
+fn restart_request_fails_the_daemon_and_keeps_shutdown_failures() {
+    let restart = finish_daemon_run(
+        StopReason::Restart(anyhow::anyhow!("VIP command timed out")),
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(restart.to_string().contains("VIP command timed out"));
+
+    let combined = finish_daemon_run(
+        StopReason::Restart(anyhow::anyhow!("VIP command timed out")),
+        vec!["graceful VIP cleanup: failed".into()],
+    )
+    .unwrap_err();
+    let diagnostic = format!("{combined:#}");
+    assert!(diagnostic.contains("VIP command timed out"));
+    assert!(diagnostic.contains("graceful VIP cleanup: failed"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_stop_withholds_releases_when_a_writer_is_reaped_only_during_cleanup() {
+    let local = LocalVip::new(true);
+    let table = vec![(VipAddr::host(ip4(192, 0, 2, 98)), "lo".to_string())];
+    let running = local.hold_unreaped_command();
+    local.on_next_unbind(move || drop(running));
+    let (cleanup, acknowledge) = release_local_vips(
+        &local,
+        &table,
+        None,
+        true,
+        crate::vip::release_notify_state(false),
+    )
+    .await;
+    cleanup.unwrap();
+    assert!(local.commands_settled());
+    assert!(
+        !acknowledge,
+        "a writer reaped after the cleanup started may have re-added an address"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_stop_acknowledges_releases_when_every_writer_was_reaped_first() {
+    let local = LocalVip::new(true);
+    let table = vec![(VipAddr::host(ip4(192, 0, 2, 98)), "lo".to_string())];
+    let running = local.hold_unreaped_command();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(running);
+    });
+    let (cleanup, acknowledge) = release_local_vips(
+        &local,
+        &table,
+        None,
+        true,
+        crate::vip::release_notify_state(false),
+    )
+    .await;
+    cleanup.unwrap();
+    assert!(acknowledge, "the writer was reaped before the cleanup");
 }
 
 fn ip4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {

@@ -29,12 +29,38 @@ async fn failed_bind_closes_the_local_health_gate() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn only_a_timed_out_bind_requests_a_daemon_restart() {
+    for failure in [
+        "exit",
+        "spawn",
+        "timeout",
+        "reap-timeout",
+        "uncertain-timeout",
+        "marker",
+        "reassert",
+    ] {
+        let (_, restart) = assert_bind_fault(failure).await;
+        let timed_out = matches!(failure, "timeout" | "reap-timeout" | "uncertain-timeout");
+        assert_eq!(restart, timed_out, "{failure}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn failed_bind_logs_preserve_nested_io_error() {
-    for failure in ["spawn", "timeout"] {
-        let output = assert_bind_fault(failure).await;
+    for (failure, message) in [
+        (
+            "spawn",
+            "VIP bind failed; node remains unhealthy until restart",
+        ),
+        (
+            "timeout",
+            "VIP command timed out; restarting the daemon to prove the release",
+        ),
+    ] {
+        let (output, _) = assert_bind_fault(failure).await;
         let line = output
             .lines()
-            .find(|line| line.contains("VIP bind failed; node remains unhealthy until restart"))
+            .find(|line| line.contains(message))
             .expect("bind fault must emit its diagnostic");
         assert!(line.contains("address=192.0.2.99"), "{failure}: {line}");
         assert!(
@@ -45,7 +71,7 @@ async fn failed_bind_logs_preserve_nested_io_error() {
     }
 }
 
-async fn assert_bind_fault(failure: &str) -> String {
+async fn assert_bind_fault(failure: &str) -> (String, bool) {
     use std::os::unix::process::ExitStatusExt;
     let _lock = LOCK.lock().await;
     let (logs, _guard) = crate::warning_limit::test_support::LogCapture::start(
@@ -83,7 +109,7 @@ async fn assert_bind_fault(failure: &str) -> String {
                 )
                 .await
         }
-        "spawn" | "timeout" => {
+        "spawn" | "timeout" | "uncertain-timeout" => {
             let kind = if failure == "spawn" {
                 std::io::ErrorKind::NotFound
             } else {
@@ -93,6 +119,35 @@ async fn assert_bind_fault(failure: &str) -> String {
                 .force_next_bind_result(
                     (&table[0].1, addr, table[0].0.prefix),
                     Err(std::io::Error::new(kind, "bind unavailable")),
+                )
+                .await;
+            if failure == "uncertain-timeout" {
+                local
+                    .force_next_bind_presence_result(
+                        addr,
+                        Ok(std::process::Output {
+                            status: std::process::ExitStatus::from_raw(0),
+                            stdout: b"present".to_vec(),
+                            stderr: Vec::new(),
+                        }),
+                    )
+                    .await;
+                local
+                    .force_unbind_results(
+                        (&table[0].1, addr, table[0].0.prefix),
+                        vec![Ok(std::process::ExitStatus::from_raw(0))],
+                    )
+                    .await;
+            }
+        }
+        "reap-timeout" => {
+            local
+                .force_next_bind_result(
+                    (&table[0].1, addr, table[0].0.prefix),
+                    Err(crate::process::deadline_missed(
+                        std::io::ErrorKind::Other,
+                        "child command timed out and child reap also timed out".into(),
+                    )),
                 )
                 .await;
         }
@@ -147,6 +202,7 @@ async fn assert_bind_fault(failure: &str) -> String {
     .await
     .unwrap();
     let faulted = !healthy.is_healthy();
+    let restart = futures::poll!(Box::pin(healthy.wait_for_restart_request())).is_ready();
     drop(reconcile);
     controls.shutdown().await.unwrap();
     network.shutdown().await.unwrap();
@@ -155,7 +211,7 @@ async fn assert_bind_fault(failure: &str) -> String {
         faulted,
         "{failure}: failed VIP binding must make the holder unhealthy"
     );
-    logs.text()
+    (logs.text(), restart)
 }
 
 #[tokio::test(start_paused = true)]
@@ -968,7 +1024,17 @@ async fn successful_release_does_not_create_a_health_proof() {
         activation_tick: 2,
     };
     let mut released = HashMap::new();
-    maybe_publish_release(&cfg, &raft, &freshness, 1, vip, &assignment, &mut released).await;
+    maybe_publish_release(
+        &cfg,
+        &raft,
+        &freshness,
+        &LocalVip::new(false),
+        1,
+        vip,
+        &assignment,
+        &mut released,
+    )
+    .await;
     let created_proof = freshness.is_fresh();
     controls.shutdown().await.unwrap();
     network.shutdown().await.unwrap();
@@ -981,6 +1047,63 @@ async fn successful_release_does_not_create_a_health_proof() {
     assert!(
         !created_proof,
         "a release acknowledgement must not renew health freshness"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unreaped_command_withholds_the_release_until_it_is_reaped() {
+    let _lock = LOCK.lock().await;
+    let (cfg, raft, network, state, mut controls) = cluster().await;
+    let freshness = Arc::new(ConsensusFreshness::for_probe_cadence(1_000, 1));
+    let vip: std::net::IpAddr = "192.0.2.99".parse().unwrap();
+    let assignment = VipAssignment {
+        holder: 2,
+        generation: 2,
+        previous_holder: Some(1),
+        previous_holder_released: false,
+        activation_tick: 2,
+    };
+    state
+        .write()
+        .await
+        .vip_assignments
+        .insert(vip, assignment.clone());
+    let local = LocalVip::new(false);
+    let running = local.hold_unreaped_command();
+    let mut released = HashMap::new();
+    maybe_publish_release(
+        &cfg,
+        &raft,
+        &freshness,
+        &local,
+        1,
+        vip,
+        &assignment,
+        &mut released,
+    )
+    .await;
+    let withheld =
+        released.is_empty() && !state.read().await.vip_assignments[&vip].previous_holder_released;
+    drop(running);
+    maybe_publish_release(
+        &cfg,
+        &raft,
+        &freshness,
+        &local,
+        1,
+        vip,
+        &assignment,
+        &mut released,
+    )
+    .await;
+    let published = released.get(&vip) == Some(&2);
+    controls.shutdown().await.unwrap();
+    network.shutdown().await.unwrap();
+    raft.shutdown().await.unwrap();
+    assert!(withheld, "no release while a killed command may still run");
+    assert!(
+        published,
+        "the release follows once every command is reaped"
     );
 }
 
@@ -1094,6 +1217,99 @@ async fn missing_health_proof_still_withdraws_and_commits_release_acknowledgemen
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_writer_reaped_during_cleanup_defers_the_release_to_a_second_kernel_delete() {
+    use std::os::unix::process::ExitStatusExt;
+    let _lock = LOCK.lock().await;
+    let (cfg, raft, network, state, mut controls) = cluster().await;
+    let (vip, iface) = cfg.sorted_vips()[0].clone();
+    let addr = vip.addr;
+    state.write().await.vip_assignments.insert(
+        addr,
+        VipAssignment {
+            holder: 2,
+            generation: 2,
+            previous_holder: Some(1),
+            previous_holder_released: false,
+            activation_tick: 2,
+        },
+    );
+    let local = LocalVip::new(false);
+    local
+        .force_next_bind_result(
+            (&iface, addr, vip.prefix),
+            Ok(std::process::ExitStatus::from_raw(0)),
+        )
+        .await;
+    local.bind(&iface, addr, vip.prefix).await.unwrap();
+    local
+        .force_unbind_results(
+            (&iface, addr, vip.prefix),
+            vec![
+                Ok(std::process::ExitStatus::from_raw(0)),
+                Ok(std::process::ExitStatus::from_raw(0)),
+            ],
+        )
+        .await;
+    local
+        .force_marker_delete_results(
+            addr,
+            vec![
+                Ok(std::process::ExitStatus::from_raw(0)),
+                Ok(std::process::ExitStatus::from_raw(0)),
+            ],
+        )
+        .await;
+    let running = local.hold_unreaped_command();
+    local.on_next_unbind(move || drop(running));
+    let freshness = Arc::new(ConsensusFreshness::for_probe_cadence(1_000, 1));
+    let task = tokio::spawn(run_reconcile_loop(
+        cfg.clone(),
+        raft.clone(),
+        state.clone(),
+        local.clone(),
+        Arc::new(cfg.sorted_vips()),
+        Arc::new(LocalHealth::new(false)),
+        freshness,
+        1,
+    ));
+    let deletes = || {
+        local
+            .commands
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "addr" && pair[1] == "del")
+                    && call
+                        .arguments
+                        .iter()
+                        .any(|arg| arg.to_string_lossy().starts_with(&addr.to_string()))
+            })
+            .count()
+    };
+    let deletes_at_release = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        loop {
+            if state.read().await.vip_assignments[&addr].previous_holder_released {
+                return deletes();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    task.abort();
+    let _ = task.await;
+    controls.shutdown().await.unwrap();
+    network.shutdown().await.unwrap();
+    raft.shutdown().await.unwrap();
+    assert_eq!(
+        deletes_at_release,
+        Ok(2),
+        "a writer reaped during the first delete may re-add the address, so a second delete must precede the release"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn repeated_proof_renewals_do_not_restart_the_pending_takeover_delay() {
     let _lock = LOCK.lock().await;
     let (cfg, raft, network, state, mut controls) = cluster().await;
@@ -1151,5 +1367,79 @@ async fn repeated_proof_renewals_do_not_restart_the_pending_takeover_delay() {
     assert!(
         acquired,
         "renewals more frequent than takeover delay must not starve acquisition"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_writer_reaped_during_a_cleanup_without_an_ownership_change_gets_a_second_delete() {
+    use std::os::unix::process::ExitStatusExt;
+    let _lock = LOCK.lock().await;
+    let (cfg, raft, network, state, mut controls) = cluster().await;
+    let (vip, iface) = cfg.sorted_vips()[0].clone();
+    let addr = vip.addr;
+    let local = LocalVip::new(false);
+    local
+        .force_next_bind_result(
+            (&iface, addr, vip.prefix),
+            Ok(std::process::ExitStatus::from_raw(0)),
+        )
+        .await;
+    local.bind(&iface, addr, vip.prefix).await.unwrap();
+    local
+        .force_unbind_results(
+            (&iface, addr, vip.prefix),
+            vec![
+                Ok(std::process::ExitStatus::from_raw(0)),
+                Ok(std::process::ExitStatus::from_raw(0)),
+            ],
+        )
+        .await;
+    local
+        .force_marker_delete_results(
+            addr,
+            vec![
+                Ok(std::process::ExitStatus::from_raw(0)),
+                Ok(std::process::ExitStatus::from_raw(0)),
+            ],
+        )
+        .await;
+    let running = local.hold_unreaped_command();
+    local.on_next_unbind(move || drop(running));
+    let task = tokio::spawn(run_reconcile_loop(
+        cfg.clone(),
+        raft.clone(),
+        state.clone(),
+        local.clone(),
+        Arc::new(cfg.sorted_vips()),
+        Arc::new(LocalHealth::new(false)),
+        Arc::new(ConsensusFreshness::for_probe_cadence(1_000, 1)),
+        1,
+    ));
+    let deletes = || {
+        local
+            .commands
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "addr" && pair[1] == "del")
+            })
+            .count()
+    };
+    let second_delete = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while deletes() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    task.abort();
+    let _ = task.await;
+    controls.shutdown().await.unwrap();
+    network.shutdown().await.unwrap();
+    raft.shutdown().await.unwrap();
+    assert!(
+        second_delete.is_ok(),
+        "a writer reaped during the delete may have re-added the address, so the cleanup stays pending until a delete after the reap"
     );
 }

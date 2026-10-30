@@ -51,7 +51,13 @@ pub(crate) struct RuntimeDriver {
     mutation: AsyncMutex<()>,
     stopped: AtomicBool,
     running: AtomicBool,
+    status: Mutex<StatusReport>,
+    admission_reported: AtomicBool,
 }
+
+/// Where the driver reports whether it waits for admission, answering whether the report was
+/// taken; systemd's status text by default.
+pub(crate) type StatusReport = Arc<dyn Fn(&'static str) -> bool + Send + Sync>;
 
 impl RuntimeDriver {
     pub(crate) fn new(
@@ -79,7 +85,42 @@ impl RuntimeDriver {
             mutation: AsyncMutex::new(()),
             stopped: AtomicBool::new(false),
             running: AtomicBool::new(false),
+            status: Mutex::new(Arc::new(crate::systemd_status::report)),
+            admission_reported: AtomicBool::new(false),
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn report_status_with(&self, report: StatusReport) {
+        *self.status.lock().unwrap() = report;
+    }
+
+    /// Reports `admitted` once this boot votes again: a JOIN admits a learner first, and only its
+    /// committed promotion lets it count towards quorum (#47).
+    pub(super) fn report_admission_once_voting(&self) {
+        let joining = self
+            .bootstrap_join
+            .lock()
+            .map_or(true, |join| join.is_some());
+        if joining
+            || self.authority.current().is_none()
+            || self.admission_reported.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        // A report the supervisor did not take is tried again on the next renewal round.
+        if self.report_status(crate::systemd_status::ADMITTED) {
+            self.admission_reported.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn report_status(&self, status: &'static str) -> bool {
+        let report = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        report(status)
     }
 
     pub(crate) fn attach(&self, raft: KafRaft) -> anyhow::Result<()> {

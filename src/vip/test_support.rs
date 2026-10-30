@@ -26,7 +26,30 @@ fn empty_inventory() -> io::Result<Output> {
     })
 }
 
+/// A killed VIP command whose child is not reaped yet; dropping it reaps the child.
+pub(crate) struct UnreapedCommand(crate::process::ChildTracker);
+
+impl Drop for UnreapedCommand {
+    fn drop(&mut self) {
+        self.0.settle();
+    }
+}
+
 impl LocalVip {
+    pub(crate) fn on_next_unbind(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.next_unbind_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    pub(crate) fn lose_command(&self) {
+        self.children.begin();
+        self.children.lose();
+    }
+
+    pub(crate) fn hold_unreaped_command(&self) -> UnreapedCommand {
+        self.children.begin();
+        UnreapedCommand(self.children.clone())
+    }
+
     pub(super) fn after_bind_result(&self, result: &Option<anyhow::Result<Option<bool>>>) {
         let hook = self.next_bind_result_hook.lock().unwrap().take();
         if let Some(hook) = hook {
@@ -87,7 +110,7 @@ impl LocalVip {
         assert!(results.next().is_none());
     }
 
-    pub(super) async fn force_unbind_results(
+    pub(crate) async fn force_unbind_results(
         &self,
         target: Target<'_>,
         results: Vec<io::Result<ExitStatus>>,
@@ -170,7 +193,7 @@ impl LocalVip {
         }
     }
 
-    pub(super) async fn force_marker_delete_results(
+    pub(crate) async fn force_marker_delete_results(
         &self,
         address: IpAddr,
         results: Vec<io::Result<ExitStatus>>,

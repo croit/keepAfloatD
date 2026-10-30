@@ -36,3 +36,7 @@ grep -Fq 'chown root:root' deploy/rpm/postinst || {
   echo "RPM postinst must restore root ownership on existing instance configs" >&2
   exit 1
 }
+grep -Fq 'systemctl daemon-reload' deploy/rpm/postinst || {
+  echo "RPM postinst must reload systemd so an upgraded unit takes effect" >&2
+  exit 1
+}

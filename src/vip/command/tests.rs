@@ -82,12 +82,18 @@ async fn scripted_runner_matches_concurrent_commands_independently() {
 
 #[tokio::test]
 async fn system_runner_delegates_status_output_and_spawn_errors() {
-    let runner = SystemCommandRunner;
+    let runner = SystemCommandRunner {
+        children: crate::process::ChildTracker::default(),
+    };
     let timeout = Duration::from_secs(1);
     let mut status = command("/bin/sh", &["-c", "exit 7"]);
     assert_eq!(
         runner.status(&mut status, timeout).await.unwrap().code(),
         Some(7)
+    );
+    assert!(
+        runner.children.is_settled(),
+        "a reaped status command is no longer tracked"
     );
     let mut output = command("/bin/sh", &["-c", "printf out; printf err >&2"]);
     output.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -115,7 +121,9 @@ async fn system_runner_delegates_status_output_and_spawn_errors() {
 
 #[tokio::test]
 async fn system_runner_keeps_status_and_output_timeouts() {
-    let runner = SystemCommandRunner;
+    let runner = SystemCommandRunner {
+        children: crate::process::ChildTracker::default(),
+    };
     for capture in [false, true] {
         let mut command = command("/bin/sh", &["-c", "sleep 30"]);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());

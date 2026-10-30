@@ -11,7 +11,8 @@
 //! 5. Block on `SIGINT`, `SIGTERM`, `SIGHUP` or `SIGQUIT`. On signal: stop the reconcile loop, run
 //!    [`vip::LocalVip::unbind_all`] to remove every VIP this process bound, publish a bounded
 //!    ownership handoff, then shut down submit and Raft. `SIGHUP` and `SIGQUIT` request
-//!    a restart by returning a failure status after cleanup.
+//!    a restart by returning a failure status after cleanup, and so does a VIP command that
+//!    missed its deadline.
 //!
 //! See module `bind_policy`, `vip` and `README.md` for the binding rules and failure-handling
 //! semantics.
@@ -33,6 +34,7 @@ mod runtime_permission;
 mod shutdown;
 mod stop_budget;
 mod submit;
+mod systemd_status;
 mod vip;
 mod warning_limit;
 
@@ -53,6 +55,8 @@ use clap::Parser;
 
 enum StopReason {
     Complete(Option<FatalReason>),
+    /// Stop gracefully, then exit unsuccessfully so the supervisor starts a fresh process.
+    Restart(anyhow::Error),
     Failed(anyhow::Error),
 }
 
@@ -120,6 +124,30 @@ async fn stop_daemon_task<T>(
     }
 }
 
+/// Remove every local VIP and report whether releases may be acknowledged. Writers killed with
+/// reconciliation are waited for first: one reaped only after the cleanup may have re-added an
+/// address the cleanup already removed (#46).
+async fn release_local_vips(
+    vip_local: &vip::LocalVip,
+    vip_table: &[(VipAddr, String)],
+    notify: Option<&str>,
+    dry_run: bool,
+    shutdown_state: vip::VipState,
+) -> (anyhow::Result<()>, bool) {
+    let settled_before_cleanup = vip_local
+        .wait_commands_settled(crate::process::PROCESS_REAP_TIMEOUT)
+        .await;
+    let cleanup = vip_local
+        .unbind_all_with_progress(vip_table, notify, dry_run, shutdown_state, || {
+            stop_budget::checkpoint(vip::SHUTDOWN_VIP_BUDGET)
+        })
+        .await;
+    (
+        cleanup,
+        settled_before_cleanup && vip_local.commands_settled(),
+    )
+}
+
 fn finish_daemon_run(
     stop_reason: StopReason,
     lifecycle_failures: Vec<String>,
@@ -129,8 +157,10 @@ fn finish_daemon_run(
         StopReason::Complete(_) => {
             anyhow::bail!("daemon shutdown failed: {}", lifecycle_failures.join("; "))
         }
-        StopReason::Failed(error) if lifecycle_failures.is_empty() => Err(error),
-        StopReason::Failed(error) => Err(error.context(format!(
+        StopReason::Restart(error) | StopReason::Failed(error) if lifecycle_failures.is_empty() => {
+            Err(error)
+        }
+        StopReason::Restart(error) | StopReason::Failed(error) => Err(error.context(format!(
             "additional daemon shutdown failures: {}",
             lifecycle_failures.join("; ")
         ))),
@@ -330,6 +360,23 @@ async fn run_with_probe(
                 FinishedTask::None,
             ),
         },
+        () = vip_local.wait_lost_command() => (
+            StopReason::Restart(anyhow::anyhow!(
+                "a killed VIP command could not be reaped; a supervised restart must prove the VIP release"
+            )),
+            FinishedTask::None,
+        ),
+        requested = local_healthy.wait_for_restart_request() => (
+            match requested {
+                Ok(()) => StopReason::Restart(anyhow::anyhow!(
+                    "VIP command timed out; a supervised restart must prove the VIP release"
+                )),
+                Err(_) => StopReason::Failed(anyhow::anyhow!(
+                    "local health watch closed unexpectedly"
+                )),
+            },
+            FinishedTask::None,
+        ),
         result = &mut submit_task => (
             StopReason::Failed(submit_task_failure(result)),
             FinishedTask::Submit,
@@ -371,21 +418,31 @@ async fn run_with_probe(
         record_optional_failure(&mut lifecycle_failures, result);
     }
     let shutdown_state = crate::vip::release_notify_state(local_healthy.is_healthy());
-    let vip_cleanup = vip_local
-        .unbind_all_with_progress(
-            vip_table.as_ref(),
-            cfg.notify.as_deref(),
-            cfg.dry_run,
-            shutdown_state,
-            || stop_budget::checkpoint(vip::SHUTDOWN_VIP_BUDGET),
-        )
-        .await;
+    let (vip_cleanup, acknowledge_releases) = release_local_vips(
+        &vip_local,
+        vip_table.as_ref(),
+        cfg.notify.as_deref(),
+        cfg.dry_run,
+        shutdown_state,
+    )
+    .await;
     if vip_cleanup.is_ok()
         && lifecycle_failures.is_empty()
-        && matches!(stop_reason, StopReason::Complete(None))
+        && matches!(
+            stop_reason,
+            StopReason::Complete(None) | StopReason::Restart(_)
+        )
     {
         stop_budget::checkpoint(std::time::Duration::from_millis(cfg.submit_timeout_ms));
-        if let Err(error) = handoff::publish(&cfg, &raft, &sm, &control_tasks.runtime(), &net).await
+        if let Err(error) = handoff::publish(
+            &cfg,
+            &raft,
+            &sm,
+            &control_tasks.runtime(),
+            &net,
+            acknowledge_releases,
+        )
+        .await
         {
             tracing::warn!(%error, "graceful handoff incomplete; peers retain the stale-holder fallback");
         }

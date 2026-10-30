@@ -105,15 +105,21 @@ pub(super) fn should_publish_release(
         && released_generations.get(&vip).copied() != Some(assignment.generation)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn maybe_publish_release(
     cfg: &Arc<Config>,
     raft: &KafRaft,
     consensus_fresh: &Arc<ConsensusFreshness>,
+    local: &LocalVip,
     node_id: u64,
     vip: IpAddr,
     assignment: &VipAssignment,
     released_generations: &mut HashMap<IpAddr, u64>,
 ) {
+    if !local.commands_settled() {
+        tracing::debug!(%vip, "withholding VIP release: a killed command may still change the address");
+        return;
+    }
     if !should_publish_release(assignment, node_id, vip, released_generations, true) {
         // Not (or no longer) our obligation. Clear any stale dedup marker only when this node is
         // no longer the previous holder (or it has already been released), mirroring the original

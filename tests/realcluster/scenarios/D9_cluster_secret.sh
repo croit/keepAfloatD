@@ -24,7 +24,7 @@ write_secret() {  # write_secret <ip> <secret|"">
 }
 restart_all_together() {  # coordinated near-simultaneous restart of all nodes
   local ip pids=()
-  for ip in "${NODE_IPS[@]}"; do node_sh "${ip}" "systemctl restart keepafloatd@$(instance_for_ip "${ip}")" & pids+=("$!"); done
+  for ip in "${NODE_IPS[@]}"; do node_sh "${ip}" "systemctl reset-failed keepafloatd@$(instance_for_ip "${ip}") 2>/dev/null; systemctl restart keepafloatd@$(instance_for_ip "${ip}")" & pids+=("$!"); done
   wait_for_all "${pids[@]}" 2>/dev/null
 }
 
@@ -56,7 +56,7 @@ check "matching peers keep VIPs uniquely held and reachable" \
 # node 3 joining their incarnation is a clean single-node rejoin, not a reform).
 evid "correcting ${NODE_IPS[2]} secret -> should rejoin"
 write_secret "${NODE_IPS[2]}" "${good}"
-node_sh "${NODE_IPS[2]}" "systemctl restart keepafloatd@$(instance_for_ip "${NODE_IPS[2]}")"
+node_sh "${NODE_IPS[2]}" "systemctl reset-failed keepafloatd@$(instance_for_ip "${NODE_IPS[2]}") 2>/dev/null; systemctl restart keepafloatd@$(instance_for_ip "${NODE_IPS[2]}")"
 check "corrected node rejoins with safe all-node service" wait_for_available_cluster
 
 # Cleanup: restore the original required secret on every node via one coordinated restart.

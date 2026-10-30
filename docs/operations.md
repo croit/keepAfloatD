@@ -111,7 +111,33 @@ reconciliation periodically reasserts the VIP in the kernel. This
 intentionally repairs external address deletion. Manually removing an
 address does not withdraw the node's assignment or disable the daemon.
 Stop the instance through its supervisor for maintenance instead.
-Repair does not bypass a failed gate or reset a latched bind fault.
+Repair does not bypass a failed gate or reset a latched bind fault. A VIP
+command that misses its deadline stops the daemon for a supervised restart
+instead of latching; see README `Failover behavior`. Run every production
+member under a supervisor that restarts it on failure, as the packaged
+unit does.
+
+The packaged unit allows three starts within two hours
+(`StartLimitIntervalSec=2h`, `StartLimitBurst=3`). The window has to
+exceed three startup safety waits, or a timeout loop restarts forever:
+the daemon logs its wait at start (`startup_safety_wait_ms`), and it
+grows with the health window and the VIP count. Raise the window with a
+drop-in if three of your waits come near two hours. The limit counts
+every start: the first one, supervised restarts after a timeout or
+`SIGHUP`, and restarts by an operator or a package upgrade. Before a
+deliberate restart, clear the counter so maintenance cannot use up the
+budget meant for timeout restarts:
+
+```bash
+systemctl reset-failed keepafloatd@<instance>
+systemctl restart keepafloatd@<instance>
+```
+
+A unit that hit the limit is failed (`start-limit-hit`) and its node is out
+of placement. Repair the slow host first, then bring it back with
+`systemctl reset-failed keepafloatd@<instance>` followed by
+`systemctl start keepafloatd@<instance>`; `reset-failed` alone does not
+start it. Alert on repeated keepafloatd restarts and on `start-limit-hit`.
 
 ### Transition notification hooks
 
@@ -310,6 +336,13 @@ skip the check. Later sysctl changes are not monitored.
 - **Who holds a VIP:** the VIP is a real secondary address, so ask the kernel:
   `ip addr show | grep <vip>` on each node - exactly one node should have it.
 - A node logs `bound <vip>` when it takes a VIP and `unbound <vip>` when it releases one.
+- **Voter admission:** under systemd, `systemctl show -p StatusText keepafloatd@node1` reads
+  `awaiting admission` from start, through the restart quarantine, runtime admission and learner
+  rejoin, until the member votes in its cluster again, and `admitted` from then on. It says the
+  member counts towards quorum, not that it may hold VIPs: VIP activation can still be pending
+  after `admitted`, until the startup safety wait ends. The unit stays `Type=simple`, so `active`
+  alone says only that the process runs. A standalone binary without `NOTIFY_SOCKET` reports
+  nothing.
 
 Repeated inbound Raft and submit warnings are limited to one message per
 warning site per listener every 30 seconds, including `accept` errors.
@@ -423,7 +456,9 @@ at a time so the cluster keeps quorum:
 3. `systemctl start keepafloatd@nodeX` - it rejoins via Raft. VIPs rebalance evenly when
    `failback: true`; nopreempt nodes remain available for future orphaned VIPs without taking from
    healthy holders.
-4. Confirm health (`journalctl`, `ip addr`) before moving to the next node.
+4. Wait until `systemctl show -p StatusText keepafloatd@nodeX` reads `admitted`, and confirm
+   health (`journalctl`, `ip addr`), before moving to the next node. A member still `awaiting
+   admission` does not count towards quorum yet.
 
 During rolling maintenance, never take down a majority at once, or the cluster loses quorum and
 every node unbinds its VIPs until quorum returns. The coordinated upgrade above deliberately

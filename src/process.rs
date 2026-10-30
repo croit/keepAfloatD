@@ -132,35 +132,48 @@ impl GroupedChild {
         self.child.stderr.take()
     }
 
-    pub(crate) async fn wait_status(mut self, timeout: Duration) -> io::Result<ExitStatus> {
+    pub(crate) async fn wait_status(self, timeout: Duration) -> io::Result<ExitStatus> {
+        self.wait_status_or_cancel(timeout, std::future::pending())
+            .await
+            .0
+    }
+
+    /// [`Self::wait_status`] that `cancelled` cuts short by killing the group and reaping the child.
+    /// The flag says whether the child was reaped, after which it can no longer act (#46).
+    async fn wait_status_or_cancel(
+        mut self,
+        timeout: Duration,
+        cancelled: impl std::future::Future<Output = ()>,
+    ) -> (io::Result<ExitStatus>, bool) {
         let pid = self.group.pgid;
         let started = std::time::Instant::now();
-        let wait_result = tokio::time::timeout(timeout, self.child.wait()).await;
+        let wait_result = tokio::select! {
+            biased;
+            result = tokio::time::timeout(timeout, self.child.wait()) => Some(result),
+            () = cancelled => None,
+        };
         let wait_elapsed = started.elapsed();
         let cleanup_started = std::time::Instant::now();
         let cleanup_result = self.group.terminate();
         let cleanup_elapsed = cleanup_started.elapsed();
         match wait_result {
-            Ok(Ok(status)) => {
-                cleanup_result?;
-                Ok(status)
-            }
-            Ok(Err(error)) => {
-                cleanup_result?;
-                Err(error)
-            }
-            Err(_) => {
-                cleanup_result?;
+            Some(Ok(Ok(status))) => (cleanup_result.map(|()| status), true),
+            Some(Ok(Err(error))) => (cleanup_result.and(Err(error)), false),
+            Some(Err(_)) => {
+                if let Err(error) = cleanup_result {
+                    return (Err(error), false);
+                }
                 let reap_started = std::time::Instant::now();
                 let reap = tokio::time::timeout(PROCESS_REAP_TIMEOUT, self.child.wait())
                     .await
                     .ok();
                 let reap_elapsed = reap_started.elapsed();
                 let status = reap.as_ref().and_then(|result| result.as_ref().ok());
+                let child_reaped = status.is_some();
                 let exit_code = status.and_then(ExitStatus::code);
                 let signal = status.and_then(ExitStatusExt::signal);
                 let error = timed_out_error(timeout, reap);
-                Err(io::Error::new(
+                let error = deadline_missed(
                     error.kind(),
                     format!(
                         "{error}; pid={pid} budget_ms={} wait_ms={} overrun_ms={} cleanup_ms={} reap_ms={} exit_code={exit_code:?} signal={signal:?}",
@@ -170,7 +183,22 @@ impl GroupedChild {
                         cleanup_elapsed.as_millis(),
                         reap_elapsed.as_millis(),
                     ),
-                ))
+                );
+                (Err(error), child_reaped)
+            }
+            None => {
+                if let Err(error) = cleanup_result {
+                    return (Err(error), false);
+                }
+                let reaped = matches!(
+                    tokio::time::timeout(PROCESS_REAP_TIMEOUT, self.child.wait()).await,
+                    Ok(Ok(_))
+                );
+                let error = io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("command cancelled; pid={pid} reaped={reaped}"),
+                );
+                (Err(error), reaped)
             }
         }
     }
@@ -220,6 +248,32 @@ impl GroupedChild {
     }
 }
 
+/// Payload of the error for a child that outlived its deadline. The error kind still reports the
+/// reap outcome, so callers use [`missed_deadline`] to tell a missed deadline from a failed command
+/// (#44).
+#[derive(Debug)]
+struct DeadlineMissed(String);
+
+impl std::fmt::Display for DeadlineMissed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeadlineMissed {}
+
+pub(crate) fn deadline_missed(kind: io::ErrorKind, message: String) -> io::Error {
+    io::Error::new(kind, DeadlineMissed(message))
+}
+
+/// Whether `error` means the command missed its deadline, whatever the post-kill reap reported.
+pub(crate) fn missed_deadline(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::TimedOut
+        || error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<DeadlineMissed>())
+}
+
 /// Error for a child that outlived `timeout`. `reap` is the post-kill wait result, or `None`
 /// when reaping itself timed out; the message distinguishes the three outcomes so the operator
 /// can tell a slow probe from a stuck kernel wait.
@@ -256,6 +310,162 @@ pub(crate) async fn run_status(command: &mut Command, timeout: Duration) -> io::
 
 pub(crate) async fn run_output(command: &mut Command, timeout: Duration) -> io::Result<Output> {
     spawn_grouped(command)?.wait_output(timeout).await
+}
+
+/// Counts address-changing children not yet proven reaped. One whose reap fails is lost: it keeps
+/// the tracker unsettled for the life of the process, because it may still change kernel state,
+/// and is reported so the daemon restarts under supervision instead of blocking releases forever.
+#[derive(Clone)]
+pub(crate) struct ChildTracker {
+    state: std::sync::Arc<tokio::sync::watch::Sender<TrackedChildren>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TrackedChildren {
+    unsettled: usize,
+    lost: bool,
+}
+
+impl Default for ChildTracker {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Arc::new(tokio::sync::watch::Sender::new(TrackedChildren::default())),
+        }
+    }
+}
+
+impl ChildTracker {
+    pub(crate) fn begin(&self) {
+        self.state.send_modify(|state| state.unsettled += 1);
+    }
+
+    pub(crate) fn settle(&self) {
+        self.state
+            .send_modify(|state| state.unsettled = state.unsettled.saturating_sub(1));
+    }
+
+    /// The child's reap failed; it stays counted.
+    pub(crate) fn lose(&self) {
+        self.state.send_modify(|state| state.lost = true);
+    }
+
+    pub(crate) fn is_settled(&self) -> bool {
+        self.state.borrow().unsettled == 0
+    }
+
+    /// Whether every tracked child is reaped within `budget`.
+    pub(crate) async fn wait_settled(&self, budget: Duration) -> bool {
+        let mut state = self.state.subscribe();
+        tokio::time::timeout(budget, state.wait_for(|state| state.unsettled == 0))
+            .await
+            .is_ok_and(|result| result.is_ok())
+    }
+
+    /// Resolves once a tracked child is lost.
+    pub(crate) async fn wait_lost(&self) {
+        let mut state = self.state.subscribe();
+        if state.wait_for(|state| state.lost).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunPhase {
+    WaitedFor,
+    Abandoned,
+    Finished,
+}
+
+/// Counts a child from the moment its caller stops waiting for it: only then can it outlive the
+/// caller, so a child that is still waited for holds no release back (#46). A child whose reap
+/// failed stays counted. The lock makes each transition and its count change one step, so the
+/// count never reads zero between them.
+#[derive(Clone)]
+struct TrackedRun {
+    tracker: ChildTracker,
+    phase: std::sync::Arc<std::sync::Mutex<RunPhase>>,
+}
+
+impl TrackedRun {
+    fn new(tracker: ChildTracker) -> Self {
+        Self {
+            tracker,
+            phase: std::sync::Arc::new(std::sync::Mutex::new(RunPhase::WaitedFor)),
+        }
+    }
+
+    fn phase(&self) -> std::sync::MutexGuard<'_, RunPhase> {
+        self.phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The caller stopped waiting before the child finished.
+    fn abandon(&self) {
+        let mut phase = self.phase();
+        if *phase == RunPhase::WaitedFor {
+            self.tracker.begin();
+            *phase = RunPhase::Abandoned;
+        }
+    }
+
+    /// The waiter is done with the child, which is reaped or lost.
+    fn finish(&self, reaped: bool) {
+        let mut phase = self.phase();
+        match (*phase, reaped) {
+            (RunPhase::Abandoned, true) => self.tracker.settle(),
+            (RunPhase::WaitedFor, false) => self.tracker.begin(),
+            _ => {}
+        }
+        if !reaped {
+            self.tracker.lose();
+        }
+        *phase = RunPhase::Finished;
+    }
+}
+
+/// Abandons the run, and cancels its child, when the caller is dropped before the result.
+struct Abandonment {
+    run: TrackedRun,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for Abandonment {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            self.run.abandon();
+            drop(cancel);
+        }
+    }
+}
+
+/// [`run_status`] for a command that changes kernel state. Cancelling the caller kills and reaps
+/// the child in the background instead of abandoning it, and `tracker` counts it until then (#46).
+pub(crate) async fn run_status_tracked(
+    command: &mut Command,
+    timeout: Duration,
+    tracker: &ChildTracker,
+) -> io::Result<ExitStatus> {
+    let child = spawn_grouped(command)?;
+    let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+    let run = TrackedRun::new(tracker.clone());
+    let mut abandonment = Abandonment {
+        run: run.clone(),
+        cancel: Some(cancel),
+    };
+    // Owns the child until it is reaped or its reap times out, also after the caller is dropped.
+    let waiter = tokio::spawn(async move {
+        let cancelled = async {
+            let _ = cancelled.await;
+        };
+        let (result, reaped) = child.wait_status_or_cancel(timeout, cancelled).await;
+        run.finish(reaped);
+        result
+    });
+    let result = waiter.await;
+    abandonment.cancel = None;
+    result.unwrap_or_else(|error| Err(io::Error::other(format!("command waiter failed: {error}"))))
 }
 
 async fn read_captured_output<R>(mut reader: R, limit: usize) -> io::Result<CapturedOutput>
@@ -546,6 +756,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tracked_command_settles_once_its_child_is_reaped() {
+        let tracker = ChildTracker::default();
+        let mut command = shell("exit 0");
+        null_stdio(&mut command);
+        let status = run_status_tracked(&mut command, Duration::from_secs(5), &tracker)
+            .await
+            .unwrap();
+        assert!(status.success());
+        assert!(tracker.is_settled());
+    }
+
+    #[tokio::test]
+    async fn a_tracked_command_counts_from_its_abandonment_until_reaped() {
+        let tracker = ChildTracker::default();
+        let mut command = shell("sleep 30");
+        null_stdio(&mut command);
+        let mut run = Box::pin(run_status_tracked(
+            &mut command,
+            Duration::from_secs(30),
+            &tracker,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut run)
+                .await
+                .is_err()
+        );
+        assert!(
+            tracker.is_settled(),
+            "a child its caller still waits for cannot outlive it, so it holds no release back"
+        );
+        drop(run);
+        assert!(
+            !tracker.is_settled(),
+            "an abandoned child counts until it is reaped"
+        );
+        assert!(
+            tracker.wait_settled(Duration::from_secs(5)).await,
+            "the cancelled child must be killed and reaped instead of abandoned"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_tracked_command_settles_once_reaped() {
+        let tracker = ChildTracker::default();
+        let mut command = shell("sleep 30");
+        null_stdio(&mut command);
+        let error = run_status_tracked(&mut command, Duration::from_millis(20), &tracker)
+            .await
+            .unwrap_err();
+        assert!(missed_deadline(&error));
+        assert!(tracker.is_settled());
+    }
+
+    #[tokio::test]
+    async fn a_lost_child_stays_unsettled_and_is_reported() {
+        let tracker = ChildTracker::default();
+        let lost = tracker.wait_lost();
+        tokio::pin!(lost);
+        assert!(futures::poll!(&mut lost).is_pending());
+        tracker.begin();
+        tracker.lose();
+        assert!(!tracker.is_settled());
+        assert!(matches!(
+            futures::poll!(&mut lost),
+            std::task::Poll::Ready(())
+        ));
+    }
+
+    #[test]
+    fn a_child_counts_from_abandonment_until_reaped_in_either_order() {
+        for (reaped, abandoned_first, settled) in [
+            (true, true, true),
+            (true, false, true),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let tracker = ChildTracker::default();
+            let run = TrackedRun::new(tracker.clone());
+            if abandoned_first {
+                run.abandon();
+                assert!(!tracker.is_settled(), "an abandoned child counts");
+                run.finish(reaped);
+            } else {
+                run.finish(reaped);
+                run.abandon();
+            }
+            assert_eq!(
+                tracker.is_settled(),
+                settled,
+                "reaped={reaped} abandoned_first={abandoned_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_child_still_waited_for_is_not_counted() {
+        let tracker = ChildTracker::default();
+        let run = TrackedRun::new(tracker.clone());
+        assert!(tracker.is_settled());
+        run.finish(true);
+        assert!(tracker.is_settled());
+    }
+
+    #[test]
+    fn an_unreaped_child_keeps_the_tracker_unsettled() {
+        let tracker = ChildTracker::default();
+        tracker.begin();
+        assert!(!tracker.is_settled());
+        tracker.settle();
+        assert!(tracker.is_settled());
+    }
+
+    #[test]
+    fn missed_deadline_recognizes_every_timeout_but_not_a_failed_command() {
+        assert!(missed_deadline(&io::Error::new(
+            io::ErrorKind::TimedOut,
+            "child output drain timed out"
+        )));
+        for reap in [Some(Err(io::Error::other("no child"))), None] {
+            let error = timed_out_error(Duration::from_millis(250), reap);
+            assert_ne!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(missed_deadline(&deadline_missed(
+                error.kind(),
+                error.to_string()
+            )));
+        }
+        assert!(!missed_deadline(&io::Error::other(
+            "ip addr replace failed"
+        )));
+        assert!(!missed_deadline(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "ip not found"
+        )));
+    }
+
+    #[tokio::test]
     async fn timeout_diagnostics_identify_wait_and_reap_without_command_secrets() {
         let mut command = shell("sleep 30 # secret-argument-sentinel");
         command.env("SECRET_TEST_VALUE", "secret-environment-sentinel");
@@ -554,6 +900,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(missed_deadline(&error));
         let diagnostic = error.to_string();
         for field in [
             "pid=",

@@ -117,6 +117,19 @@ Four independent mechanisms force this node off a VIP:
   Release still requires proven address and marker cleanup. The fault stays
   active even when service probes succeed: repair the interface, permissions
   or other reported cause, then restart the daemon to re-enter placement.
+  A command that only missed its deadline is the exception: the daemon stops
+  as on `SIGHUP` and exits unsuccessfully, and the supervisor's restart, with
+  post-stop and startup cleanup, lets the fresh process re-enter placement
+  after runtime admission. The stop hands its VIPs off at once when every VIP
+  command the process killed has been reaped. While a killed `ip` child may
+  still run, it could re-add an address, so no release is acknowledged and
+  healthy peers take over after the stale-holder fence. The same holds for a
+  stop by signal and for an operation cut short by lost health.
+  The packaged unit restarts on failure but stops after three starts within
+  two hours, so a host whose commands keep timing out leaves the unit failed
+  and the node out of placement. The limit counts every start, manual
+  restarts included; see the operations guide for maintenance. Without a
+  supervisor that restarts on failure, the node stays stopped.
 - **Verified authority is lost:** an expired health proof, explicit
   rejection or revoked runtime admission withdraws local VIPs.
   A transport interruption or temporarily missing leader stops new
@@ -146,7 +159,9 @@ Four independent mechanisms force this node off a VIP:
   assignment in a fresh cluster omits the previous-holder fence, but
   still waits for the [runtime admission activation delay](docs/runtime-admission.md).
   A node publishes
-  `VipReleased` only after its kernel unbind succeeds. When that release reaches an incumbent that
+  `VipReleased` only after its kernel unbind succeeds and only while every VIP command it killed
+  has been reaped; a killed command that may still run could re-add the address, so its release
+  waits. When that release reaches an incumbent that
   already bound the handoff, the incumbent reannounces the address for that generation so
   cleanup of a crashed holder cannot leave neighbor caches pointing at the removed orphan.
 
@@ -239,7 +254,9 @@ preempt. Failures committed after activation use ownership-aware V2 tracking.
   planned stop. The whole notification phase shares one
   `submit_timeout_ms` budget. Without quorum, a reachable leader or an
   applied-log proof, shutdown logs a warning and peers retain the ordinary
-  stale-holder fallback. Failed cleanup never publishes this handoff.
+  stale-holder fallback. Failed cleanup never publishes this handoff, and
+  neither does a stop that leaves a killed VIP command unreaped after a
+  short wait.
   Each delete is bounded to 250 ms and retried up to three times; an
   exhausted cleanup is returned as a daemon error after every tracked VIP has been attempted. The
   sample `systemd` unit uses `KillMode=mixed`, so graceful SIGTERM reaches the daemon but not the
@@ -379,7 +396,7 @@ assertions remain mandatory. Restart checks inspect the complete log
 window as well as current addresses, so an unbind and rebind between polls
 cannot pass. Other scenarios keep their original profile.
 
-The reusable [real-cluster harness](tests/realcluster/README.md) contains 35 scenarios, including
+The reusable [real-cluster harness](tests/realcluster/README.md) contains 36 scenarios, including
 full-restart and legacy-wire rejection contracts in the retained D15/D16 slots. Its scenario code, assertions,
 sanitized `env.example.sh`, and local self-test are versioned; `env.sh`, credentials, internal audit
 notes, and generated evidence remain ignored. VIP and address-count assertions fail closed if any
@@ -446,6 +463,12 @@ Notes:
 - `CAP_NET_ADMIN` is required for `ip addr add|del`; `CAP_NET_RAW` is needed when `arping` is
   used.
 - No ports are exposed in the image; publish the configured Raft/submit ports explicitly.
+- Give production containers a bounded restart policy such as `--restart on-failure:3` instead
+  of `--rm`: a VIP command that misses its deadline exits the daemon for a supervised restart, and
+  without a policy the member stays stopped. Unlike the packaged unit's two-hour window, Docker's
+  retry count has no time window, so a member that used its retries stays stopped until you
+  repair the host and start it again; watch the container's restart count. The `docker run --rm`
+  example above and the Compose files are for testing.
 - A read-only root filesystem is recommended. `/var/lib/keepafloatd` is
   the container user's home and working directory, not a Raft data
   directory. Raft state remains in memory; no data volume is required
@@ -461,7 +484,9 @@ random secret on all three nodes, for example `openssl rand -hex 32`.
 Only `node_id` and the listen addresses differ.
 
 Run one command in each of three separate terminals. Keep the processes
-running together; each command stays in the foreground.
+running together; each command stays in the foreground. Nothing restarts a
+foreground process, so a member that exits after a timed-out VIP command
+stays down until you start it again.
 
 ```bash
 ./target/release/keepafloatd -c examples/node1.yaml

@@ -44,7 +44,7 @@ use effects::presence_probe_command;
 use effects::{IP_COMMAND_TIMEOUT, bind_command_arguments, delete_command, verify_delete_result};
 #[cfg(test)]
 use effects::{ensure_failed_delete_is_absent, ip_family, presence_probe_target};
-use notify::VipState;
+pub(crate) use notify::VipState;
 #[cfg(test)]
 use notify::fire_notify_script;
 #[cfg(test)]
@@ -121,8 +121,13 @@ pub struct LocalVip {
     next_unbind: Mutex<HashMap<IpAddr, tokio::sync::oneshot::Receiver<()>>>,
     #[cfg(test)]
     next_bind_result_hook: std::sync::Mutex<Option<test_support::BindResultHook>>,
+    #[cfg(test)]
+    next_unbind_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     ownership_marker: ownership::OwnershipMarker,
     runner: Arc<dyn command::CommandRunner>,
+    children: crate::process::ChildTracker,
+    /// Addresses whose last delete ran while a killed writer could still re-add them (#46).
+    needs_recleanup: RwLock<HashSet<IpAddr>>,
     #[cfg(test)]
     commands: Arc<command::scripted::ScriptedRunner>,
 }
@@ -136,12 +141,17 @@ impl LocalVip {
 
     /// Use a distinct protocol per co-located daemon so crash discovery cannot cross instances.
     pub fn new_with_address_protocol(dry_run: bool, address_protocol: u8) -> Arc<Self> {
+        let children = crate::process::ChildTracker::default();
         #[cfg(test)]
         let runner = Arc::new(command::scripted::ScriptedRunner::default());
         #[cfg(not(test))]
-        let runner = Arc::new(command::SystemCommandRunner);
+        let runner = Arc::new(command::SystemCommandRunner {
+            children: children.clone(),
+        });
         Arc::new(Self {
             runner: runner.clone(),
+            children,
+            needs_recleanup: RwLock::new(HashSet::new()),
             #[cfg(test)]
             commands: runner.clone(),
             bound: RwLock::new(HashSet::new()),
@@ -163,8 +173,25 @@ impl LocalVip {
             next_unbind: Mutex::new(HashMap::new()),
             #[cfg(test)]
             next_bind_result_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            next_unbind_hook: std::sync::Mutex::new(None),
             ownership_marker: ownership::OwnershipMarker::new(address_protocol, runner),
         })
+    }
+
+    /// Whether every VIP command this process killed is reaped, so none can still change an
+    /// address and a release may be acknowledged (#46).
+    pub(crate) fn commands_settled(&self) -> bool {
+        self.children.is_settled()
+    }
+
+    pub(crate) async fn wait_commands_settled(&self, budget: std::time::Duration) -> bool {
+        self.children.wait_settled(budget).await
+    }
+
+    /// Resolves once a killed VIP command could not be reaped.
+    pub(crate) async fn wait_lost_command(&self) {
+        self.children.wait_lost().await;
     }
 
     #[cfg(test)]
@@ -285,12 +312,16 @@ impl LocalVip {
         };
         if let Some(bind_error) = bind_error {
             if should_clear_tracking_after_bind_failure(first_bind) {
-                self.ownership_marker
+                if let Err(cleanup_error) = self
+                    .ownership_marker
                     .remove_after_failed_first_bind(ip, prefix)
                     .await
-                    .map_err(|cleanup_error| {
-                        anyhow::anyhow!("{bind_error:#}; {cleanup_error:#}")
-                    })?;
+                {
+                    // Keep the bind error as the source so a missed deadline stays visible (#44).
+                    return Err(
+                        bind_error.context(format!("failed first-bind cleanup: {cleanup_error:#}"))
+                    );
+                }
                 self.bound.write().await.remove(&ip);
                 self.pending_first_bind.write().await.remove(&ip);
             }
@@ -387,16 +418,30 @@ impl LocalVip {
 
     /// Remove the address if it was previously added by this [`LocalVip`] instance on this host.
     /// `prefix` must match the prefix the address was bound with so the kernel del matches.
+    /// Whether a writer killed during the last delete of `ip` may have re-added it since.
+    pub(crate) async fn needs_another_delete(&self, ip: IpAddr) -> bool {
+        self.needs_recleanup.read().await.contains(&ip)
+    }
+
     pub async fn unbind(&self, iface: &str, ip: IpAddr, prefix: u8) -> anyhow::Result<()> {
+        // Taken before this cleanup can wait for anything: a writer reaped later may still have
+        // re-added the address after the delete below (#46).
+        let settled = self.children.is_settled();
         self.announcements.cancel(ip).await;
         #[cfg(test)]
         {
+            let hook = self.next_unbind_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
             let pause = self.next_unbind.lock().await.remove(&ip);
             if let Some(pause) = pause {
                 let _ = pause.await;
             }
         }
-        if !self.bound.read().await.contains(&ip) {
+        if !self.bound.read().await.contains(&ip)
+            && !self.needs_recleanup.read().await.contains(&ip)
+        {
             return Ok(());
         }
         if self.dry_run {
@@ -416,8 +461,16 @@ impl LocalVip {
             self.ownership_marker.delete(ip).await?;
             tracing::info!(target: "keepafloatd::vip", "unbound {ip}/{prefix} on {iface}");
         }
+        // Recorded before the tracking below goes, so a cancellation in between still leaves the
+        // address to the next cleanup.
+        if !settled {
+            self.needs_recleanup.write().await.insert(ip);
+        }
         self.bound.write().await.remove(&ip);
         self.pending_first_bind.write().await.remove(&ip);
+        if settled {
+            self.needs_recleanup.write().await.remove(&ip);
+        }
         Ok(())
     }
 
@@ -609,6 +662,32 @@ mod tests {
                 local.commands.assert_finished();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_cleanup_cancelled_while_a_writer_may_run_keeps_the_address_for_the_next_delete() {
+        let local = LocalVip::new(false);
+        let address: IpAddr = "192.0.2.99".parse().unwrap();
+        local.bound.write().await.insert(address);
+        local
+            .force_unbind_results(("test0", address, 32), vec![Ok(ExitStatus::from_raw(0))])
+            .await;
+        local
+            .force_marker_delete_results(address, vec![Ok(ExitStatus::from_raw(0))])
+            .await;
+        let _running = local.hold_unreaped_command();
+        let reader = local.needs_recleanup.read().await;
+        let mut cleanup = Box::pin(local.unbind("test0", address, 32));
+        let first_poll =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(cleanup.as_mut().poll(cx))).await;
+        assert!(first_poll.is_pending());
+        drop(cleanup);
+        drop(reader);
+        assert!(
+            local.bound.read().await.contains(&address)
+                || local.needs_recleanup.read().await.contains(&address),
+            "a writer that may re-add the address needs another delete, even after a cancelled cleanup"
+        );
     }
 
     #[tokio::test]
@@ -1207,11 +1286,16 @@ mod tests {
 
         let error = vip.bind("test0", address, 32).await.unwrap_err();
 
-        assert!(error.to_string().contains("marker retained"));
-        assert!(error.to_string().contains("operation=address_replace"));
+        // The reconcile worker logs the whole chain.
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("marker retained"), "{diagnostic}");
         assert!(
-            error.to_string().contains("netlink response timed out"),
-            "{error:#}"
+            diagnostic.contains("operation=address_replace"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("netlink response timed out"),
+            "{diagnostic}"
         );
         assert!(vip.bound.read().await.contains(&address));
         assert!(

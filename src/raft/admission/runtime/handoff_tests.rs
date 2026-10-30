@@ -77,7 +77,7 @@ async fn pending_health_commit_cannot_outlive_the_shared_handoff_timeout() {
     let started = Instant::now();
     assert!(session.check().unwrap() > started + Duration::from_millis(50));
     let mut publish = Box::pin(crate::handoff::publish(
-        &cfg, &raft, &state, &runtime, &network,
+        &cfg, &raft, &state, &runtime, &network, true,
     ));
     assert!(futures::poll!(publish.as_mut()).is_pending());
     assert!(
@@ -138,7 +138,7 @@ async fn busy_state_waits_and_completes_handoff() {
         "the synchronous read cannot acquire the busy state"
     );
     let mut publish = Box::pin(crate::handoff::publish(
-        &cfg, &raft, &state, &runtime, &network,
+        &cfg, &raft, &state, &runtime, &network, true,
     ));
     assert!(
         futures::poll!(publish.as_mut()).is_pending(),
@@ -171,7 +171,7 @@ async fn busy_state_acquisition_cannot_outlive_the_shared_handoff_timeout() {
     let started = Instant::now();
     assert!(runtime.authority.current().unwrap().1 > started + Duration::from_millis(50));
     let mut publish = Box::pin(crate::handoff::publish(
-        &cfg, &raft, &state, &runtime, &network,
+        &cfg, &raft, &state, &runtime, &network, true,
     ));
     assert!(
         futures::poll!(publish.as_mut()).is_pending(),
@@ -209,7 +209,7 @@ async fn state_acquisition_does_not_restart_the_shared_handoff_timeout() {
     let held = state.write().await;
     let started = Instant::now();
     let mut publish = Box::pin(crate::handoff::publish(
-        &cfg, &raft, &state, &runtime, &network,
+        &cfg, &raft, &state, &runtime, &network, true,
     ));
     assert!(
         futures::poll!(publish.as_mut()).is_pending(),
@@ -257,7 +257,7 @@ async fn admission_shutdown_interrupts_busy_state_handoff() {
     let runtime = controls.runtime();
     let held = state.write().await;
     let mut publish = Box::pin(crate::handoff::publish(
-        &cfg, &raft, &state, &runtime, &network,
+        &cfg, &raft, &state, &runtime, &network, true,
     ));
     assert!(
         futures::poll!(publish.as_mut()).is_pending(),

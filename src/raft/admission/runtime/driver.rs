@@ -65,6 +65,7 @@ impl RuntimeDriver {
     }
 
     async fn drive(&self, network: &RaftNetworkImpl) -> anyhow::Result<()> {
+        let _ = self.report_status(crate::systemd_status::AWAITING_ADMISSION);
         tokio::time::sleep_until(self.timing.quarantine_deadline(self.boot)?).await;
         let operation_nonce = fresh_nonce()?;
         loop {
@@ -85,6 +86,7 @@ impl RuntimeDriver {
             tokio::time::sleep(self.rpc_budget()).await;
         }
         tracing::info!(replica = %self.local, "runtime admission acquired");
+        self.report_admission_once_voting();
         loop {
             if let Err(error) = self.within_admission(self.drive_round(network)).await {
                 self.authority
@@ -92,6 +94,7 @@ impl RuntimeDriver {
                     .ok_or(AdmissionDenied("runtime admission expired during renewal"))?;
                 tracing::debug!(%error, "admission renewal round deferred");
             }
+            self.report_admission_once_voting();
             tokio::time::sleep(self.timing.renewal_interval()).await;
         }
     }

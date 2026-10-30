@@ -414,9 +414,10 @@ standalone_scenario_capture_is_safe() (
   # Run the actual scenario in a fresh shell so conditional assertions cannot suppress ERR traps.
   printf '%s\n' 'set -Euo pipefail' \
     'NODE_IPS=(first second third)' 'NODE_INSTANCES=(first second third)' \
-    'IPV6_TEST_VIP=2001:db8::1' 'IFACE=fixture-interface' '_PASS=1' \
+    'IPV6_TEST_VIP=2001:db8::1' 'VIPS=(198.51.100.10 198.51.100.11 198.51.100.12)' \
+    'IFACE=fixture-interface' '_PASS=1' \
     "$(declare -f backup_cluster_configs restore_cluster_configs instance_for_ip shell_quote \
-      node_sh scenario_start scenario_end evid kafd_stop set_healthy clean_reform \
+      node_sh scenario_start scenario_end evid kafd_stop set_healthy clean_reform set_cluster_scalar \
       cleanup_ownership_test_artifacts scenario_unexpected_error install_scenario_error_guard)" \
     'install_scenario_error_guard' > "${fixture}/scenario.sh"
   export fixture fixture_mode
@@ -672,6 +673,8 @@ for capture_mode in stale-first stale-middle transport-middle post-capture; do
     B3_notify_hook b3-notify "${capture_mode}"
   assert "D24 standalone capture: ${capture_mode}" standalone_scenario_capture_is_safe \
     D24_ipv6_crash_removed_vip_cleanup d24 "${capture_mode}"
+  assert "D27 standalone capture: ${capture_mode}" standalone_scenario_capture_is_safe \
+    D27_bind_timeout_restart d27 "${capture_mode}"
 done
 
 removed_vip_evidence_is_fail_closed() (

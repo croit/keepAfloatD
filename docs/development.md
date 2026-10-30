@@ -56,7 +56,7 @@ the checks is rejected; start a new branch pipeline to verify that new
 commit. GitHub tag-triggered releases verify that tag's commit directly.
 Dry runs retain the same checks but skip release publication. GitLab's
 ordinary build jobs still publish temporary CI images for their tests.
-These checks do not run the 35 scenarios against a live Ceph cluster.
+These checks do not run the 36 scenarios against a live Ceph cluster.
 
 GitLab runtime images use the static amd64 and arm64 binary artifacts
 from the same pipeline through Docker's `runtime-dist` target. The image

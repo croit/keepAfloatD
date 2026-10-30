@@ -81,7 +81,7 @@ From the repository root, validate the exported harness without contacting any c
 For a live campaign, copy `env.example.sh` to the ignored `env.sh` and replace its example values
 before running any scenario. Configure three nodes, three VIPs, service instance names, mutation
 addresses, the candidate BuildID, and access credentials. D15/D16 now cover full restart and legacy-wire rejection;
-the full run still includes all 35 scenarios.
+the full run still includes all 36 scenarios.
 
 ```bash
 cd tests/realcluster
@@ -216,6 +216,7 @@ node when they are not exported; it never writes them to evidence logs.
 | D24_ipv6_crash_removed_vip_cleanup | the same crash-time config-removal cleanup reclaims an IPv6 `/128` and its IPv6 marker before a quorum can form | `ip -6 addr` + IPv6 `throw` route + systemd lifecycle |
 | D25_authenticated_raft_deadlines | authenticated idle, partial-prefix, partial-body, and trickled frames expire; renewed status requests succeed and every voter/VIP remains available | source-bound TCP + monotonic close times + agreed leader + unique reachable VIPs |
 | D26_isolated_health_proof | a delayed health probe cannot keep an isolated leader bound; its expired process stops and a fresh boot rejoins after healing | exact candidate daemons with dry-run VIPs in a private namespace on the real kernel |
+| D27_bind_timeout_restart | a holder whose reassert of a held VIP misses its deadline once hands off, is restarted by its supervisor and holds a VIP again; a replace that fails outright keeps it out without a restart | injected `ip` delay and status + systemd MainPID + sustained `ip addr` + journal |
 
 A5/D7/D19/C2 pin evidence to the node's boot and systemd invocation, using
 node-local monotonic timestamps. A5 requires successful reclamation of the exact
@@ -329,7 +330,7 @@ must never be rolled together.
 
 - Kill/partition/restart effects are confined to the explicitly configured lab. The harness
   re-asserts that `ceph health` recovers to `HEALTH_OK` in `restore_baseline`.
-- All 35 scenarios keep the fixed candidate binary on every node. D15/D16
+- All 36 scenarios keep the fixed candidate binary on every node. D15/D16
   explicitly test the new full-restart and legacy-rejection contracts.
 - Health failure is induced by stopping both the node's HAProxy front end and RGW backend. Current
   generated configs probe HAProxy on `127.0.0.1:9400/healthz`; stopping RGW alone leaves that endpoint

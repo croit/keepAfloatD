@@ -2,16 +2,26 @@
 
 use tokio::sync::watch;
 
+/// Why a VIP effect failed. Either way the fault lasts for the life of the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindFault {
+    /// The command failed outright; restarting does not repair the cause.
+    Failed,
+    /// The command missed its deadline. A supervised restart re-enters placement once the host
+    /// recovers (#44).
+    TimedOut,
+}
+
 #[derive(Clone, Copy)]
 struct Status {
     probe_healthy: bool,
-    bind_failed: bool,
+    bind_fault: Option<BindFault>,
     loss_epoch: u64,
 }
 
 impl Status {
     fn healthy(self) -> bool {
-        self.probe_healthy && !self.bind_failed
+        self.probe_healthy && self.bind_fault.is_none()
     }
 }
 
@@ -54,7 +64,7 @@ impl LocalHealth {
         Self {
             status: watch::channel(Status {
                 probe_healthy,
-                bind_failed: false,
+                bind_fault: None,
                 loss_epoch: 0,
             })
             .0,
@@ -85,21 +95,36 @@ impl LocalHealth {
     }
 
     /// A service probe cannot prove bind recovery; only a fresh process resets this fault.
-    pub(crate) fn fail_binding(&self) {
+    /// The first fault decides whether the process asks for a restart.
+    pub(crate) fn fail_binding(&self, fault: BindFault) {
         self.status.send_if_modified(|status| {
-            let changed = !status.bind_failed;
+            if status.bind_fault.is_some() {
+                return false;
+            }
             if status.healthy() {
                 status.loss_epoch = status.loss_epoch.saturating_add(1);
             }
-            status.bind_failed = true;
-            changed
+            status.bind_fault = Some(fault);
+            true
         });
     }
 
     pub(crate) async fn wait_for_bind_failure(&self) -> Result<(), watch::error::RecvError> {
+        self.wait_for_fault(|fault| fault.is_some()).await
+    }
+
+    pub(crate) async fn wait_for_restart_request(&self) -> Result<(), watch::error::RecvError> {
+        self.wait_for_fault(|fault| fault == Some(BindFault::TimedOut))
+            .await
+    }
+
+    async fn wait_for_fault(
+        &self,
+        matches: impl Fn(Option<BindFault>) -> bool,
+    ) -> Result<(), watch::error::RecvError> {
         self.status
             .subscribe()
-            .wait_for(|status| status.bind_failed)
+            .wait_for(|status| matches(status.bind_fault))
             .await
             .map(|_| ())
     }
@@ -139,7 +164,7 @@ mod tests {
         }
         assert!(continuity.check());
         assert_eq!(continuity.run(async { 7 }).await, Some(7));
-        health.fail_binding();
+        health.fail_binding(BindFault::Failed);
         health.observe_probe(true);
         assert!(!continuity.check());
         assert_eq!(continuity.run(async { 7 }).await, None);
@@ -157,7 +182,7 @@ mod tests {
         assert!(health.is_healthy());
         assert!(futures::poll!(&mut waiting).is_pending());
 
-        health.fail_binding();
+        health.fail_binding(BindFault::Failed);
         assert!(matches!(
             futures::poll!(&mut waiting),
             std::task::Poll::Ready(Ok(()))
@@ -171,7 +196,7 @@ mod tests {
         let waiting = health.wait_for_bind_failure();
         tokio::pin!(waiting);
 
-        health.fail_binding();
+        health.fail_binding(BindFault::Failed);
         for probe in [false, true, true] {
             assert!(!health.observe_probe(probe));
         }
@@ -194,17 +219,46 @@ mod tests {
         let waiting = health.wait_for_bind_failure();
         tokio::pin!(waiting);
         assert!(futures::poll!(&mut waiting).is_pending());
-        health.fail_binding();
+        health.fail_binding(BindFault::Failed);
         waiting.await.unwrap();
         for probe in [true, false, true] {
             assert!(!health.observe_probe(probe));
             assert!(!health.is_healthy());
         }
-        health.fail_binding();
+        health.fail_binding(BindFault::Failed);
         health.wait_for_bind_failure().await.unwrap();
         let restarted = LocalHealth::new(false);
         restarted.observe_probe(true);
         assert!(restarted.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn only_a_timed_out_bind_requests_a_restart() {
+        let failed = LocalHealth::new(true);
+        let failed_restart = failed.wait_for_restart_request();
+        tokio::pin!(failed_restart);
+        failed.fail_binding(BindFault::Failed);
+        assert!(!failed.is_healthy());
+        assert!(futures::poll!(&mut failed_restart).is_pending());
+        failed.fail_binding(BindFault::TimedOut);
+        assert!(
+            futures::poll!(&mut failed_restart).is_pending(),
+            "a latched failure must not turn into a restart request"
+        );
+
+        let timed_out = LocalHealth::new(true);
+        let restart = timed_out.wait_for_restart_request();
+        tokio::pin!(restart);
+        assert!(futures::poll!(&mut restart).is_pending());
+        timed_out.fail_binding(BindFault::TimedOut);
+        assert!(!timed_out.is_healthy());
+        timed_out.observe_probe(true);
+        assert!(!timed_out.is_healthy());
+        assert!(matches!(
+            futures::poll!(&mut restart),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        timed_out.wait_for_bind_failure().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -221,7 +275,7 @@ mod tests {
             }
         });
         barrier.wait().await;
-        health.fail_binding();
+        health.fail_binding(BindFault::Failed);
         probe.await.unwrap();
         assert!(!health.is_healthy());
     }

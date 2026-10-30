@@ -2,6 +2,11 @@
 Description=keepAfloatD Raft VIP failover (optional front-end for NFS or other services)
 After=network-online.target
 Wants=network-online.target
+# A VIP command that misses its deadline exits for a restart; three within two hours leave the
+# unit failed, so a host that stays slow keeps the node out instead of moving VIPs back and forth.
+# The window must exceed three startup safety waits, which grow with the VIP count.
+StartLimitIntervalSec=2h
+StartLimitBurst=3
 
 [Service]
 Type=simple

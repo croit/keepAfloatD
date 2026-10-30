@@ -115,7 +115,7 @@ async fn handoff_bounds_busy_admission_by_the_shared_submit_deadline() {
     let started = tokio::time::Instant::now();
     assert!(session.check().unwrap() > started + Duration::from_millis(50));
     let mut publish = Box::pin(crate::handoff::publish(
-        &cfg, &raft, &state, &runtime, &network,
+        &cfg, &raft, &state, &runtime, &network, true,
     ));
     assert!(futures::poll!(publish.as_mut()).is_pending());
     tokio::time::advance(Duration::from_millis(49)).await;
@@ -148,7 +148,7 @@ async fn handoff_without_admission_returns_an_error() {
             .await
             .unwrap();
     let runtime = controls.runtime();
-    let result = crate::handoff::publish(&cfg, &raft, &state, &runtime, &network).await;
+    let result = crate::handoff::publish(&cfg, &raft, &state, &runtime, &network, true).await;
     controls.shutdown().await.unwrap();
     network.shutdown().await.unwrap();
     raft.shutdown().await.unwrap();

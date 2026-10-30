@@ -11,12 +11,15 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 /// Publish only after successful local cleanup. Quorum loss must not delay shutdown indefinitely.
+/// Without `acknowledge_releases` only the unhealthy report is published, so peers wait for the
+/// stale-holder fence instead of trusting a cleanup that a surviving child may still undo (#44).
 pub(crate) async fn publish(
     cfg: &Arc<Config>,
     raft: &KafRaft,
     state: &Arc<RwLock<KafStorageState>>,
     runtime: &RuntimeDriver,
     network: &RaftNetworkImpl,
+    acknowledge_releases: bool,
 ) -> anyhow::Result<()> {
     let submit_deadline =
         tokio::time::Instant::now() + Duration::from_millis(cfg.submit_timeout_ms);
@@ -29,6 +32,12 @@ pub(crate) async fn publish(
         runtime.submit_health(network, false).await?;
         session.check()?;
         tracing::info!("shutdown unhealthy report committed and applied");
+        if !acknowledge_releases {
+            tracing::warn!(
+                "withholding shutdown VIP releases: a timed-out command may still change an address"
+            );
+            return Ok(());
+        }
         let releases = pending_releases(&*state.read().await, cfg.node_id);
         for request in releases {
             tracing::debug!(%request, "publishing shutdown VIP release");
@@ -94,7 +103,7 @@ mod tests {
         .await
         .unwrap();
         runtime.attach(raft.clone()).unwrap();
-        let result = publish(&cfg, &raft, &state, &runtime, &network).await;
+        let result = publish(&cfg, &raft, &state, &runtime, &network, true).await;
         runtime.shutdown();
         raft.shutdown().await.unwrap();
         assert!(result.unwrap_err().to_string().contains("active admission"));

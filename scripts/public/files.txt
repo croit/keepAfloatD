@@ -96,6 +96,7 @@ src/main.rs|src/main.rs
 src/handoff.rs|src/handoff.rs
 src/shutdown.rs|src/shutdown.rs
 src/stop_budget.rs|src/stop_budget.rs
+src/systemd_status.rs|src/systemd_status.rs
 tests/signals.rs|tests/signals.rs
 tests/signals/cleanup.rs|tests/signals/cleanup.rs
 tests/signals/fixtures/ip.sh|tests/signals/fixtures/ip.sh
@@ -344,6 +345,7 @@ tests/realcluster/scenarios/D23_crash_removed_vip_cleanup.sh|tests/realcluster/s
 tests/realcluster/scenarios/D24_ipv6_crash_removed_vip_cleanup.sh|tests/realcluster/scenarios/D24_ipv6_crash_removed_vip_cleanup.sh
 tests/realcluster/scenarios/D25_authenticated_raft_deadlines.sh|tests/realcluster/scenarios/D25_authenticated_raft_deadlines.sh
 tests/realcluster/scenarios/D26_isolated_health_proof.sh|tests/realcluster/scenarios/D26_isolated_health_proof.sh
+tests/realcluster/scenarios/D27_bind_timeout_restart.sh|tests/realcluster/scenarios/D27_bind_timeout_restart.sh
 tests/e2e/scripts/auth_wire.py|tests/e2e/scripts/auth_wire.py
 tests/e2e/scripts/auth_wire_test.py|tests/e2e/scripts/auth_wire_test.py
 docs/authentication.md|docs/authentication.md

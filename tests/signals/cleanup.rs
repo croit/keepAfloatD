@@ -159,6 +159,22 @@ fn packaged_unit_accepts_stop_budget_from_daemon_and_cleanup_command() {
     assert!(unit.lines().any(|line| line == "TimeoutStopSec=15"));
 }
 
+#[test]
+fn packaged_unit_stops_restarting_a_node_whose_vip_commands_keep_timing_out() {
+    // A timed-out VIP command restarts the daemon; repeated ones must end in a failed unit instead
+    // of moving VIPs back and forth every few minutes (#44).
+    let unit = include_str!("../../deploy/systemd/keepafloatd@.service");
+    let section: Vec<&str> = unit
+        .lines()
+        .skip_while(|line| *line != "[Unit]")
+        .skip(1)
+        .take_while(|line| !line.starts_with('['))
+        .collect();
+    assert!(section.contains(&"StartLimitIntervalSec=2h"), "{section:?}");
+    assert!(section.contains(&"StartLimitBurst=3"), "{section:?}");
+    assert!(unit.lines().any(|line| line == "Restart=on-failure"));
+}
+
 #[tokio::test]
 async fn cleanup_only_extends_stop_budget_for_discovered_work() {
     use std::os::unix::net::UnixDatagram;

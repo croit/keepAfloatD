@@ -5,6 +5,83 @@ All notable changes to keepafloatd. Versions follow the calendar scheme
 project tracker. Release preparation may precede publication; the
 published release pages confirm which artifacts are available.
 
+## v2610.2 (2026-10-30)
+
+Changes since `v2610.1`.
+
+### Upgrade notes
+
+- Protocol version 3 and the configuration format are unchanged, and
+  `v2610.2` members exchange the same messages as `v2610.1` members.
+  A cluster mixing the two versions was not tested on a live cluster.
+- The packaged systemd unit gains `StartLimitIntervalSec=2h` and
+  `StartLimitBurst=3`: it allows three starts per two-hour window,
+  including the first one, and refuses the next with
+  `start-limit-hit`. Before a deliberate restart, run
+  `systemctl reset-failed keepafloatd@<instance>` so maintenance does
+  not use up that budget; see
+  [protective failure and repair policies](docs/operations.md#protective-failure-and-repair-policies).
+  The rpm `postinst` now reloads systemd, so an upgraded unit applies
+  before the next start.
+- The new systemd status text relies on the packaged unit's existing
+  `NotifyAccess=exec`. A custom unit must allow notifications from the
+  daemon's main process, or it reports nothing.
+
+### VIP command timeouts
+
+- A VIP bind or reassert command that misses its deadline no longer
+  keeps the node out of placement until an operator restarts it (#44).
+  The daemon stops as on `SIGHUP` and exits with a failure status. A
+  supervisor that restarts failed processes, such as the packaged
+  unit, starts it again, and the new process re-enters placement after
+  startup cleanup and runtime admission. Without such a supervisor the
+  daemon stays stopped. A bind that fails outright, such as one naming
+  a missing interface, still latches local FAULT, and cleanup failures
+  are still retried.
+- A host whose commands keep timing out ends in a failed unit once the
+  start limit is reached, instead of moving VIPs back and forth.
+- A VIP release is acknowledged only once every cancelled address
+  command has been killed and reaped (#46). A release could previously
+  be acknowledged while a killed `ip` child could still re-add the
+  address, so two nodes could hold the VIP. While such a child may
+  still run, no release is acknowledged and peers take the VIP over
+  only after the stale-holder fences, which grow with the health
+  timing and the configured VIP count; see
+  [unacknowledged takeover allowance](docs/operations.md#unacknowledged-takeover-allowance).
+  A cancelled command that cannot be reaped at all also stops the
+  daemon for a supervised restart.
+- A timeout restart can still bypass the stale-holder wait when every
+  cancelled command was reaped before cleanup began, the cleanup
+  succeeded and the release acknowledgement commits within the handoff
+  budget.
+
+### Observability
+
+- Under systemd, after startup cleanup, the status text reads
+  `awaiting admission` while the member waits to vote in its cluster,
+  and `admitted` from then on (#47). Read it with
+  `systemctl show -p StatusText keepafloatd@<instance>`. `admitted`
+  means the member counts toward quorum, not that VIP activation has
+  finished. Rolling maintenance waits for `admitted` before moving to
+  the next node, as the rolling upgrade steps in
+  [the operations guide](docs/operations.md) describe.
+
+### Validation and known limits
+
+- The release candidate passed all 37 GitLab jobs on main, including
+  Docker E2E and source-export checks, with 94.89 percent line
+  coverage. Release publication runs its own checks against the final
+  commit and version-stamped archive.
+- The full 36-scenario live Ceph campaign passed on a three-node stand
+  with the release candidate, including the new bind-timeout restart
+  scenario. A second run with the packaged unit confirmed both status
+  text values and clean stops in seven restart and failure scenarios.
+- The causes of the earlier VIP command timeouts in CI and on the Ceph
+  test stand remain unexplained. A bind or reassert timeout now leads
+  to a supervised restart instead of a latched fault.
+- Runtime admission assumptions and the physical fencing limits listed
+  for `v2610.0` still apply.
+
 ## v2610.1 (2026-10-28)
 
 Changes since `v2610.0`.

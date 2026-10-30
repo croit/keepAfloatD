@@ -20,7 +20,10 @@ pub(super) trait CommandRunner: Send + Sync {
     ) -> BoxFuture<'a, io::Result<Output>>;
 }
 
-pub(super) struct SystemCommandRunner;
+pub(super) struct SystemCommandRunner {
+    /// Every `status` command changes addresses or markers, so each is tracked until reaped.
+    pub(super) children: crate::process::ChildTracker,
+}
 
 impl CommandRunner for SystemCommandRunner {
     fn status<'a>(
@@ -28,7 +31,11 @@ impl CommandRunner for SystemCommandRunner {
         command: &'a mut Command,
         timeout: Duration,
     ) -> BoxFuture<'a, io::Result<ExitStatus>> {
-        Box::pin(crate::process::run_status(command, timeout))
+        Box::pin(crate::process::run_status_tracked(
+            command,
+            timeout,
+            &self.children,
+        ))
     }
 
     fn output<'a>(

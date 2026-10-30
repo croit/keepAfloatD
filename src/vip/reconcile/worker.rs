@@ -1,7 +1,21 @@
 //! Independent effect reconciliation and cleanup for one configured VIP.
 
 use super::*;
+use crate::health::BindFault;
 use crate::vip::witness::{CompletedBindingWitness, EffectAuthorization, RetainedEffect};
+
+fn bind_fault(error: &anyhow::Error) -> BindFault {
+    let timed_out = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(crate::process::missed_deadline)
+    });
+    if timed_out {
+        BindFault::TimedOut
+    } else {
+        BindFault::Failed
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
@@ -77,6 +91,9 @@ pub(super) async fn run(
             memory.activated_generations.remove(&vip.addr);
             memory.announced_release_generations.remove(&vip.addr);
             let table = [(vip, iface.clone())];
+            // A killed writer reaped only after this cleanup may re-add the address; then the
+            // release waits for the next cleanup (#46).
+            let settled_before_cleanup = local.commands_settled();
             match local
                 .unbind_all(
                     &table,
@@ -87,14 +104,16 @@ pub(super) async fn run(
                 .await
             {
                 Ok(()) => {
-                    cleanup_needed = false;
+                    cleanup_needed = local.needs_another_delete(vip.addr).await;
                     if memory.vip_effects_armed
+                        && settled_before_cleanup
                         && let Some(assignment) = assignment.as_ref()
                     {
                         maybe_publish_release(
                             &cfg,
                             &raft,
                             &freshness,
+                            &local,
                             node_id,
                             vip.addr,
                             assignment,
@@ -227,9 +246,17 @@ pub(super) async fn run(
                         }
                     }
                     Some(Err(error)) => {
-                        health.fail_binding();
+                        let fault = bind_fault(&error);
+                        health.fail_binding(fault);
                         cleanup_needed = true;
-                        tracing::error!(error = %format_args!("{error:#}"), address = %vip.addr, "VIP bind failed; node remains unhealthy until restart");
+                        match fault {
+                            BindFault::Failed => {
+                                tracing::error!(error = %format_args!("{error:#}"), address = %vip.addr, "VIP bind failed; node remains unhealthy until restart")
+                            }
+                            BindFault::TimedOut => {
+                                tracing::error!(error = %format_args!("{error:#}"), address = %vip.addr, "VIP command timed out; restarting the daemon to prove the release")
+                            }
+                        }
                     }
                     None | Some(Ok(None)) => {
                         let unchanged = !mutation_started.load(std::sync::atomic::Ordering::SeqCst);

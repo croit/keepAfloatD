@@ -6,3 +6,8 @@ for config in /etc/keepafloatd/config.yaml /etc/keepafloatd/config-*.yaml; do
     chown root:root "${config}"
     chmod 0600 "${config}"
 done
+
+# The packaged unit changes with releases; reload so an upgrade applies it before the next start.
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || :
+fi

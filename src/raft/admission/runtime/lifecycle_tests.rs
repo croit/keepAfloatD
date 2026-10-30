@@ -128,3 +128,42 @@ async fn network_shutdown_stops_driver_before_quarantine_ends() {
         "network shutdown must stop the quarantined admission driver cleanly: {completion:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_status_text_reports_admission_once_it_is_acquired() {
+    let (runtime, network, raft) = attached_driver().await;
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let record = reported.clone();
+    runtime.report_status_with(Arc::new(move |status| {
+        record.lock().unwrap().push(status);
+        true
+    }));
+    let mut run = Box::pin(runtime.run(network.clone()));
+    assert!(futures::poll!(run.as_mut()).is_pending());
+    assert_eq!(*reported.lock().unwrap(), ["awaiting admission"]);
+    let admitted = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            tokio::select! {
+                biased;
+                result = run.as_mut() => panic!("the driver ended before admission: {result:?}"),
+                () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            if reported.lock().unwrap().len() > 1 {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        admitted.is_ok(),
+        "a single member never reported its admission"
+    );
+    assert!(runtime.authority.current().is_some());
+    assert_eq!(
+        *reported.lock().unwrap(),
+        ["awaiting admission", "admitted"]
+    );
+    drop(run);
+    network.shutdown().await.unwrap();
+    raft.shutdown().await.unwrap();
+}

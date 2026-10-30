@@ -284,12 +284,14 @@ async fn release_timeout_keeps_another_completed_vip_until_its_old_deadline() {
     };
     let mut released = HashMap::new();
     let release_address = "192.0.2.100".parse().unwrap();
+    let settled = LocalVip::new(false);
     {
         {
             let release = maybe_publish_release(
                 &cfg,
                 &raft,
                 &freshness,
+                &settled,
                 1,
                 release_address,
                 &assignment,
@@ -387,6 +389,7 @@ async fn release_authority_rejection_revokes_completed_retention() {
         &Arc::new(mismatched),
         &raft,
         &freshness,
+        &LocalVip::new(false),
         2,
         "192.0.2.100".parse().unwrap(),
         &assignment,
