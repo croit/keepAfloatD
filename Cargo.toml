@@ -67,9 +67,9 @@ clap = { version = "4", features = ["derive"] }
 openraft = { version = "=0.10.0-alpha.37", features = ["serde", "type-alias"] }
 futures = "0.3"
 # Collision-resistant, versioned identity for cluster-wide configuration invariants.
-sha2 = "0.10"
+sha2 = "0.11"
 # Reviewed HMAC and constant-time tag verification; never implement our own MAC.
-hmac = "0.12"
+hmac = "0.13"
 # Reuse the locked OS-entropy API instead of adding a userspace RNG.
 getrandom = "0.4.3"
 # Linux process-group termination for cancellation-safe health probes.
